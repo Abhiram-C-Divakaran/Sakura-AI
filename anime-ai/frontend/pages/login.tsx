@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/router';
-import { Mail, Lock, Eye, EyeOff, User, Loader2, AlertCircle, Check } from 'lucide-react';
+import Link from 'next/link';
+import { Mail, Lock, Eye, EyeOff, User, Loader2, AlertCircle, Check, ArrowLeft } from 'lucide-react';
 import { SakuraLogo, SakuraWordmark } from '../components/SakuraLogo';
 
 const GoogleIcon = () => (
@@ -148,9 +149,19 @@ export default function Login() {
 
   return (
     <div
-      className="min-h-screen w-full bg-[#000000] text-[#F5F5F5] flex flex-col items-center justify-center p-4 selection:bg-[#E9829B]/30 select-none"
+      className="min-h-screen w-full bg-[#000000] text-[#F5F5F5] flex flex-col items-center justify-center p-4 selection:bg-[#E9829B]/30 select-none relative"
       style={{ fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" }}
     >
+      {/* ─── Back to Landing Page ─── */}
+      <Link
+        href="/"
+        className="fixed top-6 left-6 sm:top-8 sm:left-8 flex items-center gap-2 text-[13px] text-[#747474] hover:text-[#F5F5F5] transition-colors cursor-pointer group select-none z-20"
+        title="Back to home"
+      >
+        <ArrowLeft className="w-4 h-4 transition-transform group-hover:-translate-x-0.5" />
+        <span className="font-medium">Back</span>
+      </Link>
+
       <div className="w-full max-w-[390px] sm:max-w-[400px] flex flex-col items-center my-auto py-8">
         
         {/* ─── Official Sakura AI Identity Lockup ─── */}
