@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/router';
 import { Mail, Lock, Eye, EyeOff, User, Loader2, AlertCircle, Check } from 'lucide-react';
-import { SakuraLogo } from '../components/SakuraLogo';
+import { SakuraLogo, SakuraWordmark } from '../components/SakuraLogo';
 
 const GoogleIcon = () => (
   <svg className="w-4 h-4 flex-shrink-0" viewBox="0 0 24 24">
@@ -108,7 +108,6 @@ export default function Login() {
     const demoUsername = `${provider.toLowerCase()}_user`;
 
     try {
-      // Automatic seamless auth for social providers
       const formData = new URLSearchParams();
       formData.append('username', demoUsername);
       formData.append('password', 'password123');
@@ -120,7 +119,6 @@ export default function Login() {
       });
 
       if (!authRes.ok) {
-        // Register if first time
         await fetch(`${apiBase}/api/v1/auth/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -153,27 +151,16 @@ export default function Login() {
       className="min-h-screen w-full bg-[#000000] text-[#F5F5F5] flex flex-col items-center justify-center p-4 selection:bg-[#E9829B]/30 select-none"
       style={{ fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" }}
     >
-      <div className="w-full max-w-[390px] sm:max-w-[410px] flex flex-col items-center my-auto py-6">
+      <div className="w-full max-w-[390px] sm:max-w-[400px] flex flex-col items-center my-auto py-8">
         
-        {/* ─── Official Sakura AI Identity ─── */}
-        <div className="flex flex-col items-center select-none mb-7">
-          <SakuraLogo size={46} className="mb-2.5 hover:scale-105 transition-transform duration-200" />
-          <div className="flex flex-col items-center">
-            <span className="text-[25px] font-bold text-white tracking-[0.24em] leading-none">
-              SAKURA
-            </span>
-            <div className="flex items-center justify-center gap-2 mt-1.5 w-full">
-              <div className="h-[1px] w-9 bg-[#E9829B]/70" />
-              <span className="text-[12px] font-semibold text-[#E9829B] tracking-[0.3em] leading-none">
-                AI
-              </span>
-              <div className="h-[1px] w-9 bg-[#E9829B]/70" />
-            </div>
-          </div>
+        {/* ─── Official Sakura AI Identity Lockup ─── */}
+        <div className="flex flex-col items-center select-none mb-8">
+          <SakuraLogo size={46} className="mb-3 hover:scale-105 transition-transform duration-200" />
+          <SakuraWordmark height={40} className="hover:opacity-95 transition-opacity" />
         </div>
 
         {/* ─── Page Title & Subtitle ─── */}
-        <div className="text-center mb-6 flex flex-col gap-1.5">
+        <div className="text-center mb-6 flex flex-col gap-1 w-full">
           <h1 className="text-[26px] sm:text-[28px] font-semibold text-[#F5F5F5] tracking-tight">
             {mode === 'signup' ? 'Create your account' : mode === 'forgot' ? 'Reset password' : 'Welcome back'}
           </h1>
@@ -206,8 +193,8 @@ export default function Login() {
           {mode === 'signup' && (
             <div className="flex flex-col gap-1.5">
               <label className="text-[13.5px] font-medium text-[#D1D1D1]">Name</label>
-              <div className="relative">
-                <User className="w-4 h-4 text-[#747474] absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <div className="relative flex items-center">
+                <User className="w-4 h-4 text-[#747474] absolute left-4 pointer-events-none" />
                 <input
                   type="text"
                   required
@@ -215,7 +202,7 @@ export default function Login() {
                   onChange={(e) => setName(e.target.value)}
                   placeholder="Your name"
                   autoComplete="name"
-                  className="w-full h-[50px] pl-11 pr-4 rounded-[11px] bg-[#171717] border border-[#303030] text-[15px] text-[#F5F5F5] placeholder-[#747474] focus:outline-none focus:border-[#555555] focus:ring-1 focus:ring-[#555555] transition-all"
+                  className="w-full h-[50px] pl-11 pr-4 rounded-[11px] bg-[#141414] border border-[#2B2B2B] text-[15px] text-[#F5F5F5] placeholder-[#747474] focus:outline-none focus:border-[#555555] focus:ring-1 focus:ring-[#555555] transition-all"
                 />
               </div>
             </div>
@@ -223,8 +210,8 @@ export default function Login() {
 
           <div className="flex flex-col gap-1.5">
             <label className="text-[13.5px] font-medium text-[#D1D1D1]">Email address</label>
-            <div className="relative">
-              <Mail className="w-4 h-4 text-[#747474] absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <div className="relative flex items-center">
+              <Mail className="w-4 h-4 text-[#747474] absolute left-4 pointer-events-none" />
               <input
                 type="text"
                 required
@@ -232,7 +219,7 @@ export default function Login() {
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder="name@example.com"
                 autoComplete="email"
-                className="w-full h-[50px] pl-11 pr-4 rounded-[11px] bg-[#171717] border border-[#303030] text-[15px] text-[#F5F5F5] placeholder-[#747474] focus:outline-none focus:border-[#555555] focus:ring-1 focus:ring-[#555555] transition-all"
+                className="w-full h-[50px] pl-11 pr-4 rounded-[11px] bg-[#141414] border border-[#2B2B2B] text-[15px] text-[#F5F5F5] placeholder-[#747474] focus:outline-none focus:border-[#555555] focus:ring-1 focus:ring-[#555555] transition-all"
               />
             </div>
           </div>
@@ -240,8 +227,8 @@ export default function Login() {
           {mode !== 'forgot' && (
             <div className="flex flex-col gap-1.5">
               <label className="text-[13.5px] font-medium text-[#D1D1D1]">Password</label>
-              <div className="relative">
-                <Lock className="w-4 h-4 text-[#747474] absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <div className="relative flex items-center">
+                <Lock className="w-4 h-4 text-[#747474] absolute left-4 pointer-events-none" />
                 <input
                   type={showPassword ? 'text' : 'password'}
                   required
@@ -249,12 +236,12 @@ export default function Login() {
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="••••••••••••"
                   autoComplete={mode === 'signup' ? 'new-password' : 'current-password'}
-                  className="w-full h-[50px] pl-11 pr-11 rounded-[11px] bg-[#171717] border border-[#303030] text-[15px] text-[#F5F5F5] placeholder-[#747474] focus:outline-none focus:border-[#555555] focus:ring-1 focus:ring-[#555555] transition-all"
+                  className="w-full h-[50px] pl-11 pr-11 rounded-[11px] bg-[#141414] border border-[#2B2B2B] text-[15px] text-[#F5F5F5] placeholder-[#747474] focus:outline-none focus:border-[#555555] focus:ring-1 focus:ring-[#555555] transition-all"
                 />
                 <button
                   type="button"
                   onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-3.5 top-1/2 -translate-y-1/2 text-[#747474] hover:text-[#F5F5F5] p-1 rounded transition-colors cursor-pointer"
+                  className="absolute right-3.5 text-[#747474] hover:text-[#F5F5F5] p-1.5 rounded transition-colors cursor-pointer"
                   tabIndex={-1}
                   title={showPassword ? 'Hide password' : 'Show password'}
                 >
@@ -268,11 +255,11 @@ export default function Login() {
           )}
 
           {mode === 'login' && (
-            <div className="flex justify-end -mt-1">
+            <div className="flex justify-end pt-0.5">
               <button
                 type="button"
                 onClick={() => { setMode('forgot'); setError(''); setSuccess(''); }}
-                className="text-[12.5px] text-[#E9829B] hover:underline transition-all cursor-pointer font-medium"
+                className="text-[13px] text-[#E9829B] hover:underline transition-all cursor-pointer font-normal"
               >
                 Forgot password?
               </button>
@@ -282,7 +269,7 @@ export default function Login() {
           <button
             type="submit"
             disabled={loading}
-            className="w-full h-[50px] rounded-[11px] bg-[#F5F5F5] hover:bg-white text-black font-semibold text-[15px] transition-all flex items-center justify-center cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed shadow-md active:scale-[0.99] mt-1"
+            className="w-full h-[50px] rounded-[11px] bg-[#F5F5F5] hover:bg-white text-black font-semibold text-[15px] transition-all flex items-center justify-center cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed shadow-md active:scale-[0.99] mt-2"
           >
             {loading ? (
               <div className="flex items-center gap-2">
@@ -296,37 +283,42 @@ export default function Login() {
 
           {mode !== 'forgot' && (
             <>
-              {/* Divider */}
-              <div className="relative flex items-center justify-center my-2">
-                <div className="w-full border-t border-[#262626]" />
-                <span className="bg-[#000000] px-3 text-[12px] text-[#747474] uppercase tracking-wider font-medium">or</span>
+              {/* Centered Symmetrical Divider */}
+              <div className="flex items-center gap-3 my-3 w-full">
+                <div className="flex-1 h-[1px] bg-[#222222]" />
+                <span className="text-[12px] text-[#747474] lowercase font-medium select-none">or</span>
+                <div className="flex-1 h-[1px] bg-[#222222]" />
               </div>
 
-              {/* Social Login Buttons */}
-              <div className="flex flex-col gap-2.5">
+              {/* Social Login Buttons with Perfectly Aligned Columns */}
+              <div className="flex flex-col gap-2.5 w-full">
                 <button
                   type="button"
                   onClick={() => handleSocialLogin('Google')}
-                  className="w-full h-[48px] rounded-[11px] bg-transparent hover:bg-[#111111] border border-[#303030] hover:border-[#444444] text-[14px] font-medium text-[#F5F5F5] flex items-center justify-center gap-3 transition-all cursor-pointer active:scale-[0.99]"
+                  className="w-full h-[48px] rounded-[11px] bg-transparent hover:bg-[#111111] border border-[#2B2B2B] hover:border-[#444444] text-[14px] font-medium text-[#F5F5F5] flex items-center justify-center transition-all cursor-pointer active:scale-[0.99]"
                 >
-                  <GoogleIcon />
-                  <span>Continue with Google</span>
+                  <div className="flex items-center gap-3 w-[190px]">
+                    <GoogleIcon />
+                    <span>Continue with Google</span>
+                  </div>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => handleSocialLogin('GitHub')}
-                  className="w-full h-[48px] rounded-[11px] bg-transparent hover:bg-[#111111] border border-[#303030] hover:border-[#444444] text-[14px] font-medium text-[#F5F5F5] flex items-center justify-center gap-3 transition-all cursor-pointer active:scale-[0.99]"
+                  className="w-full h-[48px] rounded-[11px] bg-transparent hover:bg-[#111111] border border-[#2B2B2B] hover:border-[#444444] text-[14px] font-medium text-[#F5F5F5] flex items-center justify-center transition-all cursor-pointer active:scale-[0.99]"
                 >
-                  <GitHubIcon />
-                  <span>Continue with GitHub</span>
+                  <div className="flex items-center gap-3 w-[190px]">
+                    <GitHubIcon />
+                    <span>Continue with GitHub</span>
+                  </div>
                 </button>
               </div>
             </>
           )}
 
           {/* Footer Navigation */}
-          <div className="text-center text-[13.5px] text-[#8D8D8D] mt-4">
+          <div className="text-center text-[13.5px] text-[#8D8D8D] mt-6 select-none">
             {mode === 'login' ? (
               <span>
                 Don't have an account?{' '}
