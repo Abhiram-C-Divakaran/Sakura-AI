@@ -1,0 +1,36 @@
+# Environment and secrets
+.env
+.env*.local
+.env.production
+.env.staging
+
+# Python
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.sqlite3
+*.db
+*.db-journal
+
+# Node / Frontend
+node_modules/
+.next/
+out/
+build/
+dist/
+.npm
+*.tsbuildinfo
+
+# Uploads and temporary data
+uploaded_documents/
+media/cache/
+*.log
+
+# System & IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

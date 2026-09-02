@@ -1,0 +1,341 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Outfit:wght@300;400;500;600;700;800;900&family=Inter:wght@300;400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─── CSS Custom Properties ─── */
+:root {
+  --navy:       #060a14;
+  --navy-2:     #0d1424;
+  --cyan:       #00f5ff;
+  --magenta:    #ff2d78;
+  --violet:     #8b5cf6;
+  --amber:      #ffb340;
+  --cream:      #f0e6cc;
+  --muted:      #5a6a8a;
+  --text-main:  #c8d8f0;
+}
+
+/* ─── Base Reset ─── */
+@layer base {
+  *, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    background-color: var(--navy);
+    color: var(--text-main);
+    font-family: 'Inter', sans-serif;
+    overflow-x: hidden;
+    cursor: default;
+  }
+
+  ::selection {
+    background: rgba(0, 245, 255, 0.3);
+    color: #fff;
+  }
+
+  ::-webkit-scrollbar {
+    width: 4px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #060a14;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(0, 245, 255, 0.25);
+    border-radius: 2px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 245, 255, 0.5);
+  }
+}
+
+/* ─── CRT Scanline Overlay ─── */
+.crt-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9990;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0, 0, 0, 0.12) 2px,
+      rgba(0, 0, 0, 0.12) 4px
+    );
+}
+
+/* Chromatic aberration tint */
+.crt-overlay::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 0, 60, 0.02),
+    rgba(0, 255, 200, 0.02),
+    rgba(0, 60, 255, 0.02)
+  );
+  mix-blend-mode: screen;
+}
+
+/* Rolling scanline bar */
+.scanline-roll {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 180px;
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    rgba(0, 245, 255, 0.025) 40%,
+    rgba(0, 245, 255, 0.04) 50%,
+    rgba(0, 245, 255, 0.025) 60%,
+    transparent
+  );
+  z-index: 9989;
+  pointer-events: none;
+  animation: scanroll 9s linear infinite;
+}
+
+/* Film grain */
+.film-grain {
+  position: fixed;
+  inset: 0;
+  z-index: 9988;
+  pointer-events: none;
+  opacity: 0.04;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 180px 180px;
+}
+
+/* VHS noise glitch (used sparingly) */
+.vhs-flicker {
+  animation: flicker 8s linear infinite;
+}
+
+/* ─── Glow Text Utilities ─── */
+.glow-cyan {
+  text-shadow:
+    0 0 10px rgba(0, 245, 255, 0.8),
+    0 0 30px rgba(0, 245, 255, 0.4),
+    0 0 60px rgba(0, 245, 255, 0.2);
+}
+
+.glow-magenta {
+  text-shadow:
+    0 0 10px rgba(255, 45, 120, 0.8),
+    0 0 30px rgba(255, 45, 120, 0.4);
+}
+
+.glow-violet {
+  text-shadow:
+    0 0 10px rgba(139, 92, 246, 0.8),
+    0 0 30px rgba(139, 92, 246, 0.4);
+}
+
+/* ─── Glass Panels ─── */
+.glass {
+  background: rgba(13, 20, 36, 0.75);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.glass-bright {
+  background: rgba(20, 30, 50, 0.85);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(0, 245, 255, 0.12);
+}
+
+/* ─── CRT Monitor Bezel ─── */
+.crt-bezel {
+  box-shadow:
+    inset 0 0 100px rgba(0, 0, 0, 0.9),
+    inset 0 0 30px rgba(0, 245, 255, 0.04),
+    0 0 40px rgba(139, 92, 246, 0.1),
+    0 30px 80px rgba(0, 0, 0, 0.6);
+}
+
+/* ─── Gradient Borders ─── */
+.border-glow {
+  border: 1px solid transparent;
+  background-clip: padding-box;
+  position: relative;
+}
+
+.border-glow::before {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  background: linear-gradient(135deg, rgba(0,245,255,0.3), rgba(139,92,246,0.3), rgba(255,45,120,0.2));
+  z-index: -1;
+}
+
+/* ─── Shimmer text ─── */
+.shimmer-text {
+  background: linear-gradient(
+    90deg,
+    var(--text-main) 0%,
+    var(--cyan) 30%,
+    var(--violet) 50%,
+    var(--cyan) 70%,
+    var(--text-main) 100%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer 4s linear infinite;
+}
+
+/* ─── Terminal cursor blink ─── */
+.cursor-blink::after {
+  content: '█';
+  color: var(--cyan);
+  animation: blink 1s step-end infinite;
+  margin-left: 2px;
+}
+
+/* ─── Neon button ─── */
+.btn-neon {
+  position: relative;
+  overflow: hidden;
+  transition: all 0.3s ease;
+}
+
+.btn-neon::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, rgba(0,245,255,0.15), rgba(139,92,246,0.15));
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.btn-neon:hover::before {
+  opacity: 1;
+}
+
+.btn-neon:hover {
+  box-shadow: 0 0 25px rgba(0,245,255,0.4), 0 0 60px rgba(0,245,255,0.15);
+  border-color: rgba(0,245,255,0.7);
+  color: #fff;
+  transform: translateY(-1px);
+}
+
+/* ─── Status dot pulse ─── */
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  display: inline-block;
+  animation: pulseGlow 2s ease-in-out infinite;
+}
+
+.status-dot.cyan    { background: var(--cyan);    box-shadow: 0 0 8px var(--cyan); }
+.status-dot.green   { background: #39ff14;         box-shadow: 0 0 8px #39ff14; }
+.status-dot.magenta { background: var(--magenta);  box-shadow: 0 0 8px var(--magenta); }
+
+/* ─── Section dividers ─── */
+.section-divider {
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(0, 245, 255, 0.2) 20%,
+    rgba(139, 92, 246, 0.3) 50%,
+    rgba(0, 245, 255, 0.2) 80%,
+    transparent 100%
+  );
+}
+
+/* ─── Reduced Motion ─── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ─── Keyframes ─── */
+@keyframes flicker {
+  0%, 19.9%, 22%, 62.9%, 64%, 64.9%, 70%, 100% { opacity: 0.99; }
+  20%, 21.9%, 63%, 63.9%, 65%, 69.9%           { opacity: 0.5; }
+}
+
+@keyframes scanroll {
+  0%   { transform: translateY(-180px); }
+  100% { transform: translateY(100vh); }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -200% center; }
+  100% { background-position:  200% center; }
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+
+@keyframes pulseGlow {
+  0%, 100% { box-shadow: 0 0 4px currentColor; }
+  50%       { box-shadow: 0 0 12px currentColor, 0 0 20px currentColor; }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0px) rotate(0deg); }
+  33%       { transform: translateY(-8px) rotate(0.5deg); }
+  66%       { transform: translateY(-4px) rotate(-0.5deg); }
+}
+
+@keyframes rain {
+  0%   { transform: translateY(-100%) translateX(0); opacity: 0; }
+  10%  { opacity: 0.6; }
+  90%  { opacity: 0.3; }
+  100% { transform: translateY(100vh) translateX(-20px); opacity: 0; }
+}
+
+.rain-drop {
+  position: absolute;
+  width: 1px;
+  background: linear-gradient(to bottom, transparent, rgba(0, 245, 255, 0.4));
+  animation: rain linear infinite;
+  pointer-events: none;
+}
+
+/* ─── Minimal AI Chat Sidebar Scrollbar ─── */
+.sidebar-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #262626 transparent;
+}
+.sidebar-scroll::-webkit-scrollbar {
+  width: 5px;
+}
+.sidebar-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.sidebar-scroll::-webkit-scrollbar-thumb {
+  background: #262626;
+  border-radius: 4px;
+}
+.sidebar-scroll::-webkit-scrollbar-thumb:hover {
+  background: #383838;
+}
+

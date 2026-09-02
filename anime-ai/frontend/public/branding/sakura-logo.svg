@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 280" width="100%" height="100%" fill="none">
+  <defs>
+    <filter id="subtle-glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="2" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+    <g id="petal">
+      <!-- Individual petal with notched tip -->
+      <path d="M 140 140 C 116 105 100 65 124 32 C 131 23 138 25 140 31 C 142 25 149 23 156 32 C 180 65 164 105 140 140 Z" 
+            stroke="#FF7597" stroke-width="4.5" fill="rgba(255, 117, 151, 0.08)" filter="url(#subtle-glow)" />
+      <path d="M 140 140 C 120 108 110 72 127 42 C 132 34 137 36 140 40 C 143 36 148 34 153 42 C 170 72 160 108 140 140 Z" 
+            stroke="#FFA8BD" stroke-width="1.8" fill="none" opacity="0.9" />
+    </g>
+    <g id="stamen">
+      <line x1="140" y1="140" x2="140" y2="80" stroke="#FF7597" stroke-width="2.2" stroke-linecap="round" />
+      <circle cx="140" cy="78" r="3.8" fill="none" stroke="#FF7597" stroke-width="2" />
+    </g>
+    <g id="stamen-short">
+      <line x1="140" y1="140" x2="140" y2="95" stroke="#FF7597" stroke-width="1.8" stroke-linecap="round" />
+      <circle cx="140" cy="93" r="3.2" fill="none" stroke="#FF7597" stroke-width="1.8" />
+    </g>
+  </defs>
+
+  <!-- 5 Petals rotated at 72 deg increments -->
+  <use href="#petal" />
+  <use href="#petal" transform="rotate(72 140 140)" />
+  <use href="#petal" transform="rotate(144 140 140)" />
+  <use href="#petal" transform="rotate(216 140 140)" />
+  <use href="#petal" transform="rotate(288 140 140)" />
+
+  <!-- Stamens: 10 stamens radiating outwards -->
+  <use href="#stamen" transform="rotate(0 140 140)" />
+  <use href="#stamen-short" transform="rotate(36 140 140)" />
+  <use href="#stamen" transform="rotate(72 140 140)" />
+  <use href="#stamen-short" transform="rotate(108 140 140)" />
+  <use href="#stamen" transform="rotate(144 140 140)" />
+  <use href="#stamen-short" transform="rotate(180 140 140)" />
+  <use href="#stamen" transform="rotate(216 140 140)" />
+  <use href="#stamen-short" transform="rotate(252 140 140)" />
+  <use href="#stamen" transform="rotate(288 140 140)" />
+  <use href="#stamen-short" transform="rotate(324 140 140)" />
+
+  <!-- Central Ring -->
+  <circle cx="140" cy="140" r="16" stroke="#FF7597" stroke-width="6" fill="none" filter="url(#subtle-glow)" />
+  <circle cx="140" cy="140" r="16" stroke="#FFA8BD" stroke-width="2.5" fill="none" />
+</svg>
