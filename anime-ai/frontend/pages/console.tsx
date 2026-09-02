@@ -6,9 +6,10 @@ import {
   PanelRightClose, PanelRightOpen,
   CheckCircle, Copy, RefreshCw, ThumbsUp, ThumbsDown,
   FileText, ImageIcon, Code, BarChart2, Pencil, Pin, Archive, Trash2,
-  ZoomIn, Download, Check, Sparkles, Info, Settings, Moon, HelpCircle, X,
+  ZoomIn, Download, Check, Sparkles, Info, Settings, Moon, Sun, Palette, HelpCircle, X, AlertCircle,
   Compass, Store
 } from 'lucide-react';
+import { useTheme, THEME_LIST, ThemeMode } from '../components/ThemeContext';
 import { ChatComposer, ChatSubmitPayload } from '../components/ChatComposer';
 import { LibraryView } from '../components/LibraryView';
 import { ShareModal, DeleteConfirmModal } from '../components/ChatModals';
@@ -101,6 +102,9 @@ export default function Console() {
   const [editingChatId, setEditingChatId] = useState<string | null>(null);
   const [shareModalChat, setShareModalChat] = useState<{ id: string; title: string } | null>(null);
   const [deleteModalChat, setDeleteModalChat] = useState<{ id: string; title: string } | null>(null);
+
+  // Theme & Appearance
+  const { theme, setTheme, cycleTheme, themes } = useTheme();
 
   // Search & Account modal state
   const [showSearchModal, setShowSearchModal] = useState(false);
@@ -247,6 +251,23 @@ export default function Console() {
       tools: ['create_image'],
       attachments: meta.id ? [{ id: meta.id, filename: meta.filename || 'parent_image.png', mime_type: 'image/png' }] : []
     });
+  };
+
+  const [prefilledPrompt, setPrefilledPrompt] = useState<string | null>(null);
+
+  const handleRetryImage = (errorData: any) => {
+    handleSendMessage({
+      message: errorData?.prompt || 'Create an image',
+      intensity: (errorData?.intensity as any) || 'medium',
+      tools: ['create_image'],
+      attachments: []
+    });
+  };
+
+  const handleEditImagePrompt = (errorData: any) => {
+    if (errorData?.prompt) {
+      setPrefilledPrompt(errorData.prompt);
+    }
   };
 
   const [systemStatus, setSystemStatus] = useState({ cpu: 24, memory: 56 });
@@ -1279,7 +1300,7 @@ export default function Console() {
   };
 
   return (
-    <div className="h-screen w-screen bg-black text-[#F5F5F5] flex overflow-hidden" style={{ fontFamily: "'Inter', -apple-system, system-ui, 'Segoe UI', Helvetica, Arial, sans-serif" }}>
+    <div className="h-screen w-screen bg-theme-app text-theme-text flex overflow-hidden transition-colors duration-200" style={{ fontFamily: "'Inter', -apple-system, system-ui, 'Segoe UI', Helvetica, Arial, sans-serif" }}>
 
       {/* Mobile Backdrop when sidebar is open */}
       {isMobile && sidebarOpen && (
@@ -1292,7 +1313,7 @@ export default function Console() {
       {/* ═══ LEFT SIDEBAR ═══ */}
       <aside
         aria-label="Sidebar navigation"
-        className={`flex-shrink-0 flex flex-col bg-black border-r border-[#202020] transition-all duration-200 ease-in-out select-none ${
+        className={`flex-shrink-0 flex flex-col bg-theme-sidebar border-r border-theme-border transition-all duration-200 ease-in-out select-none ${
           isMobile
             ? (sidebarOpen ? 'fixed inset-y-0 left-0 z-40 w-[272px]' : 'hidden')
             : (sidebarOpen ? 'w-[272px]' : 'w-[56px]')
@@ -1300,7 +1321,7 @@ export default function Console() {
       >
         {sidebarOpen ? (
           /* ─── EXPANDED SIDEBAR (272px) ─── */
-          <div className="w-[272px] flex flex-col h-full overflow-hidden bg-black">
+          <div className="w-[272px] flex flex-col h-full overflow-hidden bg-theme-sidebar">
             {/* Top Header: Brand on Left, Search & Toggle on Right */}
             <div className="pt-3 pb-2 px-3 flex items-center justify-between flex-shrink-0">
               <div className="flex items-center gap-2.5 select-none min-w-0">
@@ -1514,7 +1535,7 @@ export default function Console() {
           </div>
         ) : (
           /* ─── COLLAPSED ICON RAIL (56px) ─── */
-          <div className="w-[56px] flex flex-col h-full items-center py-3 bg-black">
+          <div className="w-[56px] flex flex-col h-full items-center py-3 bg-theme-sidebar border-r border-theme-border">
             {/* Top: Official Transparent Sakura Flower Logo */}
             <div className="relative group flex items-center justify-center">
               <button
@@ -1623,7 +1644,7 @@ export default function Console() {
       </aside>
 
       {/* ═══ CENTER CHAT ═══ */}
-      <div className="flex-1 flex flex-col min-w-0 bg-black">
+      <div className="flex-1 flex flex-col min-w-0 bg-theme-chat transition-colors duration-200">
 
         <div className="h-[52px] flex items-center justify-between px-4 flex-shrink-0">
           <div className="flex items-center gap-1">
@@ -1633,14 +1654,14 @@ export default function Console() {
                   <button
                     type="button"
                     onClick={() => setSidebarOpen(true)}
-                    className="w-9 h-9 flex items-center justify-center text-[#B0B0B0] hover:text-white hover:bg-white/[0.08] active:bg-white/[0.12] rounded-lg transition-colors cursor-pointer focus:outline-none focus-visible:ring-1 focus-visible:ring-white/20"
+                    className="w-9 h-9 flex items-center justify-center text-theme-muted hover:text-theme-text hover:bg-theme-hover rounded-lg transition-colors cursor-pointer focus:outline-none"
                     aria-label="Expand sidebar"
                     aria-expanded="false"
                   >
                     <SidebarToggleIcon className="w-[19px] h-[19px]" />
                   </button>
                   <div className="absolute left-0 top-full mt-1.5 hidden group-hover/sidebarToggle:flex group-focus-within/sidebarToggle:flex items-center z-50 pointer-events-none">
-                    <div className="bg-[#242424] text-[#F5F5F5] text-[12px] font-medium px-2.5 py-0.5 rounded-md shadow-xl border border-white/[0.08] whitespace-nowrap">
+                    <div className="bg-theme-card text-theme-text text-[12px] font-medium px-2.5 py-0.5 rounded-md shadow-xl border border-theme-border whitespace-nowrap">
                       Open sidebar
                     </div>
                   </div>
@@ -1658,7 +1679,7 @@ export default function Console() {
                   setShareModalChat({ id: activeConvId, title: conv?.title || getActiveTitle() });
                 }
               }}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-[#EDEDED] hover:text-white hover:bg-white/[0.08] rounded-lg transition-colors cursor-pointer select-none"
+              className="flex items-center gap-1.5 px-3 py-1.5 text-theme-muted hover:text-theme-text hover:bg-theme-hover rounded-lg transition-colors cursor-pointer select-none"
               title="Share conversation"
             >
               <ShareIcon />
@@ -1801,7 +1822,7 @@ export default function Console() {
             {messages.length === 0 && !streamingResponse ? (
               <div className="flex flex-col items-center justify-center pt-[28vh] gap-3 select-none">
                 <SakuraLogo size={36} className="opacity-80 hover:opacity-100 transition-opacity" alt="Sakura AI" />
-                <h1 className="text-[26px] font-medium text-[#EDEDED] tracking-tight">Ask Sakura AI</h1>
+                <h1 className="text-[26px] font-medium text-theme-text tracking-tight">Ask Sakura AI</h1>
               </div>
             ) : (
               <div className="flex flex-col gap-7">
@@ -1809,7 +1830,7 @@ export default function Console() {
                   <div key={i}>
                     {m.role === 'user' ? (
                       <div className="flex justify-end">
-                        <div className="bg-[#0E0E0E] border border-[#1F1F1F] px-5 py-3 rounded-3xl max-w-[70%] text-[16px] leading-[1.65]">
+                        <div className="bg-theme-user-bubble border border-theme-border text-theme-text px-5 py-3 rounded-3xl max-w-[70%] text-[16px] leading-[1.65] shadow-xs">
                           {m.content}
                         </div>
                       </div>
@@ -1826,6 +1847,8 @@ export default function Console() {
                             onRegenerate={handleImageRegenerate}
                             onVariation={handleImageVariation}
                             onUpscale={handleImageUpscale}
+                            onRetryImage={handleRetryImage}
+                            onEditPrompt={handleEditImagePrompt}
                           />
                           <div className="flex items-center gap-0.5 mt-3 -ml-1.5">
                             <button onClick={() => handleCopy(m.content, i)} className="p-1.5 text-[#6B6B6B] hover:text-white hover:bg-[#1A1A1A] rounded-lg transition-colors cursor-pointer" title="Copy">
@@ -1856,6 +1879,8 @@ export default function Console() {
                           onRegenerate={handleImageRegenerate}
                           onVariation={handleImageVariation}
                           onUpscale={handleImageUpscale}
+                          onRetryImage={handleRetryImage}
+                          onEditPrompt={handleEditImagePrompt}
                         />
                       ) : (
                         <div className="flex items-center gap-2.5 py-2 text-[#8D8D8D] text-[13.5px]">
@@ -1907,6 +1932,8 @@ export default function Console() {
               onClearExternalAttachment={() => setAttachedFromLibrary(null)}
               editingImage={editingImage}
               onClearEditingImage={() => setEditingImage(null)}
+              prefilledText={prefilledPrompt}
+              onClearPrefilledText={() => setPrefilledPrompt(null)}
             />
           </div>
         )}
@@ -2211,49 +2238,77 @@ export default function Console() {
             onClick={() => setShowAccountMenu(false)}
           />
           <div
-            className={`fixed z-50 bg-[#121212] border border-[#262626] rounded-xl shadow-2xl p-1.5 flex flex-col gap-0.5 text-[13px] text-[#E0E0E0] select-none animate-in fade-in duration-100 ${
-              sidebarOpen ? 'left-[268px] bottom-3 w-60' : 'left-[62px] bottom-3 w-60'
+            className={`fixed z-50 bg-theme-card border border-theme-border rounded-2xl shadow-2xl p-2 flex flex-col gap-1 text-[13px] text-theme-text select-none animate-in fade-in duration-100 ${
+              sidebarOpen ? 'left-[268px] bottom-3 w-[270px]' : 'left-[62px] bottom-3 w-[270px]'
             }`}
           >
-            <div className="px-3 py-2.5 flex items-center gap-2.5 border-b border-[#202020] mb-1">
+            <div className="px-3 py-2.5 flex items-center gap-2.5 border-b border-theme-border mb-0.5">
               <div className="w-8 h-8 rounded-full bg-gradient-to-br from-[#9880ED] to-[#E98297] flex items-center justify-center text-[12px] font-bold text-white flex-shrink-0">
                 {currentUser ? currentUser.substring(0, 1).toUpperCase() : 'S'}
               </div>
               <div className="flex flex-col min-w-0">
-                <span className="font-semibold text-white truncate text-[13.5px]">{currentUser || 'Operator'}</span>
-                <span className="text-[11px] text-[#7A7A7A]">Sakura Plus</span>
+                <span className="font-semibold text-theme-text truncate text-[13.5px]">{currentUser || 'Operator'}</span>
+                <span className="text-[11px] text-theme-muted">Sakura Plus</span>
+              </div>
+            </div>
+
+            {/* Theme Options in Accounts Section */}
+            <div className="px-2.5 py-2 my-0.5 rounded-xl bg-theme-surface/70 border border-theme-border flex flex-col gap-1.5">
+              <div className="flex items-center justify-between px-0.5 text-[11px] font-semibold text-theme-dim tracking-wider uppercase">
+                <span>Theme</span>
+                <span className="font-mono text-theme-text text-[11px] capitalize">
+                  {themes.find(t => t.id === theme)?.name}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+                {themes.map((t) => {
+                  const active = theme === t.id;
+                  return (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => setTheme(t.id)}
+                      className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-left transition-all cursor-pointer text-[12px] ${
+                        active
+                          ? 'bg-theme-active text-theme-text font-medium border border-theme-border shadow-xs'
+                          : 'text-theme-muted hover:text-theme-text hover:bg-theme-hover border border-transparent'
+                      }`}
+                    >
+                      <span
+                        className="w-3.5 h-3.5 rounded-full border border-white/20 flex items-center justify-center flex-shrink-0 shadow-inner"
+                        style={{ backgroundColor: t.previewBg }}
+                      >
+                        <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: t.previewAccent }} />
+                      </span>
+                      <span className="truncate">{t.name}</span>
+                      {active && <Check className="w-3 h-3 text-theme-accent ml-auto flex-shrink-0" />}
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
             <button
               onClick={() => { setShowAccountMenu(false); setShowSettingsModal(true); }}
-              className="flex items-center gap-2.5 px-3 py-2 rounded-lg hover:bg-[#1E1E1E] hover:text-white transition-colors cursor-pointer text-left"
+              className="flex items-center gap-2.5 px-3 py-2 rounded-lg hover:bg-theme-hover hover:text-theme-text transition-colors cursor-pointer text-left"
             >
-              <Settings className="w-4 h-4 text-[#888888]" />
+              <Settings className="w-4 h-4 text-theme-muted" />
               <span>Settings</span>
             </button>
 
             <button
               onClick={() => { setShowAccountMenu(false); }}
-              className="flex items-center gap-2.5 px-3 py-2 rounded-lg hover:bg-[#1E1E1E] hover:text-white transition-colors cursor-pointer text-left"
+              className="flex items-center gap-2.5 px-3 py-2 rounded-lg hover:bg-theme-hover hover:text-theme-text transition-colors cursor-pointer text-left"
             >
-              <Moon className="w-4 h-4 text-[#888888]" />
-              <span>Appearance: Pitch Black</span>
-            </button>
-
-            <button
-              onClick={() => { setShowAccountMenu(false); }}
-              className="flex items-center gap-2.5 px-3 py-2 rounded-lg hover:bg-[#1E1E1E] hover:text-white transition-colors cursor-pointer text-left"
-            >
-              <HelpCircle className="w-4 h-4 text-[#888888]" />
+              <HelpCircle className="w-4 h-4 text-theme-muted" />
               <span>Help & FAQ</span>
             </button>
 
-            <div className="h-[1px] bg-[#202020] my-1" />
+            <div className="h-[1px] bg-theme-border my-1" />
 
             <button
               onClick={() => { setShowAccountMenu(false); handleLogout(); }}
-              className="flex items-center gap-2.5 px-3 py-2 rounded-lg hover:bg-[#2A1519] hover:text-[#FF6B8B] text-[#E08A9A] transition-colors cursor-pointer text-left"
+              className="flex items-center gap-2.5 px-3 py-2 rounded-lg hover:bg-red-500/10 hover:text-red-400 text-red-400 transition-colors cursor-pointer text-left"
             >
               <LogOut className="w-4 h-4" />
               <span>Log out</span>
@@ -2338,52 +2393,91 @@ export default function Console() {
       {showSettingsModal && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-xs z-50 flex items-center justify-center p-4">
           <div className="fixed inset-0" onClick={() => setShowSettingsModal(false)} />
-          <div className="relative bg-[#121212] border border-[#262626] rounded-2xl w-full max-w-md shadow-2xl p-5 flex flex-col gap-4 z-10 animate-in fade-in zoom-in-95 duration-150">
-            <div className="flex justify-between items-center border-b border-[#222222] pb-3">
+          <div className="relative bg-theme-card border border-theme-border rounded-2xl w-full max-w-lg shadow-2xl p-5 flex flex-col gap-4 z-10 animate-in fade-in zoom-in-95 duration-150">
+            <div className="flex justify-between items-center border-b border-theme-border pb-3">
               <div className="flex items-center gap-2">
-                <Settings className="w-5 h-5 text-[#FF7597]" />
-                <h3 className="text-[15px] font-semibold text-white">Settings</h3>
+                <Settings className="w-5 h-5 text-theme-accent" />
+                <h3 className="text-[15px] font-semibold text-theme-text">Settings</h3>
               </div>
-              <button onClick={() => setShowSettingsModal(false)} className="text-[#888888] hover:text-white p-1 rounded-lg hover:bg-[#202020] cursor-pointer">
+              <button onClick={() => setShowSettingsModal(false)} className="text-theme-muted hover:text-theme-text p-1 rounded-lg hover:bg-theme-hover cursor-pointer">
                 <X className="w-4 h-4" />
               </button>
             </div>
 
             <div className="flex flex-col gap-4 text-[13.5px]">
-              <div className="flex items-center justify-between py-1">
-                <div>
-                  <div className="text-white font-medium">Theme</div>
-                  <div className="text-xs text-[#777777]">Ultra-minimal pitch-black aesthetic</div>
+              {/* Interactive Theme Selection */}
+              <div className="flex flex-col gap-2.5">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-theme-text font-medium">Appearance & Theme</div>
+                    <div className="text-xs text-theme-muted">Select your preferred visual environment</div>
+                  </div>
+                  <span className="text-xs font-mono px-2 py-0.5 rounded bg-theme-surface text-theme-muted border border-theme-border">
+                    {themes.find(t => t.id === theme)?.name}
+                  </span>
                 </div>
-                <span className="text-xs font-mono bg-[#1E1E1E] text-[#FF7597] px-2.5 py-1 rounded-md border border-[#333333]">
-                  Pitch Black (#000000)
-                </span>
+
+                <div className="grid grid-cols-2 gap-2.5">
+                  {themes.map((t) => {
+                    const active = theme === t.id;
+                    return (
+                      <button
+                        key={t.id}
+                        type="button"
+                        onClick={() => setTheme(t.id)}
+                        className={`flex flex-col gap-1.5 p-3 rounded-xl border text-left transition-all cursor-pointer relative ${
+                          active
+                            ? 'border-theme-accent bg-theme-surface ring-1 ring-theme-accent/40 shadow-md'
+                            : 'border-theme-border bg-theme-panel hover:border-theme-border-card hover:bg-theme-hover'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span
+                              className="w-5 h-5 rounded-full border border-white/20 flex items-center justify-center shadow-inner flex-shrink-0"
+                              style={{ backgroundColor: t.previewBg }}
+                            >
+                              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: t.previewAccent }} />
+                            </span>
+                            <span className="text-[13px] font-semibold text-theme-text">{t.name}</span>
+                          </div>
+                          {active && (
+                            <span className="w-4 h-4 rounded-full bg-theme-accent text-white flex items-center justify-center text-[10px] font-bold">
+                              ✓
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-theme-muted leading-tight">{t.description}</p>
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
 
-              <div className="flex items-center justify-between py-1">
+              <div className="flex items-center justify-between py-1 border-t border-theme-border/60 pt-3">
                 <div>
-                  <div className="text-white font-medium">Keyboard Shortcuts</div>
-                  <div className="text-xs text-[#777777]">Quick console navigation</div>
+                  <div className="text-theme-text font-medium">Keyboard Shortcuts</div>
+                  <div className="text-xs text-theme-muted">Quick console navigation</div>
                 </div>
-                <div className="flex flex-col gap-1 items-end text-xs font-mono text-[#888888]">
-                  <span>Toggle Sidebar: <kbd className="bg-[#202020] px-1.5 py-0.5 rounded text-white">Ctrl+[</kbd></span>
-                  <span>Search: <kbd className="bg-[#202020] px-1.5 py-0.5 rounded text-white">Ctrl+K</kbd></span>
+                <div className="flex flex-col gap-1 items-end text-xs font-mono text-theme-muted">
+                  <span>Toggle Sidebar: <kbd className="bg-theme-surface px-1.5 py-0.5 rounded text-theme-text border border-theme-border">Ctrl+[</kbd></span>
+                  <span>Search: <kbd className="bg-theme-surface px-1.5 py-0.5 rounded text-theme-text border border-theme-border">Ctrl+K</kbd></span>
                 </div>
               </div>
 
-              <div className="flex items-center justify-between py-1">
+              <div className="flex items-center justify-between py-1 border-t border-theme-border/60 pt-3">
                 <div>
-                  <div className="text-white font-medium">Platform</div>
-                  <div className="text-xs text-[#777777]">Sakura AI Autonomous Core</div>
+                  <div className="text-theme-text font-medium">Platform</div>
+                  <div className="text-xs text-theme-muted">Sakura AI Autonomous Core</div>
                 </div>
-                <span className="text-xs font-mono text-[#888888]">v2.4.0</span>
+                <span className="text-xs font-mono text-theme-muted">v2.4.0</span>
               </div>
             </div>
 
-            <div className="flex justify-end pt-2 border-t border-[#222222]">
+            <div className="flex justify-end pt-2 border-t border-theme-border">
               <button
                 onClick={() => setShowSettingsModal(false)}
-                className="px-4 py-1.5 bg-[#202020] hover:bg-[#282828] text-white rounded-lg text-[13px] font-medium transition-colors cursor-pointer"
+                className="px-4 py-1.5 bg-theme-surface hover:bg-theme-hover text-theme-text border border-theme-border rounded-lg text-[13px] font-medium transition-colors cursor-pointer"
               >
                 Close
               </button>
@@ -2897,6 +2991,51 @@ function InteractiveImageCard({
   );
 }
 
+/* ═══════════════ Image Generation Failure Card ═══════════════ */
+function ImageGenerationFailureCard({
+  errorData,
+  onRetry,
+  onEditPrompt
+}: {
+  errorData: any;
+  onRetry: (data: any) => void;
+  onEditPrompt: (data: any) => void;
+}) {
+  return (
+    <div className="my-3.5 p-4 rounded-2xl bg-red-950/20 border border-red-500/25 max-w-[440px] flex flex-col gap-3 shadow-lg select-none">
+      <div className="flex items-start gap-3">
+        <div className="w-8 h-8 rounded-full bg-red-500/15 flex items-center justify-center text-red-400 flex-shrink-0 mt-0.5 border border-red-500/20">
+          <AlertCircle className="w-4 h-4" />
+        </div>
+        <div className="flex flex-col min-w-0">
+          <span className="text-[14px] font-semibold text-theme-text leading-tight">Couldn't create the image.</span>
+          <span className="text-[12.5px] text-theme-muted mt-1 leading-snug">The generation service took too long to respond.</span>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-2 pt-0.5 pl-11">
+        <button
+          type="button"
+          onClick={() => onRetry(errorData)}
+          className="px-3.5 py-1.5 rounded-xl bg-theme-surface hover:bg-theme-hover border border-theme-border hover:border-theme-border-card text-theme-text text-[12.5px] font-medium transition-all flex items-center gap-1.5 cursor-pointer shadow-xs active:scale-[0.98]"
+        >
+          <RefreshCw className="w-3.5 h-3.5 text-theme-accent" />
+          <span>Retry</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => onEditPrompt(errorData)}
+          className="px-3.5 py-1.5 rounded-xl bg-transparent hover:bg-theme-hover border border-transparent text-theme-muted hover:text-theme-text text-[12.5px] font-medium transition-all flex items-center gap-1.5 cursor-pointer"
+        >
+          <Pencil className="w-3.5 h-3.5" />
+          <span>Edit prompt</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /* ═══════════════ Markdown Renderer ═══════════════ */
 function MarkdownContent({
   content,
@@ -2904,7 +3043,9 @@ function MarkdownContent({
   onEdit,
   onRegenerate,
   onVariation,
-  onUpscale
+  onUpscale,
+  onRetryImage,
+  onEditPrompt
 }: {
   content: string;
   onOpenLightbox?: (src: string, alt: string, meta?: ImageMetadata | null) => void;
@@ -2912,6 +3053,8 @@ function MarkdownContent({
   onRegenerate?: (prompt: string) => void;
   onVariation?: (meta: ImageMetadata) => void;
   onUpscale?: (meta: ImageMetadata) => void;
+  onRetryImage?: (errorData: any) => void;
+  onEditPrompt?: (errorData: any) => void;
 }) {
   let extractedMeta: ImageMetadata | null = null;
   const metaMatch = content.match(/<!--\s*SAKURA_IMAGE_DATA:\s*(\{.*?\})\s*-->/);
@@ -2923,29 +3066,51 @@ function MarkdownContent({
     }
   }
 
+  let extractedError: any = null;
+  const errorMatch = content.match(/<!--\s*SAKURA_IMAGE_ERROR:\s*(\{.*?\})\s*-->/);
+  if (errorMatch) {
+    try {
+      extractedError = JSON.parse(errorMatch[1]);
+    } catch (e) {
+      console.error('Failed to parse image error metadata', e);
+    }
+  }
+
+  // If this message contains an image generation timeout or error, render the failure card directly
+  if (extractedError) {
+    return (
+      <ImageGenerationFailureCard
+        errorData={extractedError}
+        onRetry={onRetryImage || (() => {})}
+        onEditPrompt={onEditPrompt || (() => {})}
+      />
+    );
+  }
+
   const cleaned = content
     .replace(/<think>[\s\S]*?(?:<\/think>|$)/g, '')
     .replace(/<!--\s*SAKURA_IMAGE_DATA:\s*\{.*?\}\s*-->/g, '')
+    .replace(/<!--\s*SAKURA_IMAGE_ERROR:\s*\{.*?\}\s*-->/g, '')
     .trim();
 
   const parts = cleaned.split('```');
   return (
-    <div className="text-[16px] leading-[1.7] text-[#D1D1D1]">
+    <div className="text-[16px] leading-[1.7] text-theme-text">
       {parts.map((part, i) => {
         if (i % 2 === 1) {
           const lines = part.trim().split('\n');
           const lang = lines[0] || '';
           const code = lines.slice(1).join('\n');
           return (
-            <div key={i} className="my-4 bg-[#0A0A0A] rounded-xl overflow-hidden border border-[#1F1F1F]" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+            <div key={i} className="my-4 bg-theme-card rounded-xl overflow-hidden border border-theme-border" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
               {lang && (
-                <div className="px-4 py-2 border-b border-[#1F1F1F] text-[12px] text-[#6B6B6B] flex justify-between items-center">
+                <div className="px-4 py-2 border-b border-theme-border text-[12px] text-theme-muted flex justify-between items-center bg-theme-panel">
                   <span>{lang}</span>
-                  <button className="text-[#6B6B6B] hover:text-white transition-colors cursor-pointer text-[11px] flex items-center gap-1"><Copy className="w-3.5 h-3.5" /> Copy</button>
+                  <button className="text-theme-muted hover:text-theme-text transition-colors cursor-pointer text-[11px] flex items-center gap-1"><Copy className="w-3.5 h-3.5" /> Copy</button>
                 </div>
               )}
               <div className="p-4 overflow-x-auto text-[14px] leading-[1.6]">
-                <pre className="text-[#E8E8E8]"><code>{code}</code></pre>
+                <pre className="text-theme-text"><code>{code}</code></pre>
               </div>
             </div>
           );
@@ -2995,7 +3160,7 @@ function TextBlock({
       const Tag = isOrdered ? 'ol' : 'ul';
       const cls = isOrdered ? 'list-decimal' : 'list-disc';
       elements.push(
-        <Tag key={key} className={`${cls} pl-6 flex flex-col gap-1.5 my-3 text-[#D1D1D1] marker:text-[#6B6B6B]`}>
+        <Tag key={key} className={`${cls} pl-6 flex flex-col gap-1.5 my-3 text-theme-text marker:text-theme-muted`}>
           {listItems.map((li, j) => <li key={j}><InlineFormat text={li.text} /></li>)}
         </Tag>
       );
@@ -3008,10 +3173,10 @@ function TextBlock({
       const header = tableRows[0];
       const rows = tableRows.slice(1).filter(r => !r.every(c => c.match(/^:?-+:?$/)));
       elements.push(
-        <div key={key} className="my-4 overflow-x-auto rounded-xl border border-[#262626] bg-[#0E0E0E]">
+        <div key={key} className="my-4 overflow-x-auto rounded-xl border border-theme-border bg-theme-card">
           <table className="w-full text-left text-[13.5px]">
             {header && (
-              <thead className="bg-[#181818] border-b border-[#262626] text-white">
+              <thead className="bg-theme-panel border-b border-theme-border text-theme-text">
                 <tr>
                   {header.map((th, hi) => (
                     <th key={hi} className="px-3.5 py-2.5 font-medium"><InlineFormat text={th} /></th>
@@ -3019,11 +3184,11 @@ function TextBlock({
                 </tr>
               </thead>
             )}
-            <tbody className="divide-y divide-[#1A1A1A]">
+            <tbody className="divide-y divide-theme-border">
               {rows.map((row, ri) => (
-                <tr key={ri} className="hover:bg-[#141414] transition-colors">
+                <tr key={ri} className="hover:bg-theme-hover transition-colors">
                   {row.map((cell, ci) => (
-                    <td key={ci} className="px-3.5 py-2 text-[#CCCCCC]"><InlineFormat text={cell} /></td>
+                    <td key={ci} className="px-3.5 py-2 text-theme-text"><InlineFormat text={cell} /></td>
                   ))}
                 </tr>
               ))}
@@ -3076,13 +3241,13 @@ function TextBlock({
       flushTable(`t-${idx}`);
     }
 
-    const h3m = trimmed.match(/^###\s+(.+)/); if (h3m) { flushList(`f-${idx}`); elements.push(<h4 key={idx} className="text-[16px] font-semibold text-white mt-6 mb-2">{h3m[1]}</h4>); return; }
-    const h2m = trimmed.match(/^##\s+(.+)/); if (h2m) { flushList(`f-${idx}`); elements.push(<h3 key={idx} className="text-[18px] font-semibold text-white mt-6 mb-2">{h2m[1]}</h3>); return; }
-    const h1m = trimmed.match(/^#\s+(.+)/); if (h1m) { flushList(`f-${idx}`); elements.push(<h2 key={idx} className="text-[22px] font-semibold text-white mt-6 mb-3">{h1m[1]}</h2>); return; }
+    const h3m = trimmed.match(/^###\s+(.+)/); if (h3m) { flushList(`f-${idx}`); elements.push(<h4 key={idx} className="text-[16px] font-semibold text-theme-text mt-6 mb-2">{h3m[1]}</h4>); return; }
+    const h2m = trimmed.match(/^##\s+(.+)/); if (h2m) { flushList(`f-${idx}`); elements.push(<h3 key={idx} className="text-[18px] font-semibold text-theme-text mt-6 mb-2">{h2m[1]}</h3>); return; }
+    const h1m = trimmed.match(/^#\s+(.+)/); if (h1m) { flushList(`f-${idx}`); elements.push(<h2 key={idx} className="text-[22px] font-semibold text-theme-text mt-6 mb-3">{h1m[1]}</h2>); return; }
     const bm = trimmed.match(/^[-*]\s+(.+)/); if (bm) { listItems.push({ text: bm[1], ordered: false }); return; }
     const nm = trimmed.match(/^\d+\.\s+(.+)/); if (nm) { listItems.push({ text: nm[1], ordered: true }); return; }
     flushList(`f-${idx}`);
-    elements.push(<p key={idx} className="my-2"><InlineFormat text={trimmed} /></p>);
+    elements.push(<p key={idx} className="my-2 text-theme-text"><InlineFormat text={trimmed} /></p>);
   });
   flushList('final');
   flushTable('final-tbl');
@@ -3094,12 +3259,12 @@ function InlineFormat({ text }: { text: string }) {
   return (
     <>
       {parts.map((p, i) => {
-        if (p.startsWith('**') && p.endsWith('**')) return <strong key={i} className="font-semibold text-white">{p.slice(2, -2)}</strong>;
-        if (p.startsWith('`') && p.endsWith('`')) return <code key={i} className="bg-[#141414] border border-[#1F1F1F] px-1.5 py-0.5 rounded text-[14px] text-[#E8E8E8]" style={{ fontFamily: "'JetBrains Mono', monospace" }}>{p.slice(1, -1)}</code>;
+        if (p.startsWith('**') && p.endsWith('**')) return <strong key={i} className="font-semibold text-theme-text">{p.slice(2, -2)}</strong>;
+        if (p.startsWith('`') && p.endsWith('`')) return <code key={i} className="bg-theme-surface border border-theme-border px-1.5 py-0.5 rounded text-[14px] text-theme-text" style={{ fontFamily: "'JetBrains Mono', monospace" }}>{p.slice(1, -1)}</code>;
         const linkMatch = p.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
         if (linkMatch) {
           return (
-            <a key={i} href={linkMatch[2]} target="_blank" rel="noopener noreferrer" className="text-[#35D0BA] underline hover:text-[#5EEAD4] transition-colors">
+            <a key={i} href={linkMatch[2]} target="_blank" rel="noopener noreferrer" className="text-theme-accent underline hover:opacity-80 transition-opacity">
               {linkMatch[1]}
             </a>
           );

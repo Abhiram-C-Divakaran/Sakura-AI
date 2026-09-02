@@ -406,7 +406,20 @@ class Agent:
                 f"*Prompt:* \"{res['prompt']}\" | *Aspect Ratio:* {res['aspect_ratio']} | *Resolution:* {res['width']}×{res['height']}"
             )
         except Exception as e:
-            return f"Image creation error: {str(e)}"
+            err_json = json.dumps({
+                "error": "timeout" if "timed out" in str(e).lower() or "timeout" in str(e).lower() else "transient_error",
+                "message": "The generation service took too long to respond.",
+                "prompt": prompt,
+                "aspect_ratio": aspect_ratio or "1:1",
+                "intensity": self.intensity,
+                "retryable": True
+            })
+            return (
+                f"Couldn't create the image.\n\n"
+                f"The generation service took too long to respond.\n\n"
+                f"<!-- SAKURA_IMAGE_ERROR:{err_json} -->\n"
+                f"*CRITICAL: This is a temporary tool failure, NOT a capability failure. Do NOT recommend Midjourney, DALL-E, Stable Diffusion, SVG or Python code. Output only the concise failure notice with Retry.*"
+            )
 
     async def _tool_edit_image(self, edit_instruction: str, image_id: Optional[str] = None) -> str:
         """Edits an existing image preserving prior context and establishing edit lineage."""
@@ -460,7 +473,20 @@ class Agent:
                 f"*Instruction:* \"{edit_instruction}\" | *Lineage:* Version {res['lineage_depth'] + 1}"
             )
         except Exception as e:
-            return f"Image edit error: {str(e)}"
+            err_json = json.dumps({
+                "error": "timeout" if "timed out" in str(e).lower() or "timeout" in str(e).lower() else "transient_error",
+                "message": "The generation service took too long to respond.",
+                "prompt": edit_instruction,
+                "aspect_ratio": "1:1",
+                "intensity": self.intensity,
+                "retryable": True
+            })
+            return (
+                f"Couldn't create the image.\n\n"
+                f"The generation service took too long to respond.\n\n"
+                f"<!-- SAKURA_IMAGE_ERROR:{err_json} -->\n"
+                f"*CRITICAL: This is a temporary tool failure, NOT a capability failure. Do NOT recommend Midjourney, DALL-E, Stable Diffusion, SVG or Python code. Output only the concise failure notice with Retry.*"
+            )
 
     async def _tool_deep_research(self, topic: str, aspects: List[str]) -> str:
         """Executes a deep research synthesis over multiple aspects."""
@@ -676,14 +702,14 @@ class Agent:
         # ─── Tool iteration loop ───
         for iteration in range(max_iterations):
             try:
-                # Non-streaming call to check for tool use
+                # Non-streaming call to check for tool use (allocate conservative max_tokens for tool calls)
                 response = await provider.client.chat.completions.create(
                     model=provider.model,
                     messages=messages,
                     tools=available_tools if available_tools else None,
                     tool_choice="auto" if available_tools else None,
                     temperature=temperature,
-                    max_tokens=4096,
+                    max_tokens=1024,
                 )
 
                 choice = response.choices[0]
@@ -739,7 +765,7 @@ class Agent:
                 model=provider.model,
                 messages=messages,
                 temperature=temperature,
-                max_tokens=4096,
+                max_tokens=2048,
                 stream=True,
             )
 

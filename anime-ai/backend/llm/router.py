@@ -30,8 +30,9 @@ class LLMRouter:
         # 2. Groq
         if os.getenv("GROQ_API_KEY"):
             try:
-                self.providers["groq"] = GroqProvider(model="qwen/qwen3.8-27b")
-                print("LLM Router: Groq adapter active.")
+                groq_model = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
+                self.providers["groq"] = GroqProvider(model=groq_model)
+                print(f"LLM Router: Groq adapter active ({groq_model}).")
             except Exception as e:
                 print(f"LLM Router: Failed to initialize Groq: {e}")
 

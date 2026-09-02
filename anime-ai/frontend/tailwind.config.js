@@ -8,6 +8,31 @@ module.exports = {
   theme: {
     extend: {
       colors: {
+        // Semantic dynamic theme colors
+        theme: {
+          app: "var(--bg-app)",
+          sidebar: "var(--bg-sidebar)",
+          chat: "var(--bg-chat)",
+          panel: "var(--bg-panel)",
+          surface: "var(--bg-surface)",
+          card: "var(--bg-card)",
+          "card-hover": "var(--bg-card-hover)",
+          hover: "var(--bg-hover)",
+          active: "var(--bg-active)",
+          composer: "var(--bg-composer)",
+          "composer-inner": "var(--bg-composer-inner)",
+          "user-bubble": "var(--bg-user-bubble)",
+          border: "var(--border-app)",
+          "border-card": "var(--border-card)",
+          "border-subtle": "var(--border-subtle)",
+          text: "var(--text-main)",
+          muted: "var(--text-muted)",
+          dim: "var(--text-dim)",
+          accent: "var(--accent)",
+          "accent-blue": "var(--accent-blue)",
+          "accent-cyan": "var(--accent-cyan)",
+          popover: "var(--popover-bg)",
+        },
         // Original retro configuration colors (restored to fix unstyled login/console)
         retro: {
           bg: "#090c15",

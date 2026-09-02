@@ -49,6 +49,19 @@ ASPECT_RATIO_MAP = {
     "2:3": (720, 1080),
 }
 
+# ─── Custom Image Generation Exceptions ───────────────────────────────────────
+class ImageTimeoutError(Exception):
+    """Raised when image generation times out across all allowed attempts."""
+    pass
+
+class ImageTransientError(Exception):
+    """Raised when transient network, 502/503/504, 429 or GPU worker failure occurs."""
+    pass
+
+class ImageNonTransientError(Exception):
+    """Raised when request is fundamentally invalid, unauthorized or content-rejected."""
+    pass
+
 
 class GenerationPipeline(str, Enum):
     ANIME = "ANIME"
@@ -302,9 +315,22 @@ class ImageGenerationEngine:
         # Deep prompt expansion
         enhanced_prompt, negative_prompt = self.expand_prompt(clean_prompt, pipeline, intensity=intensity)
 
-        # Setup retry policy (Max 2 quality retries)
-        max_retries = 2 if intensity == "high" else 1
+        # Setup intensity-based timeouts and retry policy
+        # LOW: 40s timeout per attempt, 2 attempts
+        # MEDIUM: 60s timeout per attempt, 3 attempts
+        # HIGH: 120s timeout per attempt, 3 attempts
+        if intensity == "high":
+            attempt_timeout = 120
+            max_attempts = 3
+        elif intensity == "low":
+            attempt_timeout = 40
+            max_attempts = 2
+        else: # medium
+            attempt_timeout = 60
+            max_attempts = 3
+
         last_error = None
+        is_timeout = False
 
         image_id = uuid.uuid4()
         sanitized_title = re.sub(r'[^\w\s-]', '', clean_prompt[:36]).strip().replace(' ', '_')
@@ -318,14 +344,17 @@ class ImageGenerationEngine:
 
         loop = asyncio.get_event_loop()
 
-        for attempt in range(max_retries + 1):
+        for attempt in range(max_attempts):
             current_seed = actual_seed if attempt == 0 else random.randint(10000, 9999999)
+            
+            # Failover: If primary Flux fails or times out, failover to secondary turbo provider
+            active_model = "flux" if attempt < (max_attempts - 1) else "turbo"
             
             # Encode URL for neural rendering engine
             encoded_prompt = urllib.parse.quote(enhanced_prompt)
             pollinations_url = (
                 f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-                f"?width={width}&height={height}&nologo=true&seed={current_seed}&model=flux"
+                f"?width={width}&height={height}&nologo=true&seed={current_seed}&model={active_model}"
             )
 
             def download_worker():
@@ -333,7 +362,7 @@ class ImageGenerationEngine:
                     pollinations_url,
                     headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SakuraAI/1.0"}
                 )
-                with urllib.request.urlopen(req, timeout=40) as resp:
+                with urllib.request.urlopen(req, timeout=attempt_timeout) as resp:
                     with open(storage_path, "wb") as f:
                         f.write(resp.read())
 
@@ -348,19 +377,31 @@ class ImageGenerationEngine:
                         os.remove(storage_path)
                     last_error = Exception("Output failed quality validation (incomplete or corrupt image).")
             except Exception as e:
+                err_str = str(e).lower()
+                is_timeout = "timed out" in err_str or "timeout" in err_str or "time out" in err_str
                 last_error = e
                 if os.path.exists(storage_path):
                     try:
                         os.remove(storage_path)
                     except Exception:
                         pass
-            
-            # Small backoff before retry
-            if attempt < max_retries:
-                await asyncio.sleep(1.0)
+
+                # Non-transient errors (invalid parameters, auth, content rejection) should not retry
+                if "400" in err_str or "401" in err_str or "403" in err_str or "unsupported" in err_str:
+                    raise ImageNonTransientError(f"Image generation request error: {str(e)}")
+
+            # Exponential backoff with jitter before next attempt
+            if attempt < (max_attempts - 1):
+                if attempt == 0:
+                    backoff = random.uniform(1.0, 2.0)
+                else:
+                    backoff = random.uniform(3.0, 5.0)
+                await asyncio.sleep(backoff)
 
         if not os.path.exists(storage_path) or file_size == 0:
-            raise RuntimeError(f"Couldn't create the image. Generation failed after {max_retries + 1} passes: {str(last_error)}")
+            if is_timeout:
+                raise ImageTimeoutError("The generation service took too long to respond.")
+            raise ImageTransientError("The generation service took too long to respond.")
 
         filename = f"{sanitized_title}_{actual_seed % 10000}.png"
         public_image_url = f"/api/v1/library/files/{image_id}/download"

@@ -30,6 +30,8 @@ interface ChatComposerProps {
   onClearExternalAttachment?: () => void;
   editingImage?: { id?: string; filename?: string; url?: string; prompt?: string } | null;
   onClearEditingImage?: () => void;
+  prefilledText?: string | null;
+  onClearPrefilledText?: () => void;
 }
 
 export const ChatComposer: React.FC<ChatComposerProps> = ({
@@ -43,7 +45,9 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
   externalAttachment = null,
   onClearExternalAttachment,
   editingImage = null,
-  onClearEditingImage
+  onClearEditingImage,
+  prefilledText = null,
+  onClearPrefilledText
 }) => {
   const [inputText, setInputText] = useState('');
   const [intensity, setIntensity] = useState<IntensityLevel>('medium');
@@ -78,6 +82,21 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
       if (onClearExternalAttachment) onClearExternalAttachment();
     }
   }, [externalAttachment, onClearExternalAttachment]);
+
+  // Sync prefilled text (e.g. from Edit Prompt on failed image generation)
+  useEffect(() => {
+    if (prefilledText) {
+      setInputText(prefilledText);
+      setTimeout(() => {
+        if (textareaRef.current) {
+          textareaRef.current.focus();
+          textareaRef.current.selectionStart = textareaRef.current.value.length;
+          textareaRef.current.selectionEnd = textareaRef.current.value.length;
+        }
+      }, 50);
+      onClearPrefilledText?.();
+    }
+  }, [prefilledText, onClearPrefilledText]);
 
   // Load saved intensity from localStorage
   useEffect(() => {
@@ -369,10 +388,10 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
 
       {/* Main Canonical Composer Pill Container */}
       <div
-        className={`bg-[#2F2F2F] rounded-[30px] px-3.5 py-2 transition-all duration-200 border flex flex-col justify-center min-h-[58px] ${
+        className={`rounded-[30px] px-3.5 py-2 transition-all duration-200 border flex flex-col justify-center min-h-[58px] bg-theme-composer-inner ${
           isDragOver
-            ? 'border-[#2F95F6] ring-2 ring-[#2F95F6]/30 bg-[#343434]'
-            : 'border-white/[0.06] hover:border-white/[0.1] focus-within:border-white/[0.12]'
+            ? 'border-theme-accent ring-2 ring-theme-accent/30'
+            : 'border-theme-border hover:border-theme-border-card focus-within:border-theme-border-card'
         }`}
         style={{
           boxShadow: 'none',
@@ -388,16 +407,16 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
           onClearEditingImage={onClearEditingImage}
         />
 
-        {/* Input & Controls Row */}
-        <div className="flex items-center gap-1.5 px-0.5">
+        {/* Canonical Input Row */}
+        <div className="flex items-center gap-2 relative">
           {/* Left + Button */}
           <button
             type="button"
             onClick={() => setIsPlusMenuOpen(!isPlusMenuOpen)}
             aria-label="Add files and tools"
             aria-expanded={isPlusMenuOpen}
-            className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors flex-shrink-0 cursor-pointer text-[#F2F2F2] hover:bg-white/[0.08] active:bg-white/[0.12] ${
-              isPlusMenuOpen ? 'bg-white/[0.15] text-white rotate-45' : ''
+            className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors flex-shrink-0 cursor-pointer text-theme-text hover:bg-theme-hover active:bg-theme-active ${
+              isPlusMenuOpen ? 'bg-theme-active text-theme-text rotate-45' : ''
             }`}
             title="Add files and tools"
           >
@@ -425,7 +444,7 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
               onKeyDown={handleKeyDown}
               placeholder={editingImage ? 'Describe what you want to change...' : placeholder}
               aria-label="Ask Sakura AI message prompt"
-              className="w-full bg-transparent text-[16px] leading-[1.5] text-[#F5F5F5] placeholder:text-[#B0B0B0] focus:outline-none resize-none max-h-[190px] overflow-y-auto font-sans"
+              className="w-full bg-transparent text-[16px] leading-[1.5] text-theme-text placeholder:text-theme-muted focus:outline-none resize-none max-h-[190px] overflow-y-auto font-sans"
               style={{
                 fontFamily: 'Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
               }}

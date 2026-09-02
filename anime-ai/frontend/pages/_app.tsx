@@ -1,10 +1,11 @@
 import type { AppProps } from 'next/app'
 import Head from 'next/head'
 import '../styles/globals.css'
+import { ThemeProvider } from '../components/ThemeContext'
 
 export default function App({ Component, pageProps }: AppProps) {
   return (
-    <>
+    <ThemeProvider>
       <Head>
         <title>Sakura AI</title>
         <meta name="description" content="Sakura AI — Advanced Autonomous Agent & Multimodal Intelligence" />
@@ -15,6 +16,6 @@ export default function App({ Component, pageProps }: AppProps) {
         <meta name="theme-color" content="#000000" />
       </Head>
       <Component {...pageProps} />
-    </>
+    </ThemeProvider>
   )
 }
