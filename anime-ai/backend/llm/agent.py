@@ -709,7 +709,7 @@ class Agent:
                     tools=available_tools if available_tools else None,
                     tool_choice="auto" if available_tools else None,
                     temperature=temperature,
-                    max_tokens=1024,
+                    max_tokens=400,
                 )
 
                 choice = response.choices[0]
@@ -755,8 +755,12 @@ class Agent:
                 break
 
             except Exception as e:
-                print(f"Agent tool loop error (iteration {iteration}): {e}")
-                # Break out and do a direct stream without tools
+                err_str = str(e)
+                print(f"Agent tool loop error (iteration {iteration}): {err_str}")
+                # If 413 occurs during tool loop, prune messages and break to direct stream
+                if "413" in err_str or "rate_limit_exceeded" in err_str or "Request too large" in err_str:
+                    if len(messages) > 2:
+                        messages = [messages[0], messages[-1]]
                 break
 
         # ─── Final streaming response ───
@@ -765,7 +769,7 @@ class Agent:
                 model=provider.model,
                 messages=messages,
                 temperature=temperature,
-                max_tokens=2048,
+                max_tokens=1500,
                 stream=True,
             )
 
@@ -775,7 +779,32 @@ class Agent:
                     yield {"token": content, "provider": provider_name}
 
         except Exception as e:
-            print(f"Agent streaming error: {e}")
+            err_str = str(e)
+            print(f"Agent streaming error: {err_str}")
+            # Automatic self-healing for 413 token quota overflow:
+            # Aggressively prune messages to system prompt + user question and retry with minimal max_tokens
+            if "413" in err_str or "rate_limit_exceeded" in err_str or "Request too large" in err_str:
+                try:
+                    print("Agent: 413 rate limit encountered. Auto-pruning context and retrying...")
+                    pruned_messages = [messages[0]]
+                    if len(messages) > 1:
+                        pruned_messages.append(messages[-1])
+                    
+                    retry_stream = await provider.client.chat.completions.create(
+                        model=provider.model,
+                        messages=pruned_messages,
+                        temperature=temperature,
+                        max_tokens=1024,
+                        stream=True,
+                    )
+                    async for chunk in retry_stream:
+                        content = chunk.choices[0].delta.content
+                        if content:
+                            yield {"token": content, "provider": provider_name}
+                    return
+                except Exception as retry_err:
+                    print(f"Agent retry after 413 failed: {retry_err}")
+
             error_msg = f"I apologize, but I encountered an error generating a response: {str(e)}"
             for word in error_msg.split(" "):
                 yield {"token": word + " ", "provider": "error"}

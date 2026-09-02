@@ -576,9 +576,26 @@ async def chat_stream(
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # 2. Load conversation history (limit to last 10 to fit Groq TPM limits)
-    past_messages = db.query(Message).filter(Message.conversation_id == conv.id).order_by(Message.created_at.desc()).limit(10).all()
-    history = [{"role": m.role, "content": m.content} for m in reversed(past_messages)]
+    # 2. Load conversation history with intelligent token budget (max ~7,500 chars, ~1,800 tokens)
+    past_messages = db.query(Message).filter(Message.conversation_id == conv.id).order_by(Message.created_at.desc()).limit(12).all()
+    history = []
+    current_history_chars = 0
+    max_history_chars = 7500
+
+    for m in past_messages:
+        # Ignore failed error message dumps from history
+        if "I apologize, but I encountered an error generating a response" in m.content:
+            continue
+        content = m.content
+        # If an individual historical message is excessively long, truncate for context economy
+        if m.role == "assistant" and len(content) > 2000:
+            content = content[:1200] + "\n\n... [content summarized for context] ...\n\n" + content[-400:]
+        
+        if current_history_chars + len(content) > max_history_chars:
+            break
+        
+        history.insert(0, {"role": m.role, "content": content})
+        current_history_chars += len(content)
 
     # 3. Save user message immediately
     user_attachments = [a.dict() if hasattr(a, 'dict') else a for a in (req.attachments or [])]
