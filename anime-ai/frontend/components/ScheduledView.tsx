@@ -3,6 +3,7 @@ import {
   Clock, Plus, Play, Pause, Trash2, CheckCircle2, 
   AlertCircle, Loader2, Calendar, Search, MoreHorizontal, ArrowRight
 } from 'lucide-react';
+import { getAccessToken, authFetch } from '../lib/auth';
 
 interface ScheduledTask {
   id: string;
@@ -38,12 +39,7 @@ export const ScheduledView: React.FC<ScheduledViewProps> = ({
   const [customCron, setCustomCron] = useState('0 9 * * *');
   const [submitting, setSubmitting] = useState(false);
 
-  const getAuthToken = () => {
-    if (typeof window !== 'undefined') {
-      return localStorage.getItem('token') || '';
-    }
-    return '';
-  };
+  const getAuthToken = () => getAccessToken();
 
   const fetchTasks = async () => {
     try {

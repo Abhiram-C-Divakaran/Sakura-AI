@@ -20,10 +20,10 @@ class LLMRouter:
     def _initialize_adapters(self):
         """Initializes adapters configured via environment variables."""
         # Configurable model identifiers
-        model_fast = os.getenv("SAKURA_MODEL_FAST", "qwen/qwen3.8-27b")
-        model_balanced = os.getenv("SAKURA_MODEL_BALANCED", "gpt-4o-mini")
+        model_fast = os.getenv("SAKURA_MODEL_FAST", "llama-3.1-8b-instant")
+        model_balanced = os.getenv("SAKURA_MODEL_BALANCED", "llama-3.3-70b-versatile")
         model_reasoning = os.getenv("SAKURA_MODEL_REASONING", "claude-3-haiku-20240307")
-        model_code = os.getenv("SAKURA_MODEL_CODE", model_fast)
+        model_code = os.getenv("SAKURA_MODEL_CODE", "llama-3.1-8b-instant")
 
         # 1. Groq (High-speed inference)
         if os.getenv("GROQ_API_KEY"):

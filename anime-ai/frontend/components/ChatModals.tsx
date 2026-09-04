@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { authFetch } from '../lib/auth';
 
 interface ShareModalProps {
   isOpen: boolean;
@@ -24,10 +25,8 @@ export const ShareModal: React.FC<ShareModalProps> = ({
     const createShare = async () => {
       try {
         setLoading(true);
-        const token = typeof window !== 'undefined' ? localStorage.getItem('token') || '' : '';
-        const res = await fetch(`${apiBase}/api/v1/conversations/${chatId}/share`, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}` }
+        const res = await authFetch(`${apiBase}/api/v1/conversations/${chatId}/share`, {
+          method: 'POST'
         });
         if (res.ok) {
           const data = await res.json();

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useImperativeHandle, forwardRef } from 'react';
 import { SakuraLogo } from './SakuraLogo';
+import { authFetch } from '../lib/auth';
 
 export interface VoiceRecorderProps {
   onTranscriptionComplete: (text: string) => void;
@@ -279,10 +280,8 @@ export const VoiceRecorder = forwardRef<VoiceRecorderHandle, VoiceRecorderProps>
       const formData = new FormData();
       formData.append('file', blob, 'recording.webm');
 
-      const token = localStorage.getItem('access_token');
-      const response = await fetch(`${apiBase}/api/v1/audio/transcribe`, {
+      const response = await authFetch(`${apiBase}/api/v1/audio/transcribe`, {
         method: 'POST',
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
         body: formData
       });
 

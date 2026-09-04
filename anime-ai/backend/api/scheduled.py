@@ -6,8 +6,9 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from database.db import get_db
-from database.models import User, ScheduledTask
+from database.models import User, ScheduledTask, ScheduledTaskRun
 from auth.manager import AuthManager
+from tasks.scheduler import execute_scheduled_task_run
 
 router = APIRouter(prefix="/scheduled", tags=["scheduled"])
 
@@ -163,13 +164,13 @@ def delete_scheduled_task(
     db.commit()
     return {"status": "deleted", "id": task_id}
 
-@router.post("/{task_id}/run")
-def trigger_scheduled_task(
+@router.get("/{task_id}/runs", response_model=List[Dict[str, Any]])
+def get_task_runs(
     task_id: str,
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Manually triggers execution of a scheduled recurring task."""
+    """Fetches execution history for a scheduled task."""
     try:
         t_uuid = uuid.UUID(task_id)
     except ValueError:
@@ -182,13 +183,49 @@ def trigger_scheduled_task(
     if not task:
         raise HTTPException(status_code=404, detail="Scheduled task not found")
 
-    now = datetime.now(timezone.utc)
-    task.last_run_at = now
-    db.commit()
+    runs = db.query(ScheduledTaskRun).filter(
+        ScheduledTaskRun.task_id == task.id
+    ).order_by(ScheduledTaskRun.started_at.desc()).limit(20).all()
+
+    return [
+        {
+            "id": str(r.id),
+            "task_id": str(r.task_id),
+            "status": r.status,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+            "error": r.error,
+            "output": r.output,
+            "duration_ms": r.duration_ms
+        }
+        for r in runs
+    ]
+
+@router.post("/{task_id}/run")
+async def trigger_scheduled_task(
+    task_id: str,
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Manually triggers real execution of a scheduled task."""
+    try:
+        t_uuid = uuid.UUID(task_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid task ID")
+
+    task = db.query(ScheduledTask).filter(
+        ScheduledTask.id == t_uuid,
+        ScheduledTask.user_id == current_user.id
+    ).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Scheduled task not found")
+
+    # Run the scheduled task and record run outcome
+    result = await execute_scheduled_task_run(task.id)
 
     return {
         "status": "triggered",
         "id": str(task.id),
         "title": task.title,
-        "last_run_at": now.isoformat()
+        "run_result": result
     }

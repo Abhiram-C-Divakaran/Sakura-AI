@@ -346,56 +346,13 @@ async def upload_library_file(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Uploads a real file to object storage, creates database record, 
-    and triggers background RAG indexing if enabled. Enforces max size and path safety.
-    """
-    # Sanitize filename against directory traversal
-    clean_filename = os.path.basename(file.filename or "upload.bin")
-    file_id = uuid.uuid4()
-    extension = os.path.splitext(clean_filename)[1]
-    storage_path = os.path.join(UPLOAD_DIR, f"{file_id}{extension}")
-
-    # Enforce 50MB file size limit
-    max_size_bytes = 50 * 1024 * 1024
-    bytes_read = 0
-    with open(storage_path, "wb") as buffer:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            bytes_read += len(chunk)
-            if bytes_read > max_size_bytes:
-                buffer.close()
-                if os.path.exists(storage_path):
-                    os.remove(storage_path)
-                raise HTTPException(status_code=413, detail="File exceeds maximum allowed size of 50MB")
-            buffer.write(chunk)
-
-    file_size = bytes_read
-    mime_type = file.content_type or "application/octet-stream"
-    category = get_file_category(mime_type, clean_filename)
-
-    doc = Document(
-        id=file_id,
+    from services.upload import save_uploaded_file
+    doc = await save_uploaded_file(
+        file=file,
         user_id=current_user.id,
-        filename=clean_filename,
-        mime_type=mime_type,
-        storage_path=storage_path,
-        metadata_json={
-            "status": "PROCESSING" if auto_index else "READY",
-            "indexing_status": "Uploaded" if auto_index else "Ready",
-            "size": file_size,
-            "category": category,
-            "source": "upload",
-            "is_knowledge_base": False,
-            "modified_at": datetime.now(timezone.utc).isoformat(),
-            "chunks": 0,
-            "error": None
-        }
+        db=db,
+        auto_index=auto_index
     )
-    db.add(doc)
-    db.commit()
 
     from api.routes import ws_manager
     serialized = serialize_document(doc)
@@ -405,6 +362,7 @@ async def upload_library_file(
         "data": serialized
     })
 
+    category = (doc.metadata_json or {}).get("category", "")
     if auto_index and category in ["documents", "code", "data"]:
         background_tasks.add_task(async_index_document, doc.id, current_user.id)
 

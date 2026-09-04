@@ -78,6 +78,81 @@ class AnthropicProvider(LLMProvider):
             async for text in stream.text_stream:
                 yield text
 
+    def _convert_messages(self, messages: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], str]:
+        system_prompt = ""
+        claude_messages: List[Dict[str, Any]] = []
+
+        for m in messages:
+            role = m.get("role")
+            if role == "system":
+                system_prompt += (m.get("content") or "") + "\n"
+            elif role == "user":
+                claude_messages.append({"role": "user", "content": m.get("content") or ""})
+            elif role == "assistant":
+                content_blocks = []
+                if m.get("content"):
+                    content_blocks.append({"type": "text", "text": m["content"]})
+                for tc in m.get("tool_calls", []):
+                    tc_args = tc.get("arguments", {})
+                    if isinstance(tc_args, str):
+                        try:
+                            tc_args = __import__("json").loads(tc_args)
+                        except Exception:
+                            tc_args = {}
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc.get("id"),
+                        "name": tc.get("name"),
+                        "input": tc_args
+                    })
+                claude_messages.append({"role": "assistant", "content": content_blocks if content_blocks else ""})
+            elif role == "tool":
+                # In Anthropic, consecutive tool responses MUST be batched into a single
+                # user turn containing multiple tool_result blocks.
+                tool_block = {
+                    "type": "tool_result",
+                    "tool_use_id": m.get("tool_call_id"),
+                    "content": str(m.get("content") or "")
+                }
+                if (
+                    claude_messages
+                    and claude_messages[-1].get("role") == "user"
+                    and isinstance(claude_messages[-1].get("content"), list)
+                ):
+                    claude_messages[-1]["content"].append(tool_block)
+                else:
+                    claude_messages.append({
+                        "role": "user",
+                        "content": [tool_block]
+                    })
+
+        return claude_messages, system_prompt.strip()
+
+    async def stream_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        **kwargs
+    ) -> AsyncGenerator[str, None]:
+        claude_messages, system = self._convert_messages(messages)
+        if not claude_messages:
+            claude_messages = [{"role": "user", "content": "Hello"}]
+
+        params: Dict[str, Any] = {
+            "model": self.model,
+            "messages": claude_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens or 4096,
+            **kwargs
+        }
+        if system:
+            params["system"] = system
+
+        async with self.client.messages.stream(**params) as stream:
+            async for text in stream.text_stream:
+                yield text
+
     async def generate_structured(
         self,
         prompt: str,
@@ -128,10 +203,6 @@ class AnthropicProvider(LLMProvider):
         Translates OpenAI tool format and conversation structure to Anthropic native tools API,
         and returns normalized provider-neutral tool turn results.
         """
-        system_prompt = ""
-        claude_messages = []
-
-        # 1. Translate tools to Anthropic format
         anthropic_tools = []
         for t in tools:
             if t.get("type") == "function":
@@ -142,46 +213,12 @@ class AnthropicProvider(LLMProvider):
                     "input_schema": fn.get("parameters", {"type": "object", "properties": {}})
                 })
 
-        # 2. Translate messages
-        for m in messages:
-            role = m.get("role")
-            if role == "system":
-                system_prompt += (m.get("content") or "") + "\n"
-            elif role == "user":
-                claude_messages.append({"role": "user", "content": m.get("content") or ""})
-            elif role == "assistant":
-                content_blocks = []
-                if m.get("content"):
-                    content_blocks.append({"type": "text", "text": m["content"]})
-                for tc in m.get("tool_calls", []):
-                    tc_args = tc.get("arguments", {})
-                    if isinstance(tc_args, str):
-                        try:
-                            tc_args = __import__("json").loads(tc_args)
-                        except Exception:
-                            tc_args = {}
-                    content_blocks.append({
-                        "type": "tool_use",
-                        "id": tc.get("id"),
-                        "name": tc.get("name"),
-                        "input": tc_args
-                    })
-                claude_messages.append({"role": "assistant", "content": content_blocks if content_blocks else ""})
-            elif role == "tool":
-                # In Anthropic, tool responses are user turns with tool_result blocks
-                claude_messages.append({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": m.get("tool_call_id"),
-                        "content": str(m.get("content") or "")
-                    }]
-                })
+        claude_messages, system_prompt = self._convert_messages(messages)
 
         response = await self.client.messages.create(
             model=self.model,
             messages=claude_messages,
-            system=system_prompt.strip() or "You are Sakura AI.",
+            system=system_prompt or "You are Sakura AI.",
             tools=anthropic_tools if anthropic_tools else None,
             temperature=temperature,
             max_tokens=max_tokens,

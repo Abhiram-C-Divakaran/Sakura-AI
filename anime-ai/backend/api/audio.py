@@ -92,13 +92,11 @@ async def transcribe_audio(
             except Exception as e:
                 print(f"OpenAI Whisper transcription error: {e}")
 
-        # Fallback if no remote whisper API responded
-        return {
-            "status": "success",
-            "text": "Voice note captured.",
-            "provider": "audio-capture-fallback",
-            "duration_bytes": len(content)
-        }
+        # Honest failure if neither Whisper provider is configured or succeeded
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Voice transcription is unavailable because audio processing models are not configured on this server."
+        )
 
     finally:
         if os.path.exists(tmp_path):

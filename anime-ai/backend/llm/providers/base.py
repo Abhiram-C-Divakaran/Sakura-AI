@@ -36,6 +36,17 @@ class LLMProvider(ABC):
         pass
 
     @abstractmethod
+    async def stream_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        **kwargs
+    ) -> AsyncGenerator[str, None]:
+        """Streams text chunks progressively from an arbitrary sequence of message dicts."""
+        pass
+
+    @abstractmethod
     async def generate_structured(
         self,
         prompt: str,

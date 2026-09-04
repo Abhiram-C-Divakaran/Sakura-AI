@@ -3,6 +3,7 @@ import { useRouter } from 'next/router';
 import Link from 'next/link';
 import { Mail, Lock, Eye, EyeOff, User, Loader2, AlertCircle, Check, ArrowLeft } from 'lucide-react';
 import { SakuraLogo, SakuraWordmark } from '../components/SakuraLogo';
+import { getAccessToken, setAccessToken } from '../lib/auth';
 
 const GoogleIcon = () => (
   <svg className="w-4 h-4 flex-shrink-0" viewBox="0 0 24 24">
@@ -32,7 +33,7 @@ export default function Login() {
 
   useEffect(() => {
     // Redirect if already authenticated
-    const token = localStorage.getItem('access_token');
+    const token = getAccessToken();
     if (token) {
       router.push('/console');
     }
@@ -93,7 +94,7 @@ export default function Login() {
       }
 
       const authData = await authRes.json();
-      localStorage.setItem('access_token', authData.access_token);
+      setAccessToken(authData.access_token);
       router.push('/console');
     } catch (err: any) {
       setError(err.message || 'Authentication error.');
@@ -102,49 +103,8 @@ export default function Login() {
     }
   };
 
-  const handleSocialLogin = async (provider: 'Google' | 'GitHub') => {
-    setError('');
-    setLoading(true);
-    const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-    const demoUsername = `${provider.toLowerCase()}_user`;
-
-    try {
-      const formData = new URLSearchParams();
-      formData.append('username', demoUsername);
-      formData.append('password', 'password123');
-
-      let authRes = await fetch(`${apiBase}/api/v1/auth/token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: formData.toString()
-      });
-
-      if (!authRes.ok) {
-        await fetch(`${apiBase}/api/v1/auth/register`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: demoUsername, password: 'password123' })
-        });
-
-        authRes = await fetch(`${apiBase}/api/v1/auth/token`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: formData.toString()
-        });
-      }
-
-      if (authRes.ok) {
-        const authData = await authRes.json();
-        localStorage.setItem('access_token', authData.access_token);
-        router.push('/console');
-      } else {
-        throw new Error(`Unable to authenticate with ${provider}.`);
-      }
-    } catch (err: any) {
-      setError(err.message || `Social login with ${provider} failed.`);
-    } finally {
-      setLoading(false);
-    }
+  const handleSocialLogin = (provider: 'Google' | 'GitHub') => {
+    setError(`${provider} OAuth 2.0 is not configured on this deployment. Please authenticate using email and password.`);
   };
 
   return (
@@ -306,23 +266,25 @@ export default function Login() {
                 <button
                   type="button"
                   onClick={() => handleSocialLogin('Google')}
-                  className="w-full h-[48px] rounded-[11px] bg-transparent hover:bg-[#111111] border border-[#2B2B2B] hover:border-[#444444] text-[14px] font-medium text-[#F5F5F5] flex items-center justify-center transition-all cursor-pointer active:scale-[0.99]"
+                  className="w-full h-[48px] px-4 rounded-[11px] bg-transparent hover:bg-[#111111] border border-[#2B2B2B] hover:border-[#444444] text-[14px] font-medium text-[#F5F5F5] flex items-center justify-between transition-all cursor-pointer active:scale-[0.99]"
                 >
-                  <div className="flex items-center gap-3 w-[190px]">
+                  <div className="flex items-center gap-3">
                     <GoogleIcon />
                     <span>Continue with Google</span>
                   </div>
+                  <span className="text-[11px] text-[#747474] font-normal border border-[#2B2B2B] px-1.5 py-0.5 rounded">Not Configured</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => handleSocialLogin('GitHub')}
-                  className="w-full h-[48px] rounded-[11px] bg-transparent hover:bg-[#111111] border border-[#2B2B2B] hover:border-[#444444] text-[14px] font-medium text-[#F5F5F5] flex items-center justify-center transition-all cursor-pointer active:scale-[0.99]"
+                  className="w-full h-[48px] px-4 rounded-[11px] bg-transparent hover:bg-[#111111] border border-[#2B2B2B] hover:border-[#444444] text-[14px] font-medium text-[#F5F5F5] flex items-center justify-between transition-all cursor-pointer active:scale-[0.99]"
                 >
-                  <div className="flex items-center gap-3 w-[190px]">
+                  <div className="flex items-center gap-3">
                     <GitHubIcon />
                     <span>Continue with GitHub</span>
                   </div>
+                  <span className="text-[11px] text-[#747474] font-normal border border-[#2B2B2B] px-1.5 py-0.5 rounded">Not Configured</span>
                 </button>
               </div>
             </>

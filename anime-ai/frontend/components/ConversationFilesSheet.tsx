@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { X, Download, Eye, Paperclip, FileText, Image as ImageIcon, Code, FileSpreadsheet, Film } from 'lucide-react';
+import { authFetch } from '../lib/auth';
 
 export interface ConversationFile {
   id: string;
@@ -46,10 +47,7 @@ export const ConversationFilesSheet: React.FC<ConversationFilesSheetProps> = ({
       setLoading(true);
       setError(null);
       try {
-        const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
-        const res = await fetch(`${apiBase}/api/v1/conversations/${conversationId}/files`, {
-          headers: token ? { Authorization: `Bearer ${token}` } : {}
-        });
+        const res = await authFetch(`${apiBase}/api/v1/conversations/${conversationId}/files`);
 
         if (res.ok) {
           const data = await res.json();

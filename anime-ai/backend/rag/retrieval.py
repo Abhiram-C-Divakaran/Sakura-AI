@@ -39,8 +39,8 @@ class HybridRetriever:
             return []
         doc_ids = [d.id for d in docs]
 
-        # 2. Get Vector/Semantic Matches
-        semantic_results = self._search_semantic(doc_ids, query_embedding, limit * 2)
+        # 2. Get Vector/Semantic Matches (if embeddings are available)
+        semantic_results = self._search_semantic(doc_ids, query_embedding, limit * 2) if query_embedding else []
 
         # 3. Get Keyword/BM25 Matches
         keyword_results = self._search_keyword(doc_ids, query_text, limit * 2)
@@ -83,8 +83,11 @@ class HybridRetriever:
 
         return results
 
-    def _search_semantic(self, doc_ids: List[Any], query_vec: List[float], limit: int) -> List[DocumentChunk]:
+    def _search_semantic(self, doc_ids: List[Any], query_vec: Optional[List[float]], limit: int) -> List[DocumentChunk]:
         """Runs vector database search, with CPU-level numpy fallback for local SQLite testing."""
+        if not query_vec or not doc_ids:
+            return []
+
         # Check connection type (SQLite vs Postgres)
         try:
             from database.db import DATABASE_URL

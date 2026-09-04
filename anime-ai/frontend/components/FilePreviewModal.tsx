@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { authFetch } from '../lib/auth';
 
 export interface LibraryFile {
   id: string;
@@ -61,10 +62,7 @@ export const FilePreviewModal: React.FC<FilePreviewModalProps> = ({
   const fetchFileContent = async (fileId: string) => {
     setLoading(true);
     try {
-      const token = localStorage.getItem('access_token');
-      const res = await fetch(`${apiBase}/api/v1/library/files/${fileId}/content`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {}
-      });
+      const res = await authFetch(`${apiBase}/api/v1/library/files/${fileId}/content`);
       if (res.ok) {
         const data = await res.json();
         setContent(data.content);

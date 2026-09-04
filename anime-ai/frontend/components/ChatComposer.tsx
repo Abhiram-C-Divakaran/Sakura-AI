@@ -5,6 +5,7 @@ import { VoiceRecorder, VoiceRecorderHandle } from './VoiceRecorder';
 import { FileLibraryModal, LibraryDocument } from './FileLibraryModal';
 import { ConnectAppsModal } from './ConnectAppsModal';
 import { AttachmentChips, AttachmentItem, ActiveMode } from './AttachmentChips';
+import { authFetch } from '../lib/auth';
 
 export interface ChatSubmitPayload {
   message: string;
@@ -181,10 +182,8 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
       formData.append('file', file);
 
       try {
-        const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
-        const res = await fetch(`${apiBase}/api/v1/documents/upload`, {
+        const res = await authFetch(`${apiBase}/api/v1/documents/upload`, {
           method: 'POST',
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
           body: formData
         });
 

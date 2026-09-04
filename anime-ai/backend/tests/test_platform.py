@@ -18,8 +18,11 @@ class TestAnimeAIPlatform(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Prepare in-memory SQLite tables for isolated API pipeline test."""
+        Base.metadata.drop_all(bind=engine)
         Base.metadata.create_all(bind=engine)
         cls.client = TestClient(app)
+        cls.token = None
+        cls.conversation_id = None
 
     @classmethod
     def tearDownClass(cls):
@@ -32,7 +35,7 @@ class TestAnimeAIPlatform(unittest.TestCase):
     def test_01_health_check(self):
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["system"], "Neo-Tokyo AI Core")
+        self.assertEqual(response.json()["system"], "Sakura AI Core")
 
     def test_02_register_and_login_operator(self):
         # Register operator

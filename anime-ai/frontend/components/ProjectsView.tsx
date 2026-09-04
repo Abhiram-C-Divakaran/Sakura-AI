@@ -5,6 +5,7 @@ import {
   Check, AlertCircle, Loader2, BookOpen
 } from 'lucide-react';
 import { SakuraLogo } from './SakuraLogo';
+import { getAccessToken, authFetch } from '../lib/auth';
 
 interface Repository {
   id: string;
@@ -70,12 +71,7 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
   const [repoUrl, setRepoUrl] = useState('');
   const [repoName, setRepoName] = useState('');
 
-  const getAuthToken = () => {
-    if (typeof window !== 'undefined') {
-      return localStorage.getItem('token') || '';
-    }
-    return '';
-  };
+  const getAuthToken = () => getAccessToken();
 
   const fetchProjects = async () => {
     try {

@@ -9,21 +9,17 @@ from sqlalchemy.orm import Session
 from database.db import get_db
 from database.models import User
 
-# Configuration & Security Guard
-DEFAULT_INSECURE_KEY = "supersecret_vintage_anime_key_replace_in_production"
-SECRET_KEY = os.getenv("JWT_SECRET", DEFAULT_INSECURE_KEY)
-ENVIRONMENT = os.getenv("ENV", os.getenv("ENVIRONMENT", "development")).lower()
+from config.settings import get_settings
 
-if ENVIRONMENT == "production" and (not SECRET_KEY or SECRET_KEY == DEFAULT_INSECURE_KEY):
-    raise RuntimeError(
-        "Production startup failed: JWT_SECRET must be explicitly configured and cannot use the default insecure key."
-    )
-
+settings = get_settings()
+SECRET_KEY = settings.jwt_secret
+ENVIRONMENT = settings.environment
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.access_token_expire_minutes
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token")
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token", auto_error=False)
 
 class AuthManager:
     """Handles password hashing, token operations, password strength validation, and session verification."""
@@ -103,4 +99,27 @@ class AuthManager:
         if user is None:
             raise credentials_exception
         return user
+
+    @staticmethod
+    def get_optional_current_user(token: Optional[str] = Depends(oauth2_scheme_optional), db: Session = Depends(get_db)) -> Optional[User]:
+        if not token:
+            return None
+        try:
+            payload = AuthManager.decode_token(token)
+            username = payload.get("sub")
+            if not username:
+                return None
+            return db.query(User).filter(User.username == username).first()
+        except Exception:
+            return None
+
+    @staticmethod
+    def validate_production_secret(secret: str, environment: str = "production", env: Optional[str] = None) -> bool:
+        """Helper to validate secret entropy and check against development placeholders."""
+        target_env = env or environment
+        from config.settings import Settings
+        s = Settings(ENVIRONMENT=target_env, JWT_SECRET=secret)
+        s.validate_production_guards()
+        return True
+
 

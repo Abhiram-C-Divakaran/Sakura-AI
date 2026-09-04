@@ -1,59 +1,61 @@
+"""
+Sakura AI — RAG Vector Embedding Manager
+
+Generates true semantic embeddings using configured embedding providers.
+Strictly eliminates mock/fake embeddings when unconfigured, allowing
+RAG pipelines to truthfully fall back to lexical BM25 matching.
+"""
 import os
-import numpy as np
 from openai import OpenAI
 from typing import List, Optional
 
 class EmbeddingManager:
     """
-    Manages vector embeddings generation. Uses OpenAI text-embedding-3-small
-    by default (1536 dimensions) with graceful fallback to random mock vector generation.
+    Manages vector embeddings generation using OpenAI text-embedding-3-small (1536 dimensions).
+    Does NOT generate fake or random mock embeddings when unconfigured.
     """
 
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        self.client = None
+        self.client: Optional[OpenAI] = None
         if self.api_key:
             try:
                 self.client = OpenAI(api_key=self.api_key)
             except Exception as e:
                 print(f"EmbeddingManager: Failed to initialize OpenAI client: {e}")
 
-    def get_embedding(self, text: str) -> List[float]:
-        """Generates embedding vector for a single text string."""
-        if self.client:
-            try:
-                response = self.client.embeddings.create(
-                    input=[text.replace("\n", " ")],
-                    model="text-embedding-3-small"
-                )
-                return response.data[0].embedding
-            except Exception as e:
-                print(f"EmbeddingManager API Error: {e}. Falling back to deterministic mock vector.")
-        
-        return self._generate_mock_embedding(text)
+    @property
+    def is_available(self) -> bool:
+        """Returns True only if a valid embedding provider is configured."""
+        return self.client is not None
 
-    def get_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Batch generates embeddings for multiple strings."""
-        if self.client:
-            try:
-                cleaned_texts = [t.replace("\n", " ") for t in texts]
-                response = self.client.embeddings.create(
-                    input=cleaned_texts,
-                    model="text-embedding-3-small"
-                )
-                return [d.embedding for d in response.data]
-            except Exception as e:
-                print(f"EmbeddingManager Batch API Error: {e}. Generating mock vectors.")
+    def get_embedding(self, text: str) -> Optional[List[float]]:
+        """Generates embedding vector for a single text string, or None if unavailable."""
+        if not self.client:
+            return None
 
-        return [self._generate_mock_embedding(t) for t in texts]
+        try:
+            response = self.client.embeddings.create(
+                input=[text.replace("\n", " ")],
+                model="text-embedding-3-small"
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            print(f"EmbeddingManager API Error: {e}")
+            return None
 
-    def _generate_mock_embedding(self, text: str) -> List[float]:
-        """
-        Generates a deterministic 1536-dimensional mock embedding based on string hash.
-        Normalized to unit length for cosine similarity compatibility.
-        """
-        state = sum(ord(c) for c in text)
-        np.random.seed(state)
-        vector = np.random.randn(1536)
-        normalized = vector / np.linalg.norm(vector)
-        return normalized.tolist()
+    def get_embeddings(self, texts: List[str]) -> List[Optional[List[float]]]:
+        """Batch generates embeddings for multiple strings, or list of None if unavailable."""
+        if not self.client:
+            return [None for _ in texts]
+
+        try:
+            cleaned_texts = [t.replace("\n", " ") for t in texts]
+            response = self.client.embeddings.create(
+                input=cleaned_texts,
+                model="text-embedding-3-small"
+            )
+            return [d.embedding for d in response.data]
+        except Exception as e:
+            print(f"EmbeddingManager Batch API Error: {e}")
+            return [None for _ in texts]

@@ -74,10 +74,63 @@ class WorkspaceSecurity:
         env["DEBIAN_FRONTEND"] = "noninteractive"
         return env
 
+    @staticmethod
+    def validate_repository_url(url: str) -> None:
+        """
+        Validates git repository URLs to prevent shell injection, flag injection,
+        and unsupported schemes.
+        """
+        if not url or not isinstance(url, str):
+            raise SecurityException("Repository URL cannot be empty.")
+        if len(url) > 500:
+            raise SecurityException("Repository URL exceeds maximum allowed length (500 chars).")
+
+        # Reject dangerous shell metacharacters
+        dangerous_chars = [";", "&", "|", "`", "$", "\n", "\r", "<", ">", "(", ")", '"', "'", "\0"]
+        for ch in dangerous_chars:
+            if ch in url:
+                raise SecurityException(f"Repository URL contains illegal character: {repr(ch)}")
+
+        # Disallow dangerous pseudo-schemes
+        lower_url = url.lower()
+        if lower_url.startswith(("-", "ext::", "fd::")):
+            raise SecurityException("Repository URL contains prohibited transport prefix.")
+        if any(lower_url.startswith(s) for s in ["file://", "ftp://", "gopher://", "ldap://"]):
+            raise SecurityException("Repository URL scheme not allowed (must be https or git/ssh).")
+
+        # Validate against allowed patterns (https:// or git@)
+        https_pattern = r"^https://[a-zA-Z0-9._~%:-]+(/[a-zA-Z0-9._~%/-]+)+(\.git)?/?$"
+        ssh_pattern = r"^git@[a-zA-Z0-9._~%-]+:[a-zA-Z0-9._~%/-]+(\.git)?$"
+        if not (re.match(https_pattern, url) or re.match(ssh_pattern, url)):
+            raise SecurityException("Repository URL must be a valid HTTPS or SSH Git URL.")
+
+    @staticmethod
+    def validate_branch_name(branch: str) -> None:
+        """
+        Validates git branch/ref names to prevent flag injection and shell exploitation.
+        """
+        if not branch or not isinstance(branch, str):
+            raise SecurityException("Branch name cannot be empty.")
+        if len(branch) > 200:
+            raise SecurityException("Branch name exceeds maximum allowed length (200 chars).")
+        if branch.startswith("-"):
+            raise SecurityException("Branch name cannot start with a dash (flag injection protection).")
+
+        # Git ref safe character regex
+        ref_pattern = r"^[a-zA-Z0-9._/-]+$"
+        if not re.match(ref_pattern, branch):
+            raise SecurityException(f"Branch name '{branch}' contains invalid ref characters.")
+
+        if ".." in branch or branch.endswith("/") or branch.endswith(".lock") or "@{" in branch:
+            raise SecurityException(f"Branch name '{branch}' violates Git ref naming rules.")
+
 resolve_safe_path = WorkspaceSecurity.resolve_safe_path
 validate_command = WorkspaceSecurity.validate_command
 sanitize_environment = WorkspaceSecurity.sanitize_environment
+validate_repository_url = WorkspaceSecurity.validate_repository_url
+validate_branch_name = WorkspaceSecurity.validate_branch_name
 SecurityViolationError = SecurityException
+
 
 def is_command_safe(command: str) -> bool:
     try:

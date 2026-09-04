@@ -266,6 +266,37 @@ class ScheduledTask(Base):
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
     user = relationship("User", back_populates="scheduled_tasks")
+    runs = relationship("ScheduledTaskRun", back_populates="task", cascade="all, delete-orphan")
+
+
+class ScheduledTaskRun(Base):
+    __tablename__ = "scheduled_task_runs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id = Column(UUID(as_uuid=True), ForeignKey("scheduled_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(50), default="RUNNING")  # RUNNING, COMPLETED, FAILED
+    started_at = Column(DateTime(timezone=True), default=utc_now)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    error = Column(Text, nullable=True)
+    output = Column(Text, nullable=True)
+    duration_ms = Column(Integer, default=0)
+
+    task = relationship("ScheduledTask", back_populates="runs")
+
+
+class TaskOutcome:
+    QUEUED = "Queued"
+    EXPLORING = "Exploring"
+    PLANNING = "Planning"
+    IMPLEMENTING = "Implementing"
+    TESTING = "Testing"
+    REVIEWING = "Reviewing"
+    COMPLETED_VERIFIED = "Completed_Verified"
+    COMPLETED_UNVERIFIED = "Completed_Unverified"
+    FAILED = "Failed"
+    BLOCKED = "Blocked"
+    MAX_ITERATIONS = "Max_Iterations"
+    CANCELLED = "Cancelled"
 
 
 # ─── Integrations (e.g. GitHub) ───────────────────────────────────────────

@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { authFetch } from '../lib/auth';
 
 export interface AppConnector {
   id: string;
@@ -111,23 +112,13 @@ export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({
   const [loading, setLoading] = useState(false);
   const [actionInProgress, setActionInProgress] = useState<string | null>(null);
 
-  const getAuthToken = () => {
-    if (typeof window !== 'undefined') {
-      return localStorage.getItem('token') || '';
-    }
-    return '';
-  };
-
   useEffect(() => {
     if (!isOpen) return;
 
     const fetchStatuses = async () => {
       try {
         setLoading(true);
-        const token = getAuthToken();
-        const res = await fetch(`${apiBase}/api/v1/integrations`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
+        const res = await authFetch(`${apiBase}/api/v1/integrations`);
         if (res.ok) {
           const data = await res.json();
           const statusMap = new Map<string, { is_connected: boolean; account_name?: string }>();
@@ -158,7 +149,6 @@ export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({
   if (!isOpen) return null;
 
   const toggleConnect = async (c: AppConnector) => {
-    const token = getAuthToken();
     setActionInProgress(c.id);
     const newConnected = !c.connected;
 
@@ -169,20 +159,18 @@ export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({
 
     try {
       if (newConnected) {
-        await fetch(`${apiBase}/api/v1/integrations/${c.id}/connect`, {
+        await authFetch(`${apiBase}/api/v1/integrations/${c.id}/connect`, {
           method: 'POST',
           headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`
+            'Content-Type': 'application/json'
           },
           body: JSON.stringify({
             account_name: `${c.name} Workspace`
           })
         });
       } else {
-        await fetch(`${apiBase}/api/v1/integrations/${c.id}/disconnect`, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}` }
+        await authFetch(`${apiBase}/api/v1/integrations/${c.id}/disconnect`, {
+          method: 'POST'
         });
       }
     } catch (err) {

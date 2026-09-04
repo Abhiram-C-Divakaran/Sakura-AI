@@ -70,6 +70,38 @@ class OpenAIProvider(LLMProvider):
             if content:
                 yield content
 
+    async def stream_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        **kwargs
+    ) -> AsyncGenerator[str, None]:
+        clean_messages = []
+        for m in messages:
+            msg: Dict[str, Any] = {"role": m.get("role"), "content": m.get("content") or ""}
+            if m.get("role") == "tool" and m.get("tool_call_id"):
+                msg["tool_call_id"] = m["tool_call_id"]
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                msg["tool_calls"] = m["tool_calls"]
+            clean_messages.append(msg)
+
+        params: Dict[str, Any] = {
+            "model": self.model,
+            "messages": clean_messages,
+            "temperature": temperature,
+            "stream": True,
+            **kwargs
+        }
+        if max_tokens is not None:
+            params["max_tokens"] = max_tokens
+
+        response_stream = await self.client.chat.completions.create(**params)
+        async for chunk in response_stream:
+            content = chunk.choices[0].delta.content
+            if content:
+                yield content
+
     async def generate_structured(
         self,
         prompt: str,

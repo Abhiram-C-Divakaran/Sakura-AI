@@ -10,6 +10,7 @@ producing a final response.
 import json
 import asyncio
 import os
+import re
 import uuid
 from typing import List, Dict, Any, Optional, AsyncGenerator
 from sqlalchemy.orm import Session
@@ -320,10 +321,46 @@ class Agent:
             return f"Tool execution error: {str(e)}"
 
     async def _tool_web_search(self, query: str) -> str:
-        """Performs live search on the web using DuckDuckGo parser."""
+        """Performs live search on the web using Tavily Search API (priority) or DuckDuckGo fallback."""
+        import json
         import urllib.request
         import urllib.parse
         import re
+
+        tavily_key = os.getenv("TAVILY_API_KEY")
+        if tavily_key:
+            try:
+                def run_tavily():
+                    req_data = json.dumps({
+                        "api_key": tavily_key,
+                        "query": query,
+                        "search_depth": "basic",
+                        "max_results": 5,
+                        "include_answer": True
+                    }).encode("utf-8")
+                    req = urllib.request.Request(
+                        "https://api.tavily.com/search",
+                        data=req_data,
+                        headers={"Content-Type": "application/json", "User-Agent": "SakuraAI/1.0"}
+                    )
+                    with urllib.request.urlopen(req, timeout=12) as response:
+                        return json.loads(response.read().decode("utf-8"))
+
+                loop = asyncio.get_event_loop()
+                data = await loop.run_in_executor(None, run_tavily)
+                results = []
+                if data.get("answer"):
+                    results.append(f"Summary: {data['answer']}\n")
+                for i, r in enumerate(data.get("results", [])[:5]):
+                    title = r.get("title", "Result")
+                    content = r.get("content", "")
+                    url = r.get("url", "")
+                    results.append(f"[{i+1}] {title}\n{content}\nSource: {url}")
+                if results:
+                    return "\n\n".join(results)
+            except Exception as e:
+                print(f"Tavily search error: {e}, falling back to DuckDuckGo")
+
         try:
             url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query)
             req = urllib.request.Request(
@@ -689,8 +726,15 @@ class Agent:
                 if fcontent:
                     attachment_snippets.append(f"=== ATTACHED FILE: {fname} ({ftype}) ===\n{fcontent[:4000]}")
                 elif "id" in att:
-                    # Check database for document content
-                    doc = self.db.query(Document).filter(Document.id == att["id"]).first()
+                    # Check database for document content (strictly enforcing user ownership)
+                    try:
+                        att_uuid = uuid.UUID(str(att["id"]))
+                    except ValueError:
+                        continue
+                    doc = self.db.query(Document).filter(
+                        Document.id == att_uuid,
+                        Document.user_id == self.user_id
+                    ).first()
                     if doc and os.path.exists(doc.storage_path):
                         try:
                             with open(doc.storage_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -746,98 +790,94 @@ class Agent:
             available_tools.append(VISUALIZE_TOOL)
 
         # ─── Tool iteration loop ───
-        for iteration in range(max_iterations):
-            try:
-                # Call provider-neutral tool turn
-                turn_result = await provider.tool_turn(
-                    messages=messages,
-                    tools=available_tools if available_tools else [],
-                    temperature=temperature,
-                    max_tokens=600,
-                )
+        if available_tools:
+            for iteration in range(max_iterations):
+                try:
+                    # Call provider-neutral tool turn
+                    turn_result = await provider.tool_turn(
+                        messages=messages,
+                        tools=available_tools,
+                        temperature=temperature,
+                        max_tokens=600,
+                    )
 
-                tool_calls = turn_result.get("tool_calls", [])
-                content = turn_result.get("content")
+                    tool_calls = turn_result.get("tool_calls", [])
+                    content = turn_result.get("content")
 
-                # If the model wants to call a tool
-                if tool_calls:
-                    formatted_tool_calls = []
-                    for tc in tool_calls:
-                        tc_id = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
-                        fn_name = tc.get("name", "")
-                        fn_args = tc.get("arguments", {})
-                        args_str = json.dumps(fn_args) if isinstance(fn_args, dict) else str(fn_args)
-                        formatted_tool_calls.append({
-                            "id": tc_id,
-                            "type": "function",
-                            "function": {
-                                "name": fn_name,
-                                "arguments": args_str
-                            }
-                        })
+                    # If the model wants to call a tool
+                    if tool_calls:
+                        formatted_tool_calls = []
+                        for tc in tool_calls:
+                            tc_id = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                            fn_name = tc.get("name", "")
+                            fn_args = tc.get("arguments", {})
+                            args_str = json.dumps(fn_args) if isinstance(fn_args, dict) else str(fn_args)
+                            formatted_tool_calls.append({
+                                "id": tc_id,
+                                "type": "function",
+                                "function": {
+                                    "name": fn_name,
+                                    "arguments": args_str
+                                }
+                            })
 
-                    messages.append({
-                        "role": "assistant",
-                        "content": content or "",
-                        "tool_calls": formatted_tool_calls
-                    })
-
-                    # Execute each tool call
-                    for idx, tool_call in enumerate(tool_calls):
-                        fn_name = tool_call.get("name")
-                        fn_args = tool_call.get("arguments", {})
-                        if isinstance(fn_args, str):
-                            try:
-                                fn_args = json.loads(fn_args)
-                            except Exception:
-                                fn_args = {}
-                        
-                        # Yield status update
-                        yield {"token": "", "provider": provider_name, "tool_call": fn_name, "status": "executing"}
-
-                        result = await self._execute_tool(fn_name, fn_args)
-                        self.tool_results.append({
-                            "tool": fn_name,
-                            "args": fn_args,
-                            "result": result
-                        })
-
-                        # Add tool result to messages matching tool_call_id
-                        tc_id = formatted_tool_calls[idx]["id"]
                         messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc_id,
-                            "content": str(result)
+                            "role": "assistant",
+                            "content": content or "",
+                            "tool_calls": formatted_tool_calls
                         })
 
-                    # Continue loop — LLM will process tool results
-                    continue
+                        # Execute each tool call
+                        for idx, tool_call in enumerate(tool_calls):
+                            fn_name = tool_call.get("name")
+                            fn_args = tool_call.get("arguments", {})
+                            if isinstance(fn_args, str):
+                                try:
+                                    fn_args = json.loads(fn_args)
+                                except Exception:
+                                    fn_args = {}
+                            
+                            # Yield status update
+                            yield {"token": "", "provider": provider_name, "tool_call": fn_name, "status": "executing"}
 
-                # No tool calls — model wants to give a final response
-                break
+                            result = await self._execute_tool(fn_name, fn_args)
+                            self.tool_results.append({
+                                "tool": fn_name,
+                                "args": fn_args,
+                                "result": result
+                            })
 
-            except Exception as e:
-                err_str = str(e)
-                print(f"Agent tool loop error (iteration {iteration}): {err_str}")
-                # If 413 occurs during tool loop, prune messages and break to direct stream
-                if "413" in err_str or "rate_limit_exceeded" in err_str or "Request too large" in err_str:
-                    if len(messages) > 2:
-                        messages = [messages[0], messages[-1]]
-                break
+                            # Add tool result to messages matching tool_call_id
+                            tc_id = formatted_tool_calls[idx]["id"]
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc_id,
+                                "content": str(result)
+                            })
+
+                        # Continue loop — LLM will process tool results
+                        continue
+
+                    # No tool calls — model wants to give a final response
+                    break
+
+                except Exception as e:
+                    err_str = str(e)
+                    print(f"Agent tool loop error (iteration {iteration}): {err_str}")
+                    # If 413 occurs during tool loop, prune messages and break to direct stream
+                    if "413" in err_str or "rate_limit_exceeded" in err_str or "Request too large" in err_str:
+                        if len(messages) > 2:
+                            messages = [messages[0], messages[-1]]
+                    break
 
         # ─── Final streaming response ───
         accumulated_response = ""
         try:
-            stream_response = await provider.client.chat.completions.create(
-                model=provider.model,
+            async for content in provider.stream_messages(
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_final_tokens,
-                stream=True,
-            )
-
-            async for chunk in stream_response:
-                content = chunk.choices[0].delta.content
+            ):
                 if content:
                     accumulated_response += content
                     yield {"token": content, "provider": provider_name}
@@ -862,15 +902,11 @@ class Agent:
                     if len(messages) > 1:
                         pruned_messages.append(messages[-1])
                     
-                    retry_stream = await provider.client.chat.completions.create(
-                        model=provider.model,
+                    async for content in provider.stream_messages(
                         messages=pruned_messages,
                         temperature=temperature,
                         max_tokens=1024,
-                        stream=True,
-                    )
-                    async for chunk in retry_stream:
-                        content = chunk.choices[0].delta.content
+                    ):
                         if content:
                             accumulated_response += content
                             yield {"token": content, "provider": provider_name}

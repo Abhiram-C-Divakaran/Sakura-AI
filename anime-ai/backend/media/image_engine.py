@@ -409,7 +409,10 @@ class ImageGenerationEngine:
         # Lineage depth calculation
         lineage_depth = 0
         if parent_image_id:
-            parent = self.db.query(GeneratedImage).filter(GeneratedImage.id == parent_image_id).first()
+            parent = self.db.query(GeneratedImage).filter(
+                GeneratedImage.id == parent_image_id,
+                GeneratedImage.user_id == self.user_id
+            ).first()
             if parent:
                 lineage_depth = parent.lineage_depth + 1
 

@@ -1,3 +1,5 @@
+import os
+import json
 import uuid
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -111,7 +113,7 @@ def disconnect_integration(
     return {"status": "disconnected", "provider": provider}
 
 @router.get("/github/repos")
-def list_github_repositories(
+async def list_github_repositories(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -125,16 +127,47 @@ def list_github_repositories(
     if not gh_integration:
         return {"connected": False, "repositories": []}
 
-    # If linked, return user's repositories or current project repo
-    return {
-        "connected": True,
-        "account": gh_integration.account_name,
-        "repositories": [
-            {
-                "name": "Sakura-AI",
-                "full_name": f"{gh_integration.account_name}/Sakura-AI",
-                "default_branch": "main",
-                "clone_url": f"https://github.com/{gh_integration.account_name}/Sakura-AI.git"
+    token = (gh_integration.config_json or {}).get("access_token") or os.getenv("GITHUB_TOKEN")
+    if not token:
+        # Connected without API token: return truthful empty list
+        return {
+            "connected": True,
+            "account": gh_integration.account_name,
+            "repositories": []
+        }
+
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.github.com/user/repos?sort=updated&per_page=30",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "Sakura-AI-Platform",
+                "Accept": "application/vnd.github.v3+json"
             }
-        ]
-    }
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            repos = [
+                {
+                    "name": r.get("name"),
+                    "full_name": r.get("full_name"),
+                    "default_branch": r.get("default_branch", "main"),
+                    "clone_url": r.get("clone_url"),
+                    "private": r.get("private", False)
+                }
+                for r in data if isinstance(r, dict)
+            ]
+            return {
+                "connected": True,
+                "account": gh_integration.account_name,
+                "repositories": repos
+            }
+    except Exception as e:
+        print(f"GitHub repo fetch error: {e}")
+        return {
+            "connected": True,
+            "account": gh_integration.account_name,
+            "repositories": [],
+            "error": "Failed to fetch repositories from GitHub API."
+        }

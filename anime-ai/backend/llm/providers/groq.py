@@ -9,15 +9,16 @@ class GroqProvider(OpenAIProvider):
     but targets Groq's low-latency execution endpoints.
     """
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "qwen/qwen3.8-27b"):
+    def __init__(self, api_key: Optional[str] = None, model: str = "llama-3.1-8b-instant"):
         api_key = api_key or os.getenv("GROQ_API_KEY")
         if not api_key:
             raise ValueError("GROQ_API_KEY environment variable is not set.")
         
-        # Instantiate AsyncOpenAI client pointed at Groq
+        # Instantiate AsyncOpenAI client pointed at Groq with timeout
         self.client = AsyncOpenAI(
             api_key=api_key,
-            base_url="https://api.groq.com/openai/v1"
+            base_url="https://api.groq.com/openai/v1",
+            timeout=10.0
         )
         self.model = model
 

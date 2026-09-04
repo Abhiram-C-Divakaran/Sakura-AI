@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { FilePreviewModal, LibraryFile } from './FilePreviewModal';
 import { CreateDocumentModal } from './CreateDocumentModal';
 import { GenerateImageModal } from './GenerateImageModal';
+import { getAccessToken, authFetch } from '../lib/auth';
 
 interface LibraryViewProps {
   onAttachToChat: (file: LibraryFile) => void;
@@ -70,7 +71,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   // Fetch files from real database
   const fetchFiles = useCallback(async () => {
     try {
-      const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
+      const token = getAccessToken();
       if (!token) return;
 
       const params = new URLSearchParams();
@@ -79,9 +80,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       params.append('sort_by', sortField);
       params.append('order', sortOrder);
 
-      const res = await fetch(`${apiBase}/api/v1/library/files?${params.toString()}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const res = await authFetch(`${apiBase}/api/v1/library/files?${params.toString()}`);
 
       if (res.ok) {
         const data = await res.json();
@@ -100,7 +99,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
   // Connect WebSocket for real-time multi-device sync
   useEffect(() => {
-    const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
+    const token = getAccessToken();
     if (!token) return;
 
     const wsUrl = apiBase.replace('http', 'ws') + '/api/v1/ws?token=' + token;
@@ -159,8 +158,6 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     const fileList = Array.from(filesToUpload);
     if (fileList.length === 0) return;
 
-    const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
-
     for (const file of fileList) {
       setUploadProgress({ name: file.name, progress: 'Uploading…' });
       const formData = new FormData();
@@ -168,9 +165,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       formData.append('auto_index', 'true');
 
       try {
-        const res = await fetch(`${apiBase}/api/v1/library/upload`, {
+        const res = await authFetch(`${apiBase}/api/v1/library/upload`, {
           method: 'POST',
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
           body: formData
         });
 
@@ -210,12 +206,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
   // Document creation handler
   const handleCreateDocument = async (filename: string, content: string, cat: string) => {
-    const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
-    const res = await fetch(`${apiBase}/api/v1/library/create-document`, {
+    const res = await authFetch(`${apiBase}/api/v1/library/create-document`, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {})
+        'Content-Type': 'application/json'
       },
       body: JSON.stringify({ filename, content, category: cat })
     });
@@ -228,12 +222,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
   // Image generator handler
   const handleGenerateImage = async (prompt: string, filename?: string) => {
-    const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
-    const res = await fetch(`${apiBase}/api/v1/library/generate-image`, {
+    const res = await authFetch(`${apiBase}/api/v1/library/generate-image`, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {})
+        'Content-Type': 'application/json'
       },
       body: JSON.stringify({ prompt, filename })
     });
@@ -246,13 +238,11 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
   // Rename handler
   const handleRename = async (file: LibraryFile, newName: string) => {
-    const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
     try {
-      const res = await fetch(`${apiBase}/api/v1/library/files/${file.id}`, {
+      const res = await authFetch(`${apiBase}/api/v1/library/files/${file.id}`, {
         method: 'PATCH',
         headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {})
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({ name: newName })
       });
@@ -267,11 +257,9 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   // Delete handler
   const handleDelete = async (file: LibraryFile) => {
     if (!confirm(`Are you sure you want to permanently delete "${file.name}"?`)) return;
-    const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
     try {
-      const res = await fetch(`${apiBase}/api/v1/library/files/${file.id}`, {
-        method: 'DELETE',
-        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      const res = await authFetch(`${apiBase}/api/v1/library/files/${file.id}`, {
+        method: 'DELETE'
       });
       if (res.ok) {
         setFiles((prev) => prev.filter((f) => f.id !== file.id));
@@ -284,12 +272,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
   // Toggle Knowledge Base indexing
   const handleToggleKnowledgeBase = async (file: LibraryFile) => {
-    const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
     const method = file.is_knowledge_base ? 'DELETE' : 'POST';
     try {
-      const res = await fetch(`${apiBase}/api/v1/library/files/${file.id}/index`, {
-        method: method,
-        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      const res = await authFetch(`${apiBase}/api/v1/library/files/${file.id}/index`, {
+        method: method
       });
       if (res.ok) {
         fetchFiles();

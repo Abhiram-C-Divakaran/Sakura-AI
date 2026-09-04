@@ -33,6 +33,7 @@ from api.coding import router as coding_router
 from api.projects import router as projects_router
 from api.scheduled import router as scheduled_router
 from api.integrations import router as integrations_router
+from api.capabilities import router as capabilities_router
 
 # Import NLP classifiers
 from ml_pipeline import SentimentAnalyzer, IntentClassifier
@@ -80,6 +81,7 @@ router.include_router(coding_router)
 router.include_router(projects_router)
 router.include_router(scheduled_router)
 router.include_router(integrations_router)
+router.include_router(capabilities_router)
 
 # Initialize shared components
 llm_router = LLMRouter()
@@ -497,17 +499,11 @@ def submit_message_feedback(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    try:
-        msg_uuid = uuid.UUID(message_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid message ID")
-    
-    msg = db.query(Message).filter(Message.id == msg_uuid).first()
-    if not msg:
-        raise HTTPException(status_code=404, detail="Message not found")
+    from auth.authorization import assert_message_owner
+    msg = assert_message_owner(db, message_id, current_user.id)
         
     feedback = MessageFeedback(
-        message_id=msg_uuid,
+        message_id=msg.id,
         user_id=current_user.id,
         rating=body.rating,
         comment=body.comment,
@@ -626,42 +622,16 @@ async def upload_document(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    # Save file locally
-    file_id = uuid.uuid4()
-    extension = os.path.splitext(file.filename)[1]
-    storage_path = os.path.join(UPLOAD_DIR, f"{file_id}{extension}")
-    
-    with open(storage_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
-    file_size = os.path.getsize(storage_path)
-
-    try:
-        # Create Document record with indexing_status="Uploaded"
-        doc = Document(
-            id=file_id,
-            user_id=current_user.id,
-            filename=file.filename,
-            mime_type=file.content_type or "text/plain",
-            storage_path=storage_path,
-            metadata_json={
-                "indexing_status": "Uploaded",
-                "size": file_size,
-                "chunks": 0,
-                "error": None
-            }
-        )
-        db.add(doc)
-        db.commit()
-
-        # Enqueue background ingestion
-        background_tasks.add_task(async_ingest_document, doc.id, current_user.id)
-
-        return {"status": "success", "document_id": str(doc.id)}
-    except Exception as e:
-        if os.path.exists(storage_path):
-            os.remove(storage_path)
-        raise HTTPException(status_code=500, detail=f"Failed to initiate file upload: {str(e)}")
+    from services.upload import save_uploaded_file
+    doc = await save_uploaded_file(
+        file=file,
+        user_id=current_user.id,
+        db=db,
+        auto_index=True
+    )
+    # Enqueue background ingestion
+    background_tasks.add_task(async_ingest_document, doc.id, current_user.id)
+    return {"status": "success", "document_id": str(doc.id)}
 
 @router.get("/documents", response_model=List[Dict[str, Any]])
 def list_documents(current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
@@ -799,6 +769,20 @@ async def chat_stream(
         )
         system_prompt += memory_ctx
 
+    # 5b. Enrich with Project context if conversation is associated with a project
+    from database.models import ProjectConversation, RepositoryWorkspace, CodingTask, TaskOutcome
+    from coding.agent import CodingAgent
+
+    project_link = db.query(ProjectConversation).filter(ProjectConversation.conversation_id == conv.id).first()
+    active_project = project_link.project if project_link else None
+
+    if active_project:
+        if active_project.instructions:
+            system_prompt += f"\n\nProject Instructions ({active_project.name}):\n{active_project.instructions}"
+        if active_project.repositories:
+            repos_info = "\n".join(f"- {r.name} ({r.branch}): {r.repository_url}" for r in active_project.repositories)
+            system_prompt += f"\n\nAttached Project Repositories:\n{repos_info}"
+
     # Calculate exact context tokens using tiktoken
     try:
         import tiktoken
@@ -809,7 +793,82 @@ async def chat_stream(
     except Exception:
         current_context_used_by_user[str(current_user.id)] = len(req.message) // 4 + 500
 
-    # 6. Create and run the Agent
+    # 5c. Check if request targets repository coding agent
+    is_code_command = req.message.strip().startswith("/code")
+    has_coding_tool = any(t in (req.tools or []) for t in ["sakura_code", "code_workspace"])
+    if is_code_command or (active_project and has_coding_tool):
+        code_objective = req.message.replace("/code", "", 1).strip() if is_code_command else req.message
+        ws = None
+        if active_project:
+            ws = db.query(RepositoryWorkspace).filter(
+                RepositoryWorkspace.user_id == current_user.id,
+                RepositoryWorkspace.name.ilike(f"%{active_project.name}%")
+            ).first()
+        if not ws:
+            ws = db.query(RepositoryWorkspace).filter(
+                RepositoryWorkspace.user_id == current_user.id
+            ).order_by(RepositoryWorkspace.created_at.desc()).first()
+
+        if ws:
+            coding_agent = CodingAgent(
+                db=db,
+                workspace=ws,
+                user=current_user,
+                llm_router=llm_router,
+                intensity=req.intensity or "high"
+            )
+            coding_task = CodingTask(
+                workspace_id=ws.id,
+                user_id=current_user.id,
+                title=f"Chat Coding: {code_objective[:40]}",
+                objective=code_objective,
+                status=TaskOutcome.QUEUED
+            )
+            db.add(coding_task)
+            db.commit()
+
+            async def coding_stream_generator():
+                full_response = ""
+                async for event in coding_agent.run_task_stream(coding_task):
+                    if "tool" in event:
+                        tool_name = event.get("tool")
+                        tool_phase = event.get("phase", "TOOL")
+                        chunk_msg = f"\n`[{tool_phase}: {tool_name}]`\n"
+                        full_response += chunk_msg
+                        yield f"data: {json.dumps({'token': chunk_msg, 'provider': 'sakura_code'})}\n\n"
+                    elif "message" in event:
+                        msg_token = f"*{event['message']}*\n"
+                        full_response += msg_token
+                        yield f"data: {json.dumps({'token': msg_token, 'provider': 'sakura_code'})}\n\n"
+                    elif "final_output" in event:
+                        final_out = f"\n\n### Coding Task Result: {event.get('phase')}\n\n{event['final_output']}"
+                        full_response += final_out
+                        yield f"data: {json.dumps({'token': final_out, 'provider': 'sakura_code'})}\n\n"
+                    elif "error" in event:
+                        err_out = f"\n\n**Error:** {event['error']}\n"
+                        full_response += err_out
+                        yield f"data: {json.dumps({'token': err_out, 'provider': 'sakura_code'})}\n\n"
+
+                # Save assistant message after stream completes
+                from database.db import get_db_context
+                with get_db_context() as db_ctx:
+                    assistant_msg = Message(
+                        conversation_id=conv.id,
+                        role="assistant",
+                        content=full_response,
+                        metadata_json={"provider": "sakura_code", "coding_task_id": str(coding_task.id)}
+                    )
+                    db_ctx.add(assistant_msg)
+                    c = db_ctx.query(Conversation).filter_by(id=conv.id).first()
+                    if c:
+                        if c.title.startswith("Chat with"):
+                            c.title = req.message[:50] + ("..." if len(req.message) > 50 else "")
+                        c.updated_at = __import__("datetime").datetime.utcnow()
+                    db_ctx.commit()
+
+            return StreamingResponse(coding_stream_generator(), media_type="text/event-stream")
+
+    # 6. Create and run standard Agent
     from llm.agent import Agent
     agent = Agent(
         db=db,
@@ -935,9 +994,16 @@ async def execute_code_analysis(task_id: str, user_id: str, code: str, instructi
 
 async def execute_doc_summary(task_id: str, user_id: str, doc_id: str, db: Session):
     await update_task_status(task_id, user_id, "Running", 10)
-    doc = db.query(Document).filter(Document.id == uuid.UUID(doc_id)).first()
+    try:
+        doc_u = uuid.UUID(doc_id)
+        user_u = uuid.UUID(user_id)
+    except ValueError:
+        await update_task_status(task_id, user_id, "Failed", 100, error="Invalid document or user identifier")
+        return
+
+    doc = db.query(Document).filter(Document.id == doc_u, Document.user_id == user_u).first()
     if not doc:
-        await update_task_status(task_id, user_id, "Failed", 100, error="Document not found")
+        await update_task_status(task_id, user_id, "Failed", 100, error="Document not found or access denied")
         return
         
     await update_task_status(task_id, user_id, "Running", 30)

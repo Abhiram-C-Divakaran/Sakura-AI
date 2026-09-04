@@ -5,6 +5,8 @@ import {
 } from 'lucide-react';
 import { ConnectAppsModal } from './ConnectAppsModal';
 
+import { authFetch } from '../lib/auth';
+
 interface IntegrationStatus {
   id: string;
   name: string;
@@ -26,20 +28,10 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
   const [loading, setLoading] = useState(true);
   const [isConnectModalOpen, setIsConnectModalOpen] = useState(false);
 
-  const getAuthToken = () => {
-    if (typeof window !== 'undefined') {
-      return localStorage.getItem('token') || '';
-    }
-    return '';
-  };
-
   const fetchIntegrations = async () => {
     try {
       setLoading(true);
-      const token = getAuthToken();
-      const res = await fetch(`${apiBase}/api/v1/integrations`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const res = await authFetch(`${apiBase}/api/v1/integrations`);
       if (res.ok) {
         const data = await res.json();
         setIntegrations(data);

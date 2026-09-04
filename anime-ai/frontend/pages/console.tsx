@@ -20,6 +20,7 @@ import { ConversationFilesSheet } from '../components/ConversationFilesSheet';
 import { ProjectsView } from '../components/ProjectsView';
 import { ScheduledView } from '../components/ScheduledView';
 import { PluginsView } from '../components/PluginsView';
+import { getAccessToken, clearAccessToken, authFetch } from '../lib/auth';
 
 export default function Console() {
   const router = useRouter();
@@ -286,13 +287,19 @@ export default function Console() {
   const abortControllerRef = useRef<AbortController | null>(null);
 
   const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
+  const handleLogout = () => {
+    clearAccessToken();
+    router.push('/login');
+  };
+
   const getHeaders = () => {
-    const token = localStorage.getItem('access_token');
+    const token = getAccessToken();
     return { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
   };
 
   useEffect(() => {
-    const token = localStorage.getItem('access_token');
+    const token = getAccessToken();
     if (!token) { router.push('/login'); return; }
     try { setCurrentUser(JSON.parse(atob(token.split('.')[1])).sub); }
     catch { setCurrentUser('Operator'); }
@@ -327,7 +334,7 @@ export default function Console() {
   // Connect WebSocket with exponential backoff & keepalive
   const connectWS = () => {
     if (!isTabVisible) return;
-    const token = localStorage.getItem('access_token');
+    const token = getAccessToken();
     if (!token) return;
 
     setWsState(prev => prev === 'OFFLINE' ? 'CONNECTING' : 'RECONNECTING');
@@ -410,7 +417,7 @@ export default function Console() {
     const fetchTelemetryFallback = async () => {
       if (wsState === 'LIVE') return;
       try {
-        const token = localStorage.getItem('access_token');
+        const token = getAccessToken();
         if (!token) return;
         const res = await fetch(`${apiBase}/api/v1/system/status`, { headers: { 'Authorization': `Bearer ${token}` } });
         if (res.ok) {
@@ -561,7 +568,7 @@ export default function Console() {
   const handleUploadFileDirectly = async (file: File) => {
     setUploading(true); setUploadSuccess(false);
     const fd = new FormData(); fd.append('file', file);
-    const token = localStorage.getItem('access_token');
+    const token = getAccessToken();
     try {
       const r = await fetch(`${apiBase}/api/v1/documents/upload`, { method: 'POST', headers: { 'Authorization': `Bearer ${token}` }, body: fd });
       if (r.ok) { setUploadSuccess(true); fetchDocuments(); setTimeout(() => setUploadSuccess(false), 3000); }
@@ -769,7 +776,6 @@ export default function Console() {
   };
 
   const handleStopGeneration = () => { abortControllerRef.current?.abort(); };
-  const handleLogout = () => { localStorage.removeItem('access_token'); router.push('/login'); };
   const getActiveTitle = () => { if (!activeConvId) return 'New chat'; return conversations.find(c => c.id === activeConvId)?.title || 'Chat'; };
 
   const handleCopy = (content: string, idx: number) => {

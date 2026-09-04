@@ -18,7 +18,9 @@ class OllamaProvider(OpenAIProvider):
 
         self.client = AsyncOpenAI(
             api_key="ollama",  # Dummy value for client library assertion checks
-            base_url=base_url
+            base_url=base_url,
+            timeout=2.0,
+            max_retries=0
         )
         self.model = model
 
