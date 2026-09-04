@@ -1,19 +1,56 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 
 interface ShareModalProps {
   isOpen: boolean;
   onClose: () => void;
   chatTitle: string;
   chatId: string;
+  apiBase?: string;
 }
 
-export const ShareModal: React.FC<ShareModalProps> = ({ isOpen, onClose, chatTitle, chatId }) => {
+export const ShareModal: React.FC<ShareModalProps> = ({ 
+  isOpen, 
+  onClose, 
+  chatTitle, 
+  chatId,
+  apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+}) => {
   const [copied, setCopied] = useState(false);
+  const [shareUrl, setShareUrl] = useState<string>('');
+  const [loading, setLoading] = useState<boolean>(true);
+
+  useEffect(() => {
+    if (!isOpen || !chatId) return;
+    const createShare = async () => {
+      try {
+        setLoading(true);
+        const token = typeof window !== 'undefined' ? localStorage.getItem('token') || '' : '';
+        const res = await fetch(`${apiBase}/api/v1/conversations/${chatId}/share`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const fullUrl = typeof window !== 'undefined' 
+            ? `${window.location.origin}${data.share_url}` 
+            : data.share_url;
+          setShareUrl(fullUrl);
+        } else {
+          setShareUrl(typeof window !== 'undefined' ? `${window.location.origin}/share/${chatId}` : `/share/${chatId}`);
+        }
+      } catch (err) {
+        setShareUrl(typeof window !== 'undefined' ? `${window.location.origin}/share/${chatId}` : `/share/${chatId}`);
+      } finally {
+        setLoading(false);
+      }
+    };
+    createShare();
+  }, [isOpen, chatId, apiBase]);
+
   if (!isOpen) return null;
 
-  const shareUrl = typeof window !== 'undefined' ? `${window.location.origin}/share/${chatId}` : `/share/${chatId}`;
-
   const handleCopy = () => {
+    if (!shareUrl) return;
     navigator.clipboard.writeText(shareUrl);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
@@ -37,19 +74,20 @@ export const ShareModal: React.FC<ShareModalProps> = ({ isOpen, onClose, chatTit
         </div>
 
         <p className="text-[13px] text-[#A0A0A0] leading-relaxed">
-          Messages you send after creating this link will not be shared. Anyone with the link will be able to view this conversation.
+          Messages you send after creating this link will not be shared. Anyone with the link will be able to view this conversation snapshot.
         </p>
 
         <div className="flex items-center gap-2 bg-[#171717] border border-[#333333] rounded-xl p-1.5 pl-3">
           <input
             type="text"
             readOnly
-            value={shareUrl}
+            value={loading ? 'Generating secure share link...' : shareUrl}
             className="bg-transparent text-[13px] text-[#CCCCCC] w-full focus:outline-none truncate font-mono select-all"
           />
           <button
             onClick={handleCopy}
-            className={`px-3.5 py-1.5 rounded-lg text-[12.5px] font-medium transition-colors cursor-pointer flex-shrink-0 ${
+            disabled={loading}
+            className={`px-3.5 py-1.5 rounded-lg text-[12.5px] font-medium transition-colors cursor-pointer flex-shrink-0 disabled:opacity-50 ${
               copied
                 ? 'bg-[#35D0BA] text-black font-semibold'
                 : 'bg-white text-black hover:bg-[#EAEAEA]'

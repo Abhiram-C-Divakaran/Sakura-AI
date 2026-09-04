@@ -10,6 +10,7 @@ producing a final response.
 import json
 import asyncio
 import os
+import uuid
 from typing import List, Dict, Any, Optional, AsyncGenerator
 from sqlalchemy.orm import Session
 from llm.router import LLMRouter
@@ -172,7 +173,7 @@ CODE_WORKSPACE_TOOL = {
     "type": "function",
     "function": {
         "name": "code_workspace",
-        "description": "Write, analyze, debug, refactor, or execute source code in an isolated workspace.",
+        "description": "Write, analyze, debug, refactor, review, or execute source code in an isolated workspace. Use 'review' for structured code review (Critical/High/Medium/Low) and 'security_review' for security-focused analysis.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -186,7 +187,7 @@ CODE_WORKSPACE_TOOL = {
                 },
                 "action": {
                     "type": "string",
-                    "enum": ["execute", "debug", "refactor", "explain", "unit_test"],
+                    "enum": ["execute", "debug", "refactor", "explain", "unit_test", "review", "security_review", "test"],
                     "description": "Action to perform in the code workspace."
                 }
             },
@@ -286,6 +287,7 @@ class Agent:
         self.enabled_tools = enabled_tools or []
         self.attachments = attachments or []
         self.tool_results: List[Dict[str, Any]] = []
+        self.pending_image_markdowns: List[str] = []
 
     # ─── Tool Executors ─────────────────────────────────────────────
 
@@ -357,7 +359,7 @@ class Agent:
                         source_url = urls[i].strip() if i < len(urls) else "https://duckduckgo.com"
                         results.append(f"[{i+1}] {clean_snip}\nSource: {source_url}")
                     return "\n\n".join(results)
-                return f"Live search results for query '{query}': High relevance content retrieved. Provide key facts accurately."
+                return f"Web search could not find live results for '{query}'."
         except Exception as e:
             return f"Web search error: {str(e)}"
 
@@ -399,11 +401,12 @@ class Agent:
                 workflow="TEXT_TO_IMAGE"
             )
             meta_json = json.dumps(res)
+            img_snippet = f"![{res['filename']}]({res['url']})\n\n<!-- SAKURA_IMAGE_DATA:{meta_json} -->\n\n*Prompt:* \"{res['prompt']}\" | *Aspect Ratio:* {res['aspect_ratio']} | *Resolution:* {res['width']}×{res['height']}"
+            self.pending_image_markdowns.append(img_snippet)
             return (
                 f"Generated artwork successfully.\n\n"
-                f"![{res['filename']}]({res['url']})\n\n"
-                f"<!-- SAKURA_IMAGE_DATA:{meta_json} -->\n"
-                f"*Prompt:* \"{res['prompt']}\" | *Aspect Ratio:* {res['aspect_ratio']} | *Resolution:* {res['width']}×{res['height']}"
+                f"{img_snippet}\n\n"
+                f"CRITICAL SYSTEM DIRECTIVE: You MUST display the generated image by including the exact markdown image tag and SAKURA_IMAGE_DATA comment block in your response to the user."
             )
         except Exception as e:
             err_json = json.dumps({
@@ -466,11 +469,12 @@ class Agent:
                     workflow="EDIT_IMAGE"
                 )
             meta_json = json.dumps(res)
+            img_snippet = f"![{res['filename']}]({res['url']})\n\n<!-- SAKURA_IMAGE_DATA:{meta_json} -->\n\n*Instruction:* \"{edit_instruction}\" | *Lineage:* Version {res['lineage_depth'] + 1}"
+            self.pending_image_markdowns.append(img_snippet)
             return (
                 f"Updated image with requested changes.\n\n"
-                f"![{res['filename']}]({res['url']})\n\n"
-                f"<!-- SAKURA_IMAGE_DATA:{meta_json} -->\n"
-                f"*Instruction:* \"{edit_instruction}\" | *Lineage:* Version {res['lineage_depth'] + 1}"
+                f"{img_snippet}\n\n"
+                f"CRITICAL SYSTEM DIRECTIVE: You MUST display the generated image by including the exact markdown image tag and SAKURA_IMAGE_DATA comment block in your response to the user."
             )
         except Exception as e:
             err_json = json.dumps({
@@ -529,25 +533,56 @@ class Agent:
         return f"### {title}\nVisualization spec prepared for {chart_type} rendering."
 
     async def _tool_code_workspace(self, language: str, code: str, action: str) -> str:
-        """Executes or analyzes code in the code workspace."""
-        if action == "execute" and language.lower() in ["python", "py"]:
-            # Local safe execution preview
-            try:
-                import io
-                import sys
-                buffer = io.StringIO()
-                # Run in restricted locals
-                safe_globals = {"__builtins__": {"print": print, "range": range, "len": len, "sum": sum, "min": min, "max": max, "enumerate": enumerate, "zip": zip, "str": str, "int": int, "float": float, "list": list, "dict": dict, "set": set, "tuple": tuple, "bool": bool}}
-                old_stdout = sys.stdout
-                sys.stdout = buffer
-                try:
-                    exec(code, safe_globals)
-                finally:
-                    sys.stdout = old_stdout
-                output = buffer.getvalue()
-                return f"Code Workspace ({language}) - Action: {action}\n\nExecution Output:\n```\n{output if output else '[Program executed successfully with no stdout]'}\n```"
-            except Exception as e:
-                return f"Code Workspace ({language}) - Execution Error:\n```\n{str(e)}\n```"
+        """Executes, reviews, or analyzes code in the isolated workspace."""
+        if action == "execute":
+            import tempfile
+            from coding.executor import SandboxExecutor
+            with tempfile.TemporaryDirectory(prefix="sakura_exec_") as temp_dir:
+                ext = ".py" if language.lower() in ["python", "py"] else (".js" if language.lower() in ["javascript", "js"] else ".txt")
+                script_path = os.path.join(temp_dir, f"snippet{ext}")
+                with open(script_path, "w", encoding="utf-8") as sf:
+                    sf.write(code)
+                executor = SandboxExecutor(temp_dir)
+                if ext == ".py":
+                    res = await executor.run_command(f"python snippet{ext}", timeout_seconds=15)
+                elif ext == ".js":
+                    res = await executor.run_command(f"node snippet{ext}", timeout_seconds=15)
+                else:
+                    return f"Execution not supported for language '{language}'. Supported: python, javascript."
+                
+                output = res.get("stdout") or res.get("stderr") or "[Executed successfully with no output]"
+                return f"Code Workspace ({language}) - Action: execute\n\nExit Code: {res['exit_code']}\nOutput:\n```\n{output}\n```"
+
+        if action == "review":
+            return (
+                f"Code Workspace ({language}) - Structured Code Review\n"
+                f"```{language}\n{code}\n```\n\n"
+                f"Conduct a structured review with the following priority levels:\n"
+                f"CRITICAL: Security vulnerabilities, data corruption, auth bypass, concurrency errors\n"
+                f"HIGH: Logic bugs, broken edge cases, incorrect APIs, resource leaks, performance problems\n"
+                f"MEDIUM: Maintainability, fragile architecture, missing validation\n"
+                f"LOW: Style issues\n"
+                f"Focus on substantive issues. Do not overwhelm with trivial nitpicks."
+            )
+
+        if action == "security_review":
+            return (
+                f"Code Workspace ({language}) - Security Review\n"
+                f"```{language}\n{code}\n```\n\n"
+                f"Analyze for: authentication/authorization flaws, input validation gaps, "
+                f"SQL injection, XSS, CSRF, SSRF, command injection, path traversal, "
+                f"secret exposure, unsafe deserialization, dependency vulnerabilities, "
+                f"race conditions, and insecure error handling.\n"
+                f"Classify each finding by severity (Critical/High/Medium/Low) with remediation."
+            )
+
+        if action == "test":
+            return (
+                f"Code Workspace ({language}) - Test Generation\n"
+                f"```{language}\n{code}\n```\n\n"
+                f"Generate comprehensive tests covering: happy path, boundary cases, error cases, "
+                f"and edge cases. Use the project's existing test framework conventions if apparent."
+            )
 
         return f"Code Workspace ({language}) - Action: {action}\n```\n{code}\n```\nPlease provide a full {action} evaluation with clean code and tests."
 
@@ -605,31 +640,42 @@ class Agent:
         Main agentic loop with streaming. Runs tool calls iteratively,
         then streams the final LLM response.
         """
-        provider_name, provider = self.llm_router.get_provider("general_inquiry")
+        from ml_pipeline import IntentClassifier
+        intent = IntentClassifier().classify(user_message)
+        provider_name, provider = self.llm_router.get_provider(intent)
 
         # Map intensity settings to internal request parameters & system instructions
         if self.intensity == "low":
             max_iterations = 1
             temperature = 0.2
+            max_final_tokens = 1500
             intensity_prompt = (
-                "\n\n[RESPONSE INTENSITY: LOW]\n"
-                "Prioritize speed, direct concise answers, and minimal unnecessary tool invocations. "
-                "Provide brief, clear, and direct explanations without excessive preamble."
+                "\n\n[RESPONSE INTENSITY: LOW — Quick Mode]\n"
+                "Prioritize speed and directness. Give concise answers without excessive preamble. "
+                "For code: generate the solution directly. Skip exhaustive verification unless the user asks."
             )
         elif self.intensity == "high":
-            max_iterations = 8
-            temperature = 0.9
+            max_iterations = 10
+            temperature = 0.2
+            max_final_tokens = 4096
             intensity_prompt = (
-                "\n\n[RESPONSE INTENSITY: HIGH]\n"
-                "Prioritize deep reasoning, step-by-step verification, thorough multi-angle analysis, "
-                "and careful precision. Provide rich, insightful, comprehensive explanations."
+                "\n\n[RESPONSE INTENSITY: HIGH — Frontier Engineering Mode]\n"
+                "Apply full engineering rigor. For coding tasks:\n"
+                "- Explore deeper context: inspect related files, dependencies, tests\n"
+                "- Plan before implementing: identify affected components and order of changes\n"
+                "- Verify your work: run tests, check types, review the diff\n"
+                "- Consider security, edge cases, error handling, and performance\n"
+                "- Provide structured output: what was implemented, verified, and any caveats\n"
+                "For non-coding tasks: deep reasoning, multi-source investigation, step-by-step verification."
             )
         else: # medium
             max_iterations = 5
-            temperature = 0.7
+            temperature = 0.2
+            max_final_tokens = 2500
             intensity_prompt = (
-                "\n\n[RESPONSE INTENSITY: MEDIUM]\n"
-                "Provide a balanced, high-quality response with clear reasoning and appropriate detail."
+                "\n\n[RESPONSE INTENSITY: MEDIUM — Standard Mode]\n"
+                "Balanced quality and speed. Write clean, correct code with appropriate error handling. "
+                "Use tools when they add value. Verify when practical."
             )
 
         # Process attachments if present
@@ -702,50 +748,66 @@ class Agent:
         # ─── Tool iteration loop ───
         for iteration in range(max_iterations):
             try:
-                # Non-streaming call to check for tool use (allocate conservative max_tokens for tool calls)
-                response = await provider.client.chat.completions.create(
-                    model=provider.model,
+                # Call provider-neutral tool turn
+                turn_result = await provider.tool_turn(
                     messages=messages,
-                    tools=available_tools if available_tools else None,
-                    tool_choice="auto" if available_tools else None,
+                    tools=available_tools if available_tools else [],
                     temperature=temperature,
-                    max_tokens=400,
+                    max_tokens=600,
                 )
 
-                choice = response.choices[0]
+                tool_calls = turn_result.get("tool_calls", [])
+                content = turn_result.get("content")
 
                 # If the model wants to call a tool
-                if choice.finish_reason == "tool_calls" or (choice.message.tool_calls and len(choice.message.tool_calls) > 0):
-                    # Add assistant message with tool calls
-                    dumped = choice.message.model_dump()
-                    clean_msg = {
+                if tool_calls:
+                    formatted_tool_calls = []
+                    for tc in tool_calls:
+                        tc_id = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                        fn_name = tc.get("name", "")
+                        fn_args = tc.get("arguments", {})
+                        args_str = json.dumps(fn_args) if isinstance(fn_args, dict) else str(fn_args)
+                        formatted_tool_calls.append({
+                            "id": tc_id,
+                            "type": "function",
+                            "function": {
+                                "name": fn_name,
+                                "arguments": args_str
+                            }
+                        })
+
+                    messages.append({
                         "role": "assistant",
-                        "content": dumped.get("content"),
-                    }
-                    if dumped.get("tool_calls"):
-                        clean_msg["tool_calls"] = dumped["tool_calls"]
-                    messages.append(clean_msg)
+                        "content": content or "",
+                        "tool_calls": formatted_tool_calls
+                    })
 
                     # Execute each tool call
-                    for tool_call in choice.message.tool_calls:
-                        fn_name = tool_call.function.name
-                        fn_args = json.loads(tool_call.function.arguments or "{}")
+                    for idx, tool_call in enumerate(tool_calls):
+                        fn_name = tool_call.get("name")
+                        fn_args = tool_call.get("arguments", {})
+                        if isinstance(fn_args, str):
+                            try:
+                                fn_args = json.loads(fn_args)
+                            except Exception:
+                                fn_args = {}
                         
-                        # Yield a status update
+                        # Yield status update
                         yield {"token": "", "provider": provider_name, "tool_call": fn_name, "status": "executing"}
 
                         result = await self._execute_tool(fn_name, fn_args)
                         self.tool_results.append({
                             "tool": fn_name,
                             "args": fn_args,
-                            "result": result[:500]  # Truncate for metadata
+                            "result": result
                         })
 
-                        # Add tool result to messages
+                        # Add tool result to messages matching tool_call_id
+                        tc_id = formatted_tool_calls[idx]["id"]
                         messages.append({
                             "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": result
+                            "tool_call_id": tc_id,
+                            "content": str(result)
                         })
 
                     # Continue loop — LLM will process tool results
@@ -764,19 +826,29 @@ class Agent:
                 break
 
         # ─── Final streaming response ───
+        accumulated_response = ""
         try:
             stream_response = await provider.client.chat.completions.create(
                 model=provider.model,
                 messages=messages,
                 temperature=temperature,
-                max_tokens=1500,
+                max_tokens=max_final_tokens,
                 stream=True,
             )
 
             async for chunk in stream_response:
                 content = chunk.choices[0].delta.content
                 if content:
+                    accumulated_response += content
                     yield {"token": content, "provider": provider_name}
+
+            # If any image tool was executed, ensure the image markdown is guaranteed in the output
+            for img_md in self.pending_image_markdowns:
+                url_match = re.search(r"\((/api/v1/library/files/[^)]+)\)", img_md)
+                if not url_match or url_match.group(1) not in accumulated_response:
+                    append_chunk = f"\n\n{img_md}\n\n"
+                    accumulated_response += append_chunk
+                    yield {"token": append_chunk, "provider": provider_name}
 
         except Exception as e:
             err_str = str(e)
@@ -800,7 +872,14 @@ class Agent:
                     async for chunk in retry_stream:
                         content = chunk.choices[0].delta.content
                         if content:
+                            accumulated_response += content
                             yield {"token": content, "provider": provider_name}
+
+                    for img_md in self.pending_image_markdowns:
+                        url_match = re.search(r"\((/api/v1/library/files/[^)]+)\)", img_md)
+                        if not url_match or url_match.group(1) not in accumulated_response:
+                            append_chunk = f"\n\n{img_md}\n\n"
+                            yield {"token": append_chunk, "provider": provider_name}
                     return
                 except Exception as retry_err:
                     print(f"Agent retry after 413 failed: {retry_err}")

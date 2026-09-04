@@ -5,7 +5,9 @@ import json
 import psutil
 import time
 import asyncio
-from datetime import datetime, timedelta
+import re
+import secrets
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
@@ -14,7 +16,10 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from database.db import get_db
-from database.models import User, Document, DocumentChunk, Conversation, Message, UserMemory, Character, GeneratedImage
+from database.models import (
+    User, Document, DocumentChunk, Conversation, Message, UserMemory, Character, GeneratedImage,
+    MessageFeedback, ConversationShare
+)
 from auth.manager import AuthManager
 from rag.ingestion.parser import DocumentParser
 from rag.embeddings.manager import EmbeddingManager
@@ -24,6 +29,10 @@ from characters.engine import CharacterEngine
 from llm.router import LLMRouter
 from api.audio import router as audio_router
 from api.library import router as library_router
+from api.coding import router as coding_router
+from api.projects import router as projects_router
+from api.scheduled import router as scheduled_router
+from api.integrations import router as integrations_router
 
 # Import NLP classifiers
 from ml_pipeline import SentimentAnalyzer, IntentClassifier
@@ -67,6 +76,10 @@ ws_manager = ConnectionManager()
 router = APIRouter(prefix="/api/v1")
 router.include_router(audio_router)
 router.include_router(library_router)
+router.include_router(coding_router)
+router.include_router(projects_router)
+router.include_router(scheduled_router)
+router.include_router(integrations_router)
 
 # Initialize shared components
 llm_router = LLMRouter()
@@ -194,6 +207,61 @@ async def archive_conversation(conversation_id: str, current_user: User = Depend
     await ws_manager.send_to_user(str(current_user.id), {"type": "conversation_updated", "action": "archived", "data": data})
     return data
 
+@router.get("/conversations/search")
+def search_conversations(
+    q: str,
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db)
+):
+    query_str = q.strip()
+    if not query_str:
+        return []
+    
+    title_matches = db.query(Conversation).filter(
+        Conversation.user_id == current_user.id,
+        Conversation.title.ilike(f"%{query_str}%")
+    ).limit(10).all()
+    
+    message_matches = db.query(Message, Conversation).join(
+        Conversation, Message.conversation_id == Conversation.id
+    ).filter(
+        Conversation.user_id == current_user.id,
+        Message.content.ilike(f"%{query_str}%")
+    ).order_by(Message.created_at.desc()).limit(20).all()
+    
+    seen_convs = set()
+    results = []
+    
+    for c in title_matches:
+        if c.id not in seen_convs:
+            seen_convs.add(c.id)
+            results.append({
+                "conversation_id": str(c.id),
+                "title": c.title,
+                "match_type": "title",
+                "snippet": c.title,
+                "updated_at": c.updated_at.isoformat() if c.updated_at else None
+            })
+            
+    for m, c in message_matches:
+        if c.id not in seen_convs:
+            seen_convs.add(c.id)
+            content = m.content or ""
+            idx = content.lower().find(query_str.lower())
+            start = max(0, idx - 40)
+            end = min(len(content), idx + len(query_str) + 40)
+            snippet = ("..." if start > 0 else "") + content[start:end] + ("..." if end < len(content) else "")
+            
+            results.append({
+                "conversation_id": str(c.id),
+                "title": c.title,
+                "match_type": "message",
+                "snippet": snippet,
+                "updated_at": c.updated_at.isoformat() if c.updated_at else None
+            })
+            
+    return results
+
 @router.post("/conversations/{conversation_id}/share")
 async def share_conversation(conversation_id: str, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
     try:
@@ -203,13 +271,74 @@ async def share_conversation(conversation_id: str, current_user: User = Depends(
     conv = db.query(Conversation).filter(Conversation.id == conv_uuid, Conversation.user_id == current_user.id).first()
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    share_url = f"/share/{conv.id}"
+    
+    existing_share = db.query(ConversationShare).filter(
+        ConversationShare.conversation_id == conv.id,
+        ConversationShare.is_active == True
+    ).first()
+    
+    if existing_share:
+        share_token = existing_share.share_token
+    else:
+        share_token = secrets.token_urlsafe(16)
+        share = ConversationShare(
+            conversation_id=conv.id,
+            user_id=current_user.id,
+            share_token=share_token,
+            is_active=True
+        )
+        db.add(share)
+        db.commit()
+
+    share_url = f"/share/{share_token}"
     return {
         "status": "shared",
         "conversation_id": str(conv.id),
+        "share_token": share_token,
         "title": conv.title,
         "share_url": share_url
     }
+
+@router.get("/share/{token}")
+def get_shared_conversation(token: str, db: Session = Depends(get_db)):
+    share = db.query(ConversationShare).filter(
+        ConversationShare.share_token == token,
+        ConversationShare.is_active == True
+    ).first()
+    if not share:
+        raise HTTPException(status_code=404, detail="Shared conversation not found or expired")
+    
+    conv = db.query(Conversation).filter(Conversation.id == share.conversation_id).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    
+    messages = db.query(Message).filter(Message.conversation_id == conv.id).order_by(Message.created_at.asc()).all()
+    return {
+        "title": conv.title,
+        "created_at": conv.created_at.isoformat() if conv.created_at else None,
+        "character_id": conv.character_id,
+        "messages": [
+            {
+                "id": str(m.id),
+                "role": m.role,
+                "content": m.content,
+                "created_at": m.created_at.isoformat() if m.created_at else None
+            } for m in messages
+        ]
+    }
+
+@router.delete("/share/{token}")
+def revoke_shared_conversation(token: str, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
+    share = db.query(ConversationShare).filter(
+        ConversationShare.share_token == token,
+        ConversationShare.user_id == current_user.id
+    ).first()
+    if not share:
+        raise HTTPException(status_code=404, detail="Shared conversation not found")
+    
+    share.is_active = False
+    db.commit()
+    return {"status": "revoked"}
 
 @router.get("/conversations/{conversation_id}/files")
 async def get_conversation_files(conversation_id: str, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
@@ -331,14 +460,62 @@ def list_messages(conversation_id: str, current_user: User = Depends(AuthManager
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
     messages = db.query(Message).filter(Message.conversation_id == conv.id).order_by(Message.created_at.asc()).all()
-    return [
-        {
+    
+    result = []
+    for m in messages:
+        content = m.content or ""
+        meta = m.metadata_json or {}
+        # Auto-enrich assistant message if an image tool was run but content lacks markdown image tag
+        if m.role == "assistant" and "![" not in content and meta.get("tool_results"):
+            for tr in meta["tool_results"]:
+                if tr.get("tool") in ["create_image", "edit_image"]:
+                    tr_res = tr.get("result", "")
+                    img_match = re.search(r"(!\[.*?\]\([^\)]+\))", tr_res)
+                    data_match = re.search(r"(<!--\s*SAKURA_IMAGE_DATA:.*?-->)", tr_res, re.DOTALL)
+                    if img_match:
+                        content += f"\n\n{img_match.group(1)}"
+                        if data_match:
+                            content += f"\n\n{data_match.group(1)}"
+        result.append({
+            "id": str(m.id),
             "role": m.role,
-            "content": m.content,
-            "metadata": m.metadata_json,
+            "content": content,
+            "metadata": meta,
             "created_at": m.created_at.isoformat()
-        } for m in messages
-    ]
+        })
+    return result
+
+class FeedbackRequest(BaseModel):
+    rating: str  # "positive" | "negative"
+    comment: Optional[str] = None
+    category: Optional[str] = None
+
+@router.post("/messages/{message_id}/feedback")
+def submit_message_feedback(
+    message_id: str,
+    body: FeedbackRequest,
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        msg_uuid = uuid.UUID(message_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid message ID")
+    
+    msg = db.query(Message).filter(Message.id == msg_uuid).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+        
+    feedback = MessageFeedback(
+        message_id=msg_uuid,
+        user_id=current_user.id,
+        rating=body.rating,
+        comment=body.comment,
+        category=body.category
+    )
+    db.add(feedback)
+    db.commit()
+    return {"status": "success", "id": str(feedback.id), "rating": body.rating}
 
 
 # ─── Memory Endpoints ────────────────────────────────────────────────────────

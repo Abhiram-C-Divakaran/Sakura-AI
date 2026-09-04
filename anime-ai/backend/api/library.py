@@ -5,9 +5,9 @@ import json
 import asyncio
 import urllib.request
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, BackgroundTasks, Query
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, BackgroundTasks, Query, Request
 from fastapi.responses import FileResponse, Response, JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, desc, asc
@@ -259,43 +259,82 @@ def get_library_file_content(
             "error": str(e)
         }
 
+def authenticate_user_from_req(token: Optional[str], req_headers: Any, db: Session) -> User:
+    """Extracts and verifies user from query token or Authorization header."""
+    raw_token = token
+    auth_header = req_headers.get("authorization") if hasattr(req_headers, "get") else None
+    if not raw_token and auth_header and auth_header.lower().startswith("bearer "):
+        raw_token = auth_header[7:].strip()
+
+    if not raw_token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication credentials required")
+
+    try:
+        payload = AuthManager.decode_token(raw_token)
+        username = payload.get("sub")
+        if not username:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        return user
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired authentication token")
+
 @router.get("/files/{file_id}/download")
 def download_library_file(
     file_id: str,
-    current_user: User = Depends(AuthManager.get_current_user),
+    from_fastapi_req: Request,
+    token: Optional[str] = Query(None),
     db: Session = Depends(get_db)
 ):
-    """Streams physical file for download with Content-Disposition."""
+    """Streams physical file for download with strict ownership validation."""
     try:
         doc_uuid = uuid.UUID(file_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid file ID")
 
-    doc = db.query(Document).filter(Document.id == doc_uuid, Document.user_id == current_user.id).first()
-    if not doc or not os.path.exists(doc.storage_path):
-        raise HTTPException(status_code=404, detail="File not found in storage")
+    current_user = authenticate_user_from_req(token, from_fastapi_req.headers, db)
 
-    return FileResponse(
-        path=doc.storage_path,
-        media_type=doc.mime_type or "application/octet-stream",
-        filename=doc.filename
-    )
+    # 1. Check Document table owned by this user
+    doc = db.query(Document).filter(Document.id == doc_uuid, Document.user_id == current_user.id).first()
+    if doc and os.path.exists(doc.storage_path):
+        return FileResponse(
+            path=doc.storage_path,
+            media_type=doc.mime_type or "application/octet-stream",
+            filename=doc.filename
+        )
+
+    # 2. Check GeneratedImage table owned by this user
+    from database.models import GeneratedImage
+    gen_img = db.query(GeneratedImage).filter(GeneratedImage.id == doc_uuid, GeneratedImage.user_id == current_user.id).first()
+    if gen_img and os.path.exists(gen_img.storage_path):
+        return FileResponse(
+            path=gen_img.storage_path,
+            media_type="image/png",
+            filename=f"image_{file_id[:8]}.png"
+        )
+
+    raise HTTPException(status_code=404, detail="File not found in storage or access denied")
 
 @router.get("/files/{file_id}/thumbnail")
 def get_library_file_thumbnail(
     file_id: str,
+    from_fastapi_req: Request,
     token: Optional[str] = Query(None),
     db: Session = Depends(get_db)
 ):
-    """Serves thumbnail or direct image preview."""
+    """Serves thumbnail or direct image preview with strict ownership validation."""
     try:
         doc_uuid = uuid.UUID(file_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid file ID")
 
-    doc = db.query(Document).filter(Document.id == doc_uuid).first()
+    current_user = authenticate_user_from_req(token, from_fastapi_req.headers, db)
+
+    doc = db.query(Document).filter(Document.id == doc_uuid, Document.user_id == current_user.id).first()
     if not doc or not os.path.exists(doc.storage_path):
-        raise HTTPException(status_code=404, detail="File not found")
+        raise HTTPException(status_code=404, detail="File not found or access denied")
 
     return FileResponse(path=doc.storage_path, media_type=doc.mime_type)
 
@@ -309,23 +348,38 @@ async def upload_library_file(
 ):
     """
     Uploads a real file to object storage, creates database record, 
-    and triggers background RAG indexing if enabled.
+    and triggers background RAG indexing if enabled. Enforces max size and path safety.
     """
+    # Sanitize filename against directory traversal
+    clean_filename = os.path.basename(file.filename or "upload.bin")
     file_id = uuid.uuid4()
-    extension = os.path.splitext(file.filename)[1]
+    extension = os.path.splitext(clean_filename)[1]
     storage_path = os.path.join(UPLOAD_DIR, f"{file_id}{extension}")
 
+    # Enforce 50MB file size limit
+    max_size_bytes = 50 * 1024 * 1024
+    bytes_read = 0
     with open(storage_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            bytes_read += len(chunk)
+            if bytes_read > max_size_bytes:
+                buffer.close()
+                if os.path.exists(storage_path):
+                    os.remove(storage_path)
+                raise HTTPException(status_code=413, detail="File exceeds maximum allowed size of 50MB")
+            buffer.write(chunk)
 
-    file_size = os.path.getsize(storage_path)
+    file_size = bytes_read
     mime_type = file.content_type or "application/octet-stream"
-    category = get_file_category(mime_type, file.filename)
+    category = get_file_category(mime_type, clean_filename)
 
     doc = Document(
         id=file_id,
         user_id=current_user.id,
-        filename=file.filename,
+        filename=clean_filename,
         mime_type=mime_type,
         storage_path=storage_path,
         metadata_json={
@@ -335,7 +389,7 @@ async def upload_library_file(
             "category": category,
             "source": "upload",
             "is_knowledge_base": False,
-            "modified_at": datetime.utcnow().isoformat(),
+            "modified_at": datetime.now(timezone.utc).isoformat(),
             "chunks": 0,
             "error": None
         }

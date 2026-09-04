@@ -90,3 +90,40 @@ class OpenAIProvider(LLMProvider):
             **kwargs
         )
         return response.choices[0].message.parsed
+
+    async def tool_turn(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        temperature: float = 0.2,
+        max_tokens: int = 1500,
+        **kwargs
+    ) -> Dict[str, Any]:
+        import json
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            tools=tools if tools else None,
+            tool_choice="auto" if tools else None,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs
+        )
+        choice = response.choices[0]
+        tool_calls = []
+        if choice.message.tool_calls:
+            for tc in choice.message.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except Exception:
+                    args = {}
+                tool_calls.append({
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "arguments": args
+                })
+        return {
+            "content": choice.message.content,
+            "tool_calls": tool_calls,
+            "finish_reason": choice.finish_reason
+        }

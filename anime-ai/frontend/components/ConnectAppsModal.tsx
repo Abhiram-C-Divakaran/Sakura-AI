@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 
 export interface AppConnector {
   id: string;
@@ -7,6 +7,7 @@ export interface AppConnector {
   description: string;
   iconSvg: JSX.Element;
   connected: boolean;
+  account_name?: string;
 }
 
 const DEFAULT_CONNECTORS: AppConnector[] = [
@@ -15,7 +16,7 @@ const DEFAULT_CONNECTORS: AppConnector[] = [
     name: 'GitHub',
     category: 'Development',
     description: 'Sync repositories, inspect pull requests, and commit code directly.',
-    connected: true,
+    connected: false,
     iconSvg: (
       <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
         <path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4" />
@@ -71,7 +72,7 @@ const DEFAULT_CONNECTORS: AppConnector[] = [
     name: 'PostgreSQL',
     category: 'Database',
     description: 'Execute analytical read queries and inspect table schemas live.',
-    connected: true,
+    connected: false,
     iconSvg: (
       <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
         <ellipse cx="12" cy="5" rx="9" ry="3" />
@@ -98,17 +99,101 @@ const DEFAULT_CONNECTORS: AppConnector[] = [
 interface ConnectAppsModalProps {
   isOpen: boolean;
   onClose: () => void;
+  apiBase?: string;
 }
 
-export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({ isOpen, onClose }) => {
+export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({
+  isOpen,
+  onClose,
+  apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+}) => {
   const [connectors, setConnectors] = useState<AppConnector[]>(DEFAULT_CONNECTORS);
+  const [loading, setLoading] = useState(false);
+  const [actionInProgress, setActionInProgress] = useState<string | null>(null);
+
+  const getAuthToken = () => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('token') || '';
+    }
+    return '';
+  };
+
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const fetchStatuses = async () => {
+      try {
+        setLoading(true);
+        const token = getAuthToken();
+        const res = await fetch(`${apiBase}/api/v1/integrations`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const statusMap = new Map<string, { is_connected: boolean; account_name?: string }>();
+          data.forEach((item: any) => {
+            statusMap.set(item.id, { is_connected: item.is_connected, account_name: item.account_name });
+          });
+
+          setConnectors((prev) =>
+            prev.map((c) => {
+              const status = statusMap.get(c.id);
+              if (status !== undefined) {
+                return { ...c, connected: status.is_connected, account_name: status.account_name };
+              }
+              return c;
+            })
+          );
+        }
+      } catch (err) {
+        console.error('Failed to fetch connector statuses:', err);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchStatuses();
+  }, [isOpen, apiBase]);
 
   if (!isOpen) return null;
 
-  const toggleConnect = (id: string) => {
+  const toggleConnect = async (c: AppConnector) => {
+    const token = getAuthToken();
+    setActionInProgress(c.id);
+    const newConnected = !c.connected;
+
+    // Optimistic update
     setConnectors((prev) =>
-      prev.map((c) => (c.id === id ? { ...c, connected: !c.connected } : c))
+      prev.map((item) => (item.id === c.id ? { ...item, connected: newConnected } : item))
     );
+
+    try {
+      if (newConnected) {
+        await fetch(`${apiBase}/api/v1/integrations/${c.id}/connect`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`
+          },
+          body: JSON.stringify({
+            account_name: `${c.name} Workspace`
+          })
+        });
+      } else {
+        await fetch(`${apiBase}/api/v1/integrations/${c.id}/disconnect`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      }
+    } catch (err) {
+      console.error('Failed to toggle connection on backend:', err);
+      // Rollback on error
+      setConnectors((prev) =>
+        prev.map((item) => (item.id === c.id ? { ...item, connected: !newConnected } : item))
+      );
+    } finally {
+      setActionInProgress(null);
+    }
   };
 
   return (
@@ -174,25 +259,28 @@ export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({ isOpen, onCl
 
               <button
                 type="button"
-                onClick={() => toggleConnect(c.id)}
+                disabled={actionInProgress === c.id}
+                onClick={() => toggleConnect(c)}
                 className={`ml-4 px-3 py-1.5 text-[12px] font-medium rounded-lg transition-all cursor-pointer flex-shrink-0 ${
                   c.connected
                     ? 'bg-[#1C2C26] text-[#35D0BA] border border-[#35D0BA]/30 hover:bg-[#223930]'
-                    : 'bg-[#2A2A2A] text-[#CCCCCC] hover:bg-[#383838] hover:text-white'
+                    : 'bg-[#2A2A2A] text-white border border-[#383838] hover:bg-[#333333]'
                 }`}
               >
-                {c.connected ? 'Connected' : 'Connect'}
+                {actionInProgress === c.id ? 'Updating...' : c.connected ? 'Connected ✓' : 'Connect'}
               </button>
             </div>
           ))}
         </div>
 
         {/* Footer */}
-        <div className="p-3 bg-[#161616] border-t border-[#282828] flex items-center justify-between text-[11.5px] text-[#888888]">
-          <span>All connections are encrypted with AES-256 tokens</span>
+        <div className="p-3.5 border-t border-[#2C2C2C] bg-[#191919] flex items-center justify-between">
+          <span className="text-[11px] text-[#666666]">
+            Credentials and tokens are encrypted and isolated per user session.
+          </span>
           <button
             onClick={onClose}
-            className="px-4 py-1.5 text-black bg-white hover:bg-[#E5E5E5] font-medium rounded-lg transition-colors cursor-pointer"
+            className="px-4 py-1.5 rounded-lg bg-[#2A2A2A] hover:bg-[#333333] text-white text-[12.5px] font-medium transition-colors cursor-pointer"
           >
             Done
           </button>

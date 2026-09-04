@@ -17,6 +17,9 @@ import { ChatPopoverMenu } from '../components/ChatPopoverMenu';
 import { ImageLightboxModal, ImageMetadata } from '../components/ImageLightboxModal';
 import { SakuraLogo, SakuraWordmark, SakuraBrandHeader } from '../components/SakuraLogo';
 import { ConversationFilesSheet } from '../components/ConversationFilesSheet';
+import { ProjectsView } from '../components/ProjectsView';
+import { ScheduledView } from '../components/ScheduledView';
+import { PluginsView } from '../components/PluginsView';
 
 export default function Console() {
   const router = useRouter();
@@ -94,6 +97,7 @@ export default function Console() {
   const [streamingProvider, setStreamingProvider] = useState('');
   const [loadingResponse, setLoadingResponse] = useState(false);
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+  const [feedbackState, setFeedbackState] = useState<Record<string, 'positive' | 'negative'>>({});
 
   const [activeView, setActiveView] = useState<'chat' | 'library' | 'projects' | 'scheduled' | 'plugins'>('chat');
   const [attachedFromLibrary, setAttachedFromLibrary] = useState<any>(null);
@@ -772,6 +776,36 @@ export default function Console() {
     navigator.clipboard.writeText(content);
     setCopiedIdx(idx);
     setTimeout(() => setCopiedIdx(null), 2000);
+  };
+
+  const handleMessageFeedback = async (msg: any, index: number, rating: 'positive' | 'negative') => {
+    const key = msg.id || String(index);
+    setFeedbackState(prev => ({ ...prev, [key]: rating }));
+    if (!msg.id) return;
+    try {
+      await fetch(`${apiBase}/api/v1/messages/${msg.id}/feedback`, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({ rating })
+      });
+    } catch (err) {
+      console.error('Failed to submit message feedback:', err);
+    }
+  };
+
+  const handleRetryMessage = (index: number) => {
+    for (let i = index - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') {
+        const userMsg = messages[i];
+        handleSendMessage({
+          message: userMsg.content,
+          intensity: userMsg.metadata?.intensity || 'medium',
+          tools: userMsg.metadata?.tools || [],
+          attachments: userMsg.metadata?.attachments || []
+        });
+        break;
+      }
+    }
   };
 
   const handleTogglePinChat = async (id: string, isCurrentlyPinned: boolean) => {
@@ -1842,6 +1876,7 @@ export default function Console() {
                         <div className="flex-1 min-w-0">
                           <MarkdownContent
                             content={m.content}
+                            metadata={m.metadata}
                             onOpenLightbox={handleOpenLightbox}
                             onEdit={handleImageEdit}
                             onRegenerate={handleImageRegenerate}
@@ -1854,9 +1889,35 @@ export default function Console() {
                             <button onClick={() => handleCopy(m.content, i)} className="p-1.5 text-[#6B6B6B] hover:text-white hover:bg-[#1A1A1A] rounded-lg transition-colors cursor-pointer" title="Copy">
                               {copiedIdx === i ? <CheckCircle className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
                             </button>
-                            <button className="p-1.5 text-[#6B6B6B] hover:text-white hover:bg-[#1A1A1A] rounded-lg transition-colors cursor-pointer" title="Retry"><RefreshCw className="w-4 h-4" /></button>
-                            <button className="p-1.5 text-[#6B6B6B] hover:text-white hover:bg-[#1A1A1A] rounded-lg transition-colors cursor-pointer" title="Good"><ThumbsUp className="w-4 h-4" /></button>
-                            <button className="p-1.5 text-[#6B6B6B] hover:text-white hover:bg-[#1A1A1A] rounded-lg transition-colors cursor-pointer" title="Bad"><ThumbsDown className="w-4 h-4" /></button>
+                            <button 
+                              onClick={() => handleRetryMessage(i)}
+                              className="p-1.5 text-[#6B6B6B] hover:text-white hover:bg-[#1A1A1A] rounded-lg transition-colors cursor-pointer" 
+                              title="Retry generation"
+                            >
+                              <RefreshCw className="w-4 h-4" />
+                            </button>
+                            <button 
+                              onClick={() => handleMessageFeedback(m, i, 'positive')}
+                              className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
+                                feedbackState[m.id || String(i)] === 'positive'
+                                  ? 'text-emerald-400 bg-emerald-500/10'
+                                  : 'text-[#6B6B6B] hover:text-white hover:bg-[#1A1A1A]'
+                              }`}
+                              title="Good response"
+                            >
+                              <ThumbsUp className="w-4 h-4" />
+                            </button>
+                            <button 
+                              onClick={() => handleMessageFeedback(m, i, 'negative')}
+                              className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
+                                feedbackState[m.id || String(i)] === 'negative'
+                                  ? 'text-rose-400 bg-rose-500/10'
+                                  : 'text-[#6B6B6B] hover:text-white hover:bg-[#1A1A1A]'
+                              }`}
+                              title="Bad response"
+                            >
+                              <ThumbsDown className="w-4 h-4" />
+                            </button>
                             <button className="p-1.5 text-[#6B6B6B] hover:text-white hover:bg-[#1A1A1A] rounded-lg transition-colors cursor-pointer" title="More"><MoreHorizontal className="w-4 h-4" /></button>
                           </div>
                         </div>
@@ -1908,9 +1969,24 @@ export default function Console() {
               onNavigateToChat={() => setActiveView('chat')}
               apiBase={apiBase}
             />
+          ) : activeView === 'projects' ? (
+            <ProjectsView
+              apiBase={apiBase}
+              onNavigateToChat={(convId) => {
+                if (convId) {
+                  selectConversation(convId);
+                } else {
+                  createNewConversation();
+                }
+              }}
+            />
+          ) : activeView === 'scheduled' ? (
+            <ScheduledView apiBase={apiBase} />
+          ) : activeView === 'plugins' ? (
+            <PluginsView apiBase={apiBase} />
           ) : (
             <div className="max-w-[48rem] mx-auto px-6 pb-36 pt-20 flex flex-col items-center justify-center h-full text-[#6B6B6B]">
-              <SakuraIcon size={48} opacity={0.15} />
+              <SakuraLogo size={48} className="opacity-15 mb-4" />
               <h2 className="text-[20px] text-white mt-6 mb-2 tracking-wide font-semibold capitalize">{activeView}</h2>
               <p className="text-[14px]">This module is currently offline.</p>
             </div>
@@ -2196,6 +2272,7 @@ export default function Console() {
           onClose={() => setShareModalChat(null)}
           chatId={shareModalChat.id}
           chatTitle={shareModalChat.title}
+          apiBase={apiBase}
         />
       )}
 
@@ -3039,6 +3116,7 @@ function ImageGenerationFailureCard({
 /* ═══════════════ Markdown Renderer ═══════════════ */
 function MarkdownContent({
   content,
+  metadata,
   onOpenLightbox,
   onEdit,
   onRegenerate,
@@ -3048,6 +3126,7 @@ function MarkdownContent({
   onEditPrompt
 }: {
   content: string;
+  metadata?: any;
   onOpenLightbox?: (src: string, alt: string, meta?: ImageMetadata | null) => void;
   onEdit?: (meta: ImageMetadata) => void;
   onRegenerate?: (prompt: string) => void;
@@ -3056,8 +3135,22 @@ function MarkdownContent({
   onRetryImage?: (errorData: any) => void;
   onEditPrompt?: (errorData: any) => void;
 }) {
+  let effectiveContent = content || '';
+  if (!effectiveContent.includes('![') && metadata?.tool_results) {
+    for (const tr of metadata.tool_results) {
+      if (tr.tool === 'create_image' || tr.tool === 'edit_image') {
+        const imgMatch = tr.result?.match(/(!\[.*?\]\([^\)]+\))/);
+        const dataMatch = tr.result?.match(/(<!--\s*SAKURA_IMAGE_DATA:.*?-->)/);
+        if (imgMatch) {
+          effectiveContent += `\n\n${imgMatch[1]}`;
+          if (dataMatch) effectiveContent += `\n\n${dataMatch[1]}`;
+        }
+      }
+    }
+  }
+
   let extractedMeta: ImageMetadata | null = null;
-  const metaMatch = content.match(/<!--\s*SAKURA_IMAGE_DATA:\s*(\{.*?\})\s*-->/);
+  const metaMatch = effectiveContent.match(/<!--\s*SAKURA_IMAGE_DATA:\s*(\{.*?\})\s*-->/);
   if (metaMatch) {
     try {
       extractedMeta = JSON.parse(metaMatch[1]);
@@ -3067,7 +3160,7 @@ function MarkdownContent({
   }
 
   let extractedError: any = null;
-  const errorMatch = content.match(/<!--\s*SAKURA_IMAGE_ERROR:\s*(\{.*?\})\s*-->/);
+  const errorMatch = effectiveContent.match(/<!--\s*SAKURA_IMAGE_ERROR:\s*(\{.*?\})\s*-->/);
   if (errorMatch) {
     try {
       extractedError = JSON.parse(errorMatch[1]);
@@ -3087,7 +3180,7 @@ function MarkdownContent({
     );
   }
 
-  const cleaned = content
+  const cleaned = effectiveContent
     .replace(/<think>[\s\S]*?(?:<\/think>|$)/g, '')
     .replace(/<!--\s*SAKURA_IMAGE_DATA:\s*\{.*?\}\s*-->/g, '')
     .replace(/<!--\s*SAKURA_IMAGE_ERROR:\s*\{.*?\}\s*-->/g, '')
@@ -3209,7 +3302,7 @@ function TextBlock({
     }
 
     // Image detection: ![alt](url)
-    const imgMatch = trimmed.match(/^!\[(.*?)\]\((.*?)\)$/);
+    const imgMatch = trimmed.match(/!\[(.*?)\]\((.*?)\)/);
     if (imgMatch) {
       flushList(`f-${idx}`);
       flushTable(`t-${idx}`);

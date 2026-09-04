@@ -33,24 +33,50 @@ class SentimentAnalyzer:
 
 
 class IntentClassifier:
-    """Keyword intent classifier mapping statements to functional categories."""
+    """Keyword and pattern intent classifier mapping user statements to functional domains."""
 
     INTENT_PATTERNS = {
+        "repository_coding": [
+            "repository", "repo", "codebase", "workspace", "multi-file", "refactor repository",
+            "git status", "git diff", "checkout branch", "pull request", "build project"
+        ],
+        "debugging": [
+            "debug", "bug", "crash", "error", "stack trace", "traceback", "exception",
+            "fix error", "failing test", "assertionerror", "typeerror", "referenceerror", "syntaxerror"
+        ],
+        "architecture": [
+            "architecture", "system design", "microservice", "database schema", "scalability",
+            "domain model", "event-driven", "distributed system", "api contract"
+        ],
         "code_generation": [
             "code", "program", "function", "script", "algorithm", "python", "javascript",
-            "typescript", "react", "html", "css", "sql", "bug", "debug", "compile",
-            "refactor", "api", "endpoint", "class", "method", "loop", "array", "database",
-            "backend", "frontend", "git", "docker", "test", "unit test", "write", "develop",
-            "implement", "component", "library", "syntax", "error", "stack trace", "codex", "claude"
+            "typescript", "react", "html", "css", "sql", "compile", "refactor", "api",
+            "endpoint", "class", "method", "loop", "array", "database", "backend", "frontend",
+            "test", "unit test", "write", "develop", "implement", "component", "library"
         ],
-        "billing_issue": ["charge", "payment", "invoice", "refund", "bill", "price", "cost"],
-        "login_issue": ["login", "sign in", "password", "forgot", "reset", "access", "account"],
-        "app_crash": ["crash", "crashes", "crashing", "frozen", "freeze", "stops"],
-        "performance_issue": ["slow", "lag", "lagging", "loading", "takes forever", "timeout"],
-        "connectivity": ["connect", "connection", "offline", "internet", "network", "wifi"],
-        "installation": ["install", "setup", "download", "update", "upgrade"],
-        "documents_issue": ["pdf", "document", "file", "read", "context", "search document", "uploaded"],
-        "local_workload": ["local", "offline", "private", "on-prem", "ollama"],
+        "image_generation": [
+            "draw", "paint", "generate image", "create image", "render", "illustration",
+            "wallpaper", "artwork", "portrait", "anime art", "sketch", "visualize picture"
+        ],
+        "image_editing": [
+            "change the image", "edit image", "make the background", "change color",
+            "make it darker", "add to image", "remove from image"
+        ],
+        "research": [
+            "research", "investigate", "market study", "comparative analysis", "deep dive",
+            "literature review", "whitepaper", "state of the art"
+        ],
+        "document_analysis": [
+            "pdf", "document", "spreadsheet", "csv", "audit document", "analyze file",
+            "extract data", "summarize report"
+        ],
+        "reasoning": [
+            "why", "how does", "compare and contrast", "trade-off", "tradeoff", "evaluate",
+            "mathematical proof", "logic puzzle", "step-by-step explanation"
+        ],
+        "local_private": [
+            "local", "offline", "private", "on-prem", "ollama", "no cloud", "confidential"
+        ]
     }
 
     def classify(self, text: str) -> str:
@@ -63,6 +89,7 @@ class IntentClassifier:
                     scores[intent] += 1
 
         if not scores:
-            return "general_inquiry"
+            return "general_chat"
 
         return max(scores, key=scores.__getitem__)
+
