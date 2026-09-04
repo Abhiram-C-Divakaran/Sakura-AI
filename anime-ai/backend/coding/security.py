@@ -36,23 +36,51 @@ class WorkspaceSecurity:
         """
         Resolves relative_path within workspace_root.
         Guarantees that the resulting canonical path cannot escape workspace_root.
+        Rejects:
+        - Absolute POSIX paths (e.g. /etc/passwd)
+        - Windows absolute drive paths (e.g. C:\\...)
+        - UNC paths (e.g. \\\\server\\share)
+        - Relative traversals escaping workspace root (e.g. ../../foo)
+        - Symlink escapes through canonicalization
         """
+        if not relative_path or not isinstance(relative_path, str):
+            raise SecurityException("Relative path cannot be empty.")
+
+        # Disallow null bytes
+        if "\0" in relative_path:
+            raise SecurityException("Path contains forbidden null byte.")
+
+        # Reject absolute paths (POSIX, Windows drive, UNC)
+        norm_path = relative_path.strip()
+        if (
+            norm_path.startswith("/")
+            or norm_path.startswith("\\")
+            or re.match(r"^[a-zA-Z]:", norm_path)
+            or norm_path.startswith("//")
+            or norm_path.startswith(r"\\")
+            or os.path.isabs(norm_path)
+        ):
+            raise SecurityException(
+                f"Absolute paths are not permitted as workspace-relative inputs: '{relative_path}'"
+            )
+
         canonical_root = os.path.realpath(os.path.abspath(workspace_root))
-        
-        # Clean leading slashes/backslashes to prevent absolute path override
-        cleaned = relative_path.replace("\\", "/")
-        if cleaned.startswith("/"):
-            cleaned = cleaned.lstrip("/")
-            
-        target = os.path.realpath(os.path.abspath(os.path.join(canonical_root, cleaned)))
-        
+        target = os.path.realpath(os.path.abspath(os.path.join(canonical_root, norm_path)))
+
         # Verify prefix containment
-        common = os.path.commonpath([canonical_root, target])
-        if common != canonical_root:
+        try:
+            common = os.path.commonpath([canonical_root, target])
+        except ValueError:
+            # Different drives on Windows
+            raise SecurityException(
+                f"Path traversal detected: '{relative_path}' resolves to different drive than workspace root."
+            )
+
+        if common != canonical_root or (target != canonical_root and not target.startswith(canonical_root + os.sep)):
             raise SecurityException(
                 f"Path traversal detected: '{relative_path}' escapes workspace root '{workspace_root}'"
             )
-            
+
         return target
 
     @staticmethod

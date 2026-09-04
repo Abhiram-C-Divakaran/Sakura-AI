@@ -72,13 +72,17 @@ class AuthManager:
             return None
 
     @staticmethod
-    def validate_production_secret(env: Optional[str] = None, secret: Optional[str] = None) -> None:
-        target_env = (env or os.getenv("ENV", os.getenv("ENVIRONMENT", "development"))).lower()
-        target_secret = secret if secret is not None else os.getenv("JWT_SECRET", DEFAULT_INSECURE_KEY)
-        if target_env == "production" and (not target_secret or target_secret == DEFAULT_INSECURE_KEY):
-            raise RuntimeError(
-                "Production startup failed: JWT_SECRET must be explicitly configured and cannot use the default insecure key."
-            )
+    def validate_production_secret(secret: Optional[str] = None, environment: Optional[str] = None, env: Optional[str] = None) -> bool:
+        """
+        Validates JWT secret against production security requirements by delegating
+        to the centralized Settings.validate_production_guards().
+        """
+        target_env = (env or environment or os.getenv("ENVIRONMENT", os.getenv("ENV", "development"))).lower()
+        target_secret = secret if secret is not None else os.getenv("JWT_SECRET", "")
+        from config.settings import Settings
+        s = Settings(ENVIRONMENT=target_env, JWT_SECRET=target_secret)
+        s.validate_production_guards()
+        return True
 
     @staticmethod
     def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
@@ -94,7 +98,7 @@ class AuthManager:
                 raise credentials_exception
         except (JWTError, Exception):
             raise credentials_exception
-            
+
         user = db.query(User).filter(User.username == username).first()
         if user is None:
             raise credentials_exception
@@ -112,14 +116,5 @@ class AuthManager:
             return db.query(User).filter(User.username == username).first()
         except Exception:
             return None
-
-    @staticmethod
-    def validate_production_secret(secret: str, environment: str = "production", env: Optional[str] = None) -> bool:
-        """Helper to validate secret entropy and check against development placeholders."""
-        target_env = env or environment
-        from config.settings import Settings
-        s = Settings(ENVIRONMENT=target_env, JWT_SECRET=secret)
-        s.validate_production_guards()
-        return True
 
 

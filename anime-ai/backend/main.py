@@ -53,10 +53,12 @@ scheduler_service = None
 
 @app.on_event("startup")
 async def on_startup():
-    """Initializes tables, seeds profiles, and starts background scheduler."""
+    """Initializes dev schema or relies on Alembic in production, seeds profiles, and starts background scheduler."""
     global scheduler_service
+    is_prod = settings.environment in ["production", "prod"]
     try:
-        init_tables()
+        if not is_prod:
+            init_tables()
         seed_characters()
         print("Sakura AI Platform: Startup database initialized successfully.")
     except Exception as e:

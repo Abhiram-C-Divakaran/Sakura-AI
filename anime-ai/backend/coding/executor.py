@@ -9,7 +9,7 @@ duration_ms, and timed_out flags.
 import os
 import asyncio
 from typing import Dict, Any, Optional, List, Union
-from coding.sandbox import SandboxManager, BaseSandboxRuntime
+from coding.sandbox import SandboxManager, BaseSandboxRuntime, SandboxUnavailableError
 
 class SandboxExecutor:
     """
@@ -28,7 +28,13 @@ class SandboxExecutor:
         self.workspace_root = os.path.realpath(os.path.abspath(workspace_root))
         self.default_timeout_seconds = timeout_seconds
         os.makedirs(self.workspace_root, exist_ok=True)
-        self.runtime = runtime or SandboxManager.get_runtime(
+        self._explicit_runtime = runtime
+
+    @property
+    def runtime(self) -> BaseSandboxRuntime:
+        if self._explicit_runtime is not None:
+            return self._explicit_runtime
+        return SandboxManager.get_runtime(
             self.workspace_root,
             timeout_seconds=self.default_timeout_seconds
         )
@@ -62,13 +68,30 @@ class SandboxExecutor:
         - timed_out (bool)
         """
         timeout = timeout_seconds if timeout_seconds is not None else self.default_timeout_seconds
-        res = await self.runtime.run_command(
-            command=command,
-            cwd_relative=cwd_relative,
-            timeout_seconds=timeout,
-            tool_name=tool_name,
-            allow_network=allow_network
-        )
-        if "timed_out" not in res:
-            res["timed_out"] = False
-        return res
+        cmd_display = " ".join(command) if isinstance(command, list) else str(command)
+        try:
+            runtime = self.runtime
+            res = await runtime.run_command(
+                command=command,
+                cwd_relative=cwd_relative,
+                timeout_seconds=timeout,
+                tool_name=tool_name,
+                allow_network=allow_network
+            )
+            if "timed_out" not in res:
+                res["timed_out"] = False
+            return res
+        except SandboxUnavailableError as e:
+            return {
+                "success": False,
+                "tool": tool_name,
+                "command": cmd_display,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Sandbox Unavailable: {str(e)}",
+                "error": str(e),
+                "duration_ms": 0,
+                "timed_out": False,
+                "blocked": True,
+                "isolation_unavailable": True
+            }

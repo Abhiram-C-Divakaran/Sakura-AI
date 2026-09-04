@@ -2,13 +2,16 @@
 Sakura AI — Persistent Scheduled Task Execution Engine
 
 Executes scheduled recurring assistant prompts, logs execution history to ScheduledTaskRun,
-and manages periodic evaluation of cron/interval schedules.
+and manages periodic evaluation of cron and natural-language schedules with timezone awareness.
 """
 import uuid
 import time
 import asyncio
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
+from zoneinfo import ZoneInfo
+from croniter import croniter
 from sqlalchemy.orm import Session
 
 from database.models import ScheduledTask, ScheduledTaskRun, User, utc_now
@@ -16,20 +19,59 @@ from database.db import get_db_context
 from llm.router import LLMRouter
 
 
-def compute_next_run(schedule: str, from_time: Optional[datetime] = None) -> datetime:
-    """Estimates next run timestamp based on interval / cron schedule string."""
+NATURAL_SCHEDULES = {
+    "hourly": "0 * * * *",
+    "every hour": "0 * * * *",
+    "daily": "0 0 * * *",
+    "every day": "0 0 * * *",
+    "daily at 9am": "0 9 * * *",
+    "every day at 9am": "0 9 * * *",
+    "weekly": "0 0 * * 0",
+    "every week": "0 0 * * 0",
+    "every 15 minutes": "*/15 * * * *",
+    "every 30 minutes": "*/30 * * * *",
+    "every 5 minutes": "*/5 * * * *",
+}
+
+
+def normalize_schedule_expression(schedule: str) -> str:
+    """Normalizes natural language schedule aliases to cron syntax."""
+    s = (schedule or "").strip().lower()
+    if s in NATURAL_SCHEDULES:
+        return NATURAL_SCHEDULES[s]
+    for k, v in NATURAL_SCHEDULES.items():
+        if k in s:
+            return v
+    return schedule.strip()
+
+
+def compute_next_run(schedule: str, tz_name: str = "UTC", from_time: Optional[datetime] = None) -> datetime:
+    """
+    Computes the authoritative next execution timestamp in UTC.
+    Evaluates cron expressions and natural schedules according to user's IANA timezone.
+    Handles DST transitions correctly.
+    """
+    # 1. Parse IANA timezone
+    try:
+        user_tz = ZoneInfo(tz_name or "UTC")
+    except Exception:
+        user_tz = timezone.utc
+
+    # 2. Establish base time in user timezone
     base = from_time or utc_now()
-    s = schedule.lower().strip()
-    if "hour" in s:
-        return base + timedelta(hours=1)
-    elif "day" in s or "daily" in s or "9am" in s:
-        return base + timedelta(days=1)
-    elif "week" in s:
-        return base + timedelta(weeks=1)
-    elif "minute" in s:
-        return base + timedelta(minutes=15)
-    else:
-        # Default fallback to 24 hours
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    base_local = base.astimezone(user_tz)
+
+    # 3. Resolve cron expression
+    cron_expr = normalize_schedule_expression(schedule)
+
+    try:
+        iter = croniter(cron_expr, base_local)
+        next_local = iter.get_next(datetime)
+        return next_local.astimezone(timezone.utc)
+    except Exception:
+        # Fallback to 24h interval if cron expression fails parsing
         return base + timedelta(days=1)
 
 
@@ -75,7 +117,7 @@ async def execute_scheduled_task_run(task_id: uuid.UUID) -> Optional[Dict[str, A
             run.duration_ms = duration_ms
 
             task.last_run_at = now
-            task.next_run_at = compute_next_run(task.schedule, now)
+            task.next_run_at = compute_next_run(task.schedule, task.timezone, now)
 
             db.commit()
             return {
@@ -93,6 +135,8 @@ async def execute_scheduled_task_run(task_id: uuid.UUID) -> Optional[Dict[str, A
             run.completed_at = now
             run.duration_ms = duration_ms
             task.last_run_at = now
+            # Prevent corruption: calculate next run even on error so task continues running
+            task.next_run_at = compute_next_run(task.schedule, task.timezone, now)
             db.commit()
             return {
                 "run_id": str(run.id),
@@ -141,5 +185,13 @@ class TaskSchedulerService:
             ).all()
 
             for t in tasks:
+                # If next_run_at is missing, calculate immediately
+                if not t.next_run_at:
+                    t.next_run_at = compute_next_run(t.schedule, t.timezone, now)
+                    db.commit()
+
                 if t.next_run_at and t.next_run_at <= now:
+                    # Advance next_run_at immediately to prevent double execution on subsequent polls
+                    t.next_run_at = compute_next_run(t.schedule, t.timezone, now)
+                    db.commit()
                     asyncio.create_task(execute_scheduled_task_run(t.id))

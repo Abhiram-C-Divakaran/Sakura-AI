@@ -321,84 +321,10 @@ class Agent:
             return f"Tool execution error: {str(e)}"
 
     async def _tool_web_search(self, query: str) -> str:
-        """Performs live search on the web using Tavily Search API (priority) or DuckDuckGo fallback."""
-        import json
-        import urllib.request
-        import urllib.parse
-        import re
-
-        tavily_key = os.getenv("TAVILY_API_KEY")
-        if tavily_key:
-            try:
-                def run_tavily():
-                    req_data = json.dumps({
-                        "api_key": tavily_key,
-                        "query": query,
-                        "search_depth": "basic",
-                        "max_results": 5,
-                        "include_answer": True
-                    }).encode("utf-8")
-                    req = urllib.request.Request(
-                        "https://api.tavily.com/search",
-                        data=req_data,
-                        headers={"Content-Type": "application/json", "User-Agent": "SakuraAI/1.0"}
-                    )
-                    with urllib.request.urlopen(req, timeout=12) as response:
-                        return json.loads(response.read().decode("utf-8"))
-
-                loop = asyncio.get_event_loop()
-                data = await loop.run_in_executor(None, run_tavily)
-                results = []
-                if data.get("answer"):
-                    results.append(f"Summary: {data['answer']}\n")
-                for i, r in enumerate(data.get("results", [])[:5]):
-                    title = r.get("title", "Result")
-                    content = r.get("content", "")
-                    url = r.get("url", "")
-                    results.append(f"[{i+1}] {title}\n{content}\nSource: {url}")
-                if results:
-                    return "\n\n".join(results)
-            except Exception as e:
-                print(f"Tavily search error: {e}, falling back to DuckDuckGo")
-
-        try:
-            url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query)
-            req = urllib.request.Request(
-                url, 
-                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-            )
-            def run_request():
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    return response.read().decode('utf-8', errors='ignore')
-            
-            loop = asyncio.get_event_loop()
-            html = await loop.run_in_executor(None, run_request)
-            
-            snippets = re.findall(r'<a class="result-snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
-            urls = re.findall(r'<a class="result__url"[^>]*href="([^"]*)"', html, re.DOTALL)
-            
-            if not snippets:
-                snippets = re.findall(r'<td class="result-snippet"[^>]*>(.*?)</td>', html, re.DOTALL)
-                
-            if snippets:
-                results = []
-                for i, snip in enumerate(snippets[:4]):
-                    clean_snip = re.sub(r'<[^>]+>', '', snip).strip()
-                    source_url = urls[i].strip() if i < len(urls) else "https://duckduckgo.com"
-                    results.append(f"[{i+1}] {clean_snip}\nSource: {source_url}")
-                return "\n\n".join(results)
-            else:
-                descs = re.findall(r'<div class="result__snippet"[^>]*>(.*?)</div>', html, re.DOTALL)
-                if descs:
-                    results = []
-                    for i, snip in enumerate(descs[:4]):
-                        clean_snip = re.sub(r'<[^>]+>', '', snip).strip()
-                        source_url = urls[i].strip() if i < len(urls) else "https://duckduckgo.com"
-                        results.append(f"[{i+1}] {clean_snip}\nSource: {source_url}")
-                    return "\n\n".join(results)
-                return f"Web search could not find live results for '{query}'."
-        except Exception as e:
-            return f"Web search error: {str(e)}"
+        """Performs live search on the web using canonical WebSearchService."""
+        from services.web_search import perform_web_search
+        result = await perform_web_search(query)
+        return result.get("formatted", f"No results found for '{query}'.")
 
     async def _tool_create_image(self, prompt: str, aspect_ratio: Optional[str] = None) -> str:
         """Generates an image via ImageGenerationEngine and embeds interactive metadata."""
@@ -624,23 +550,20 @@ class Agent:
         return f"Code Workspace ({language}) - Action: {action}\n```\n{code}\n```\nPlease provide a full {action} evaluation with clean code and tests."
 
     async def _tool_search_documents(self, query: str) -> str:
-        """RAG retrieval from uploaded documents."""
-        from database.models import User as DBUser
-        sys_user = self.db.query(DBUser).filter_by(username="operator_zero").first()
-        sys_user_id = sys_user.id if sys_user else None
-
+        """RAG retrieval from uploaded knowledge base documents."""
         has_docs = self.db.query(Document).filter(
-            (Document.user_id == self.user_id) | (Document.user_id == sys_user_id)
+            Document.user_id == self.user_id,
+            Document.is_knowledge_base == True
         ).first()
 
         if not has_docs:
-            return "No documents found in the knowledge base. The user has not uploaded any files yet."
+            return "No documents found in the knowledge base. No files have been indexed into the knowledge base yet."
 
         retriever = HybridRetriever(self.db)
-        results = await retriever.retrieve(self.user_id, query, limit=5)
+        results = await retriever.retrieve(self.user_id, query, limit=5, only_kb=True)
 
         if not results:
-            return "No relevant content found in the uploaded documents for this query."
+            return "No relevant content found in the knowledge base documents for this query."
 
         formatted = []
         for r in results:
@@ -806,37 +729,33 @@ class Agent:
 
                     # If the model wants to call a tool
                     if tool_calls:
-                        formatted_tool_calls = []
+                        canonical_tool_calls = []
                         for tc in tool_calls:
                             tc_id = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
                             fn_name = tc.get("name", "")
                             fn_args = tc.get("arguments", {})
-                            args_str = json.dumps(fn_args) if isinstance(fn_args, dict) else str(fn_args)
-                            formatted_tool_calls.append({
-                                "id": tc_id,
-                                "type": "function",
-                                "function": {
-                                    "name": fn_name,
-                                    "arguments": args_str
-                                }
-                            })
-
-                        messages.append({
-                            "role": "assistant",
-                            "content": content or "",
-                            "tool_calls": formatted_tool_calls
-                        })
-
-                        # Execute each tool call
-                        for idx, tool_call in enumerate(tool_calls):
-                            fn_name = tool_call.get("name")
-                            fn_args = tool_call.get("arguments", {})
                             if isinstance(fn_args, str):
                                 try:
                                     fn_args = json.loads(fn_args)
                                 except Exception:
                                     fn_args = {}
-                            
+                            canonical_tool_calls.append({
+                                "id": tc_id,
+                                "name": fn_name,
+                                "arguments": fn_args
+                            })
+
+                        messages.append({
+                            "role": "assistant",
+                            "content": content or "",
+                            "tool_calls": canonical_tool_calls
+                        })
+
+                        # Execute each tool call
+                        for idx, tool_call in enumerate(canonical_tool_calls):
+                            fn_name = tool_call.get("name")
+                            fn_args = tool_call.get("arguments", {})
+
                             # Yield status update
                             yield {"token": "", "provider": provider_name, "tool_call": fn_name, "status": "executing"}
 
@@ -847,8 +766,8 @@ class Agent:
                                 "result": result
                             })
 
-                            # Add tool result to messages matching tool_call_id
-                            tc_id = formatted_tool_calls[idx]["id"]
+                            # Add tool result in canonical format
+                            tc_id = tool_call["id"]
                             messages.append({
                                 "role": "tool",
                                 "tool_call_id": tc_id,

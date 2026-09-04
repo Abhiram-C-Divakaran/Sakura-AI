@@ -1024,7 +1024,7 @@ export default function Console() {
           <div className="flex flex-col gap-2 font-mono text-[9px] text-[#A3A3A3] border border-[#1F1F1F] rounded p-2.5 bg-[#050505] divide-y divide-[#151515]">
             <div className="flex justify-between py-1">
               <span>RESPONSE LATENCY</span>
-              <span className="text-white font-bold">{telemetry?.latency !== undefined ? `${telemetry.latency} ms` : '—'}</span>
+              <span className="text-white font-bold">{telemetry?.latency != null ? `${telemetry.latency} ms` : '—'}</span>
             </div>
             
             <div className="flex flex-col py-1 gap-1">
@@ -1045,7 +1045,7 @@ export default function Console() {
                 >
                   {showContextDetails ? 'HIDE DETAILS' : 'VIEW DETAILS'}
                 </button>
-                <span>{telemetry?.contextUsed !== undefined ? `${telemetry.contextUsed} / ${telemetry.contextLimit} T` : '—'}</span>
+                <span>{telemetry?.contextLimit ? `${telemetry.contextUsed || 0} / ${telemetry.contextLimit} T` : `${telemetry?.contextUsed || 0} T (Dynamic)`}</span>
               </div>
               {showContextDetails && (
                 <div className="bg-[#0A0A0A] border border-[#1F1F1F] p-1.5 rounded mt-1 text-[8px] text-[#8E8E8E] flex flex-col gap-0.5">

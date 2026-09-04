@@ -44,35 +44,9 @@ LATENCY_SAMPLES = []
 current_context_used_by_user = {}
 tokens_per_second_by_user = {}
 user_tokens_count = __import__("collections").defaultdict(int)
-ACTIVE_TASKS = {}
-RUNNING_TASKS = {}
 
-class ConnectionManager:
-    def __init__(self):
-        self.user_connections: Dict[str, List[WebSocket]] = {}
-
-    async def connect(self, user_id: str, websocket: WebSocket):
-        await websocket.accept()
-        if user_id not in self.user_connections:
-            self.user_connections[user_id] = []
-        self.user_connections[user_id].append(websocket)
-
-    def disconnect(self, user_id: str, websocket: WebSocket):
-        if user_id in self.user_connections:
-            if websocket in self.user_connections[user_id]:
-                self.user_connections[user_id].remove(websocket)
-            if not self.user_connections[user_id]:
-                del self.user_connections[user_id]
-
-    async def send_to_user(self, user_id: str, message: dict):
-        if user_id in self.user_connections:
-            for connection in self.user_connections[user_id]:
-                try:
-                    await connection.send_json(message)
-                except Exception:
-                    pass
-
-ws_manager = ConnectionManager()
+from realtime.manager import ws_manager
+from tasks.task_manager import TaskManager
 
 router = APIRouter(prefix="/api/v1")
 router.include_router(audio_router)
@@ -103,6 +77,8 @@ class ChatRequest(BaseModel):
     intensity: Optional[str] = "medium"
     tools: Optional[List[str]] = []
     attachments: Optional[List[Dict[str, Any]]] = []
+    active_workspace_id: Optional[str] = None
+    repository_workspace_id: Optional[str] = None
 
 
 # ─── Auth Endpoints ─────────────────────────────────────────────────────────
@@ -709,6 +685,23 @@ def background_memory_extraction(user_id: Any, conversation_id: Any):
         asyncio.run(mgr.extract_and_save_memories(user_id, formatted))
 
 
+def is_repository_coding_intent(message: str) -> bool:
+    """Detects repository engineering intent requiring a repository workspace."""
+    msg_lower = (message or "").strip().lower()
+    if msg_lower.startswith("/code"):
+        return True
+    repo_patterns = [
+        r"\b(fix|patch|resolve)\s+(the\s+)?.*?(bug|issue|failure|error|crash|endpoint)\b",
+        r"\bupdate\s+(the\s+)?(api|validation|schema|route|handler|model|component|service)\b",
+        r"\b(run|execute)\s+(the\s+)?(tests?|linter|typecheck|build)\s+and\s+(fix|patch)\b",
+        r"\brefactor\s+(this\s+|the\s+)?(component|module|file|class|function|service|subsystem)\b",
+        r"\bimplement\s+.*?\s+(in\s+(the\s+)?(backend|frontend|repo|codebase|api|system))\b",
+        r"\breview\s+(this\s+|the\s+)?(repo|repository|codebase|diff)\s+and\s+(patch|fix)\b",
+        r"\bin\s+this\s+(repo|repository|codebase)\b",
+    ]
+    return any(re.search(pat, msg_lower) for pat in repo_patterns)
+
+
 # ─── Chat Streaming Endpoint ────────────────────────────────────────────────
 
 @router.post("/chat/stream")
@@ -796,18 +789,46 @@ async def chat_stream(
     # 5c. Check if request targets repository coding agent
     is_code_command = req.message.strip().startswith("/code")
     has_coding_tool = any(t in (req.tools or []) for t in ["sakura_code", "code_workspace"])
-    if is_code_command or (active_project and has_coding_tool):
+    inferred_intent = is_repository_coding_intent(req.message)
+
+    if is_code_command or (active_project and has_coding_tool) or inferred_intent:
         code_objective = req.message.replace("/code", "", 1).strip() if is_code_command else req.message
+
+        user_workspaces = db.query(RepositoryWorkspace).filter(
+            RepositoryWorkspace.user_id == current_user.id
+        ).all()
+
         ws = None
-        if active_project:
-            ws = db.query(RepositoryWorkspace).filter(
-                RepositoryWorkspace.user_id == current_user.id,
-                RepositoryWorkspace.name.ilike(f"%{active_project.name}%")
-            ).first()
-        if not ws:
-            ws = db.query(RepositoryWorkspace).filter(
-                RepositoryWorkspace.user_id == current_user.id
-            ).order_by(RepositoryWorkspace.created_at.desc()).first()
+        # 1. Explicit workspace ID in request
+        explicit_ws_id = req.active_workspace_id or req.repository_workspace_id
+        if explicit_ws_id:
+            try:
+                target_uuid = uuid.UUID(str(explicit_ws_id))
+                ws = next((w for w in user_workspaces if w.id == target_uuid), None)
+            except ValueError:
+                pass
+
+        # 2. Active project workspace match
+        if not ws and active_project:
+            matched_workspaces = [w for w in user_workspaces if active_project.name.lower() in w.name.lower()]
+            if len(matched_workspaces) == 1:
+                ws = matched_workspaces[0]
+
+        # 3. Exactly one unambiguous workspace for user
+        if not ws and len(user_workspaces) == 1:
+            ws = user_workspaces[0]
+
+        # 4. Multiple candidate workspaces with no selection -> ask which repository
+        if not ws and len(user_workspaces) > 1 and (is_code_command or has_coding_tool or "repo" in req.message.lower() or "repository" in req.message.lower()):
+            ws_options = "\n".join(f"- **{w.name}** (`{w.id}`)" for w in user_workspaces)
+            clarification_msg = (
+                f"You have {len(user_workspaces)} repository workspaces available:\n\n"
+                f"{ws_options}\n\n"
+                f"Please specify which workspace you would like Sakura Code to target."
+            )
+            async def disambiguation_generator():
+                yield f"data: {json.dumps({'token': clarification_msg, 'provider': 'sakura_code'})}\n\n"
+            return StreamingResponse(disambiguation_generator(), media_type="text/event-stream")
 
         if ws:
             coding_agent = CodingAgent(
@@ -929,127 +950,43 @@ async def chat_stream(
 
     return StreamingResponse(token_generator(), media_type="text/event-stream")
 
-# Helper to execute task flows asynchronously
-async def run_task_flow(task_id: str, user_id: str):
-    from database.db import get_db_context
-    task_info = ACTIVE_TASKS.get(task_id)
-    if not task_info:
-        return
-        
-    task_info["status"] = "Starting"
-    task_info["startedAt"] = datetime.utcnow().isoformat()
-    await ws_manager.send_to_user(user_id, {"type": "task_update", "data": task_info})
-    await asyncio.sleep(0.5)
-    
-    task_type = task_info["type"]
-    payload = task_info["payload"]
-    
-    with get_db_context() as db:
-        try:
-            if task_type == "code_analysis":
-                await execute_code_analysis(task_id, user_id, payload["code"], payload.get("task", "explain"), db)
-            elif task_type == "doc_summary":
-                await execute_doc_summary(task_id, user_id, payload["document_id"], db)
-            elif task_type == "dataset_analysis":
-                await execute_dataset_analysis(task_id, user_id, payload["dataset_text"], db)
-            elif task_type == "web_research":
-                await execute_web_research(task_id, user_id, payload["query"], db)
-            else:
-                await update_task_status(task_id, user_id, "Failed", 100, error="Unknown task type")
-        except asyncio.CancelledError:
-            task_info["status"] = "Cancelled"
-            task_info["completedAt"] = datetime.utcnow().isoformat()
-            await ws_manager.send_to_user(user_id, {"type": "task_update", "data": task_info})
-        except Exception as e:
-            await update_task_status(task_id, user_id, "Failed", 100, error=str(e))
-        finally:
-            if task_id in RUNNING_TASKS:
-                del RUNNING_TASKS[task_id]
+def get_system_telemetry(user_id: str, user_uuid: uuid.UUID) -> dict:
+    active_tasks_count = TaskManager.count_active_tasks(user_uuid)
+    avg_latency = round(sum(LATENCY_SAMPLES) / len(LATENCY_SAMPLES)) if LATENCY_SAMPLES else None
 
-async def update_task_status(task_id: str, user_id: str, status: str, progress: int, error: Optional[str] = None, result: Optional[str] = None):
-    task_info = ACTIVE_TASKS.get(task_id)
-    if task_info:
-        task_info["status"] = status
-        task_info["progress"] = progress
-        if error:
-            task_info["error"] = error
-        if result:
-            task_info["result"] = result
-        if status in ["Completed", "Failed", "Cancelled"]:
-            task_info["completedAt"] = datetime.utcnow().isoformat()
-        await ws_manager.send_to_user(user_id, {"type": "task_update", "data": task_info})
+    uptime_seconds = int(time.time() - START_TIME)
+    m, s = divmod(uptime_seconds, 60)
+    h, m = divmod(m, 60)
+    uptime_str = f"{h:02d}:{m:02d}:{s:02d}"
 
-async def execute_code_analysis(task_id: str, user_id: str, code: str, instruction: str, db: Session):
-    await update_task_status(task_id, user_id, "Running", 10)
-    await asyncio.sleep(1.0)
-    await update_task_status(task_id, user_id, "Running", 40)
-    
-    prompt = f"Please analyze this code and provide a review:\nTask: {instruction}\nCode:\n{code}"
+    context_limit = None
     try:
-        await update_task_status(task_id, user_id, "Running", 60)
-        _, response = await llm_router.generate(prompt=prompt, system_prompt="You are a senior code reviewer.")
-        await update_task_status(task_id, user_id, "Completed", 100, result=response)
-    except Exception as e:
-        await update_task_status(task_id, user_id, "Failed", 100, error=str(e))
+        active_provider = llm_router.get_active_provider()
+        if hasattr(active_provider, "context_limit"):
+            context_limit = active_provider.context_limit
+        elif hasattr(active_provider, "model"):
+            model_name = getattr(active_provider, "model", "")
+            if "claude" in model_name.lower():
+                context_limit = 200000
+            elif "gpt-4" in model_name.lower():
+                context_limit = 128000
+    except Exception:
+        context_limit = None
 
-async def execute_doc_summary(task_id: str, user_id: str, doc_id: str, db: Session):
-    await update_task_status(task_id, user_id, "Running", 10)
-    try:
-        doc_u = uuid.UUID(doc_id)
-        user_u = uuid.UUID(user_id)
-    except ValueError:
-        await update_task_status(task_id, user_id, "Failed", 100, error="Invalid document or user identifier")
-        return
+    region = os.getenv("DEPLOYMENT_REGION", None)
+    is_live = user_id in ws_manager.user_connections and len(ws_manager.user_connections[user_id]) > 0
 
-    doc = db.query(Document).filter(Document.id == doc_u, Document.user_id == user_u).first()
-    if not doc:
-        await update_task_status(task_id, user_id, "Failed", 100, error="Document not found or access denied")
-        return
-        
-    await update_task_status(task_id, user_id, "Running", 30)
-    chunks = db.query(DocumentChunk).filter(DocumentChunk.document_id == doc.id).order_by(DocumentChunk.chunk_index.asc()).all()
-    if not chunks:
-        await update_task_status(task_id, user_id, "Failed", 100, error="No text indexed in this document")
-        return
-        
-    await update_task_status(task_id, user_id, "Running", 50)
-    combined_text = "\n".join(c.content for c in chunks[:5])
-    prompt = f"Please summarize the following document content:\n\n{combined_text}"
-    try:
-        await update_task_status(task_id, user_id, "Running", 70)
-        _, response = await llm_router.generate(prompt=prompt, system_prompt="You are a precise document summarizer.")
-        await update_task_status(task_id, user_id, "Completed", 100, result=response)
-    except Exception as e:
-        await update_task_status(task_id, user_id, "Failed", 100, error=str(e))
-
-async def execute_dataset_analysis(task_id: str, user_id: str, dataset_text: str, db: Session):
-    await update_task_status(task_id, user_id, "Running", 20)
-    await asyncio.sleep(0.5)
-    await update_task_status(task_id, user_id, "Running", 50)
-    try:
-        lines = dataset_text.strip().split("\n")
-        num_rows = len(lines)
-        num_cols = len(lines[0].split(",")) if num_rows > 0 else 0
-        analysis_result = f"Dataset Analysis Report:\n- Total Rows: {num_rows}\n- Estimated Columns: {num_cols}\n"
-        if num_rows > 1:
-            analysis_result += f"- Headers: {lines[0]}"
-        await update_task_status(task_id, user_id, "Running", 80)
-        await asyncio.sleep(0.5)
-        await update_task_status(task_id, user_id, "Completed", 100, result=analysis_result)
-    except Exception as e:
-        await update_task_status(task_id, user_id, "Failed", 100, error=str(e))
-
-async def execute_web_research(task_id: str, user_id: str, query: str, db: Session):
-    await update_task_status(task_id, user_id, "Running", 10)
-    try:
-        await update_task_status(task_id, user_id, "Running", 30)
-        await asyncio.sleep(1.0)
-        await update_task_status(task_id, user_id, "Running", 60)
-        prompt = f"Write a research summary on the following topic: {query}"
-        _, response = await llm_router.generate(prompt=prompt, system_prompt="You are a research analyst.")
-        await update_task_status(task_id, user_id, "Completed", 100, result=response)
-    except Exception as e:
-        await update_task_status(task_id, user_id, "Failed", 100, error=str(e))
+    return {
+        "connection": "LIVE" if is_live else "ONLINE",
+        "latency": avg_latency,
+        "contextUsed": current_context_used_by_user.get(user_id, 0),
+        "contextLimit": context_limit,
+        "tokensPerSecond": tokens_per_second_by_user.get(user_id, 0),
+        "activeTasks": active_tasks_count,
+        "region": region,
+        "uptime": uptime_str,
+        "lastUpdatedAt": datetime.utcnow().isoformat()
+    }
 
 # System Status Broadcast Loop
 async def system_status_broadcast_loop():
@@ -1059,31 +996,16 @@ async def system_status_broadcast_loop():
             for user_id in list(user_tokens_count.keys()):
                 tokens_per_second_by_user[user_id] = user_tokens_count[user_id]
                 user_tokens_count[user_id] = 0
-                
+
             for user_id in list(ws_manager.user_connections.keys()):
-                user_tasks = [t for t in ACTIVE_TASKS.values() if t["userId"] == user_id]
-                active_tasks_count = len([t for t in user_tasks if t["status"] in ["Queued", "Starting", "Running", "Waiting"]])
-                
-                avg_latency = sum(LATENCY_SAMPLES) / len(LATENCY_SAMPLES) if LATENCY_SAMPLES else 120.0
-                
-                uptime_seconds = int(time.time() - START_TIME)
-                m, s = divmod(uptime_seconds, 60)
-                h, m = divmod(m, 60)
-                uptime_str = f"{h:02d}:{m:02d}:{s:02d}"
-                
+                try:
+                    u_uuid = uuid.UUID(user_id)
+                except ValueError:
+                    continue
+                telemetry = get_system_telemetry(user_id, u_uuid)
                 status_payload = {
                     "type": "system_status",
-                    "data": {
-                        "connection": "LIVE",
-                        "latency": round(avg_latency),
-                        "contextUsed": current_context_used_by_user.get(user_id, 0),
-                        "contextLimit": 128000,
-                        "tokensPerSecond": tokens_per_second_by_user.get(user_id, 0),
-                        "activeTasks": active_tasks_count,
-                        "region": "IN / AP-SOUTH",
-                        "uptime": uptime_str,
-                        "lastUpdatedAt": datetime.utcnow().isoformat()
-                    }
+                    "data": telemetry
                 }
                 await ws_manager.send_to_user(user_id, status_payload)
         except Exception:
@@ -1091,33 +1013,17 @@ async def system_status_broadcast_loop():
 
 @router.on_event("startup")
 async def startup_event():
+    await ws_manager.initialize()
     asyncio.create_task(system_status_broadcast_loop())
+
+@router.on_event("shutdown")
+async def shutdown_event():
+    await ws_manager.shutdown()
 
 @router.get("/system/status")
 def system_status(current_user: User = Depends(AuthManager.get_current_user)):
     user_id = str(current_user.id)
-    user_tasks = [t for t in ACTIVE_TASKS.values() if t["userId"] == user_id]
-    active_tasks_count = len([t for t in user_tasks if t["status"] in ["Queued", "Starting", "Running", "Waiting"]])
-    avg_latency = sum(LATENCY_SAMPLES) / len(LATENCY_SAMPLES) if LATENCY_SAMPLES else 120.0
-    
-    uptime_seconds = int(time.time() - START_TIME)
-    m, s = divmod(uptime_seconds, 60)
-    h, m = divmod(m, 60)
-    uptime_str = f"{h:02d}:{m:02d}:{s:02d}"
-    
-    return {
-        "connection": "LIVE",
-        "latency": round(avg_latency),
-        "contextUsed": current_context_used_by_user.get(user_id, 0),
-        "contextLimit": 128000,
-        "tokensPerSecond": tokens_per_second_by_user.get(user_id, 0),
-        "activeTasks": active_tasks_count,
-        "region": "IN / AP-SOUTH",
-        "uptime": uptime_str,
-        "lastUpdatedAt": datetime.utcnow().isoformat(),
-        "cpu": psutil.cpu_percent(interval=None),
-        "memory": psutil.virtual_memory().percent
-    }
+    return get_system_telemetry(user_id, current_user.id)
 
 # WebSocket route
 @router.websocket("/ws")
@@ -1171,9 +1077,8 @@ class TaskCreateRequest(BaseModel):
 
 @router.post("/tasks")
 async def create_task(req: TaskCreateRequest, current_user: User = Depends(AuthManager.get_current_user)):
-    task_id = str(uuid.uuid4())
     user_id = str(current_user.id)
-    
+
     if req.type == "doc_summary" and "document_id" not in req.payload:
         raise HTTPException(status_code=400, detail="document_id is required for document summary")
     elif req.type == "code_analysis" and "code" not in req.payload:
@@ -1182,105 +1087,65 @@ async def create_task(req: TaskCreateRequest, current_user: User = Depends(AuthM
         raise HTTPException(status_code=400, detail="dataset_text is required for dataset analysis")
     elif req.type == "web_research" and "query" not in req.payload:
         raise HTTPException(status_code=400, detail="query is required for web research")
-        
-    task_info = {
-        "id": task_id,
-        "type": req.type,
-        "title": req.title,
-        "status": "Queued",
-        "progress": 0,
-        "createdAt": datetime.utcnow().isoformat(),
-        "startedAt": None,
-        "completedAt": None,
-        "error": None,
-        "result": None,
-        "payload": req.payload,
-        "userId": user_id
-    }
-    
-    ACTIVE_TASKS[task_id] = task_info
-    
-    t = asyncio.create_task(run_task_flow(task_id, user_id))
-    RUNNING_TASKS[task_id] = t
-    
-    user_tasks = [t for t in ACTIVE_TASKS.values() if t["userId"] == user_id]
+
+    task = TaskManager.create_task(
+        user_id=current_user.id,
+        task_type=req.type,
+        title=req.title,
+        payload=req.payload
+    )
+    user_tasks = [t.to_dict() for t in TaskManager.list_tasks(current_user.id)]
     await ws_manager.send_to_user(user_id, {"type": "tasks_list", "data": user_tasks})
-    return task_info
+    return task.to_dict()
 
 @router.get("/tasks")
 def list_tasks(current_user: User = Depends(AuthManager.get_current_user)):
-    user_id = str(current_user.id)
-    user_tasks = [t for t in ACTIVE_TASKS.values() if t["userId"] == user_id]
-    return user_tasks
+    return [t.to_dict() for t in TaskManager.list_tasks(current_user.id)]
 
 @router.post("/tasks/{task_id}/cancel")
 async def cancel_task(task_id: str, current_user: User = Depends(AuthManager.get_current_user)):
-    user_id = str(current_user.id)
-    task_info = ACTIVE_TASKS.get(task_id)
-    if not task_info or task_info["userId"] != user_id:
+    try:
+        t_uuid = uuid.UUID(task_id)
+    except ValueError:
         raise HTTPException(status_code=404, detail="Task not found")
-        
-    if task_info["status"] in ["Queued", "Starting", "Running", "Waiting"]:
-        if task_id in RUNNING_TASKS:
-            RUNNING_TASKS[task_id].cancel()
-            del RUNNING_TASKS[task_id]
-        
-        task_info["status"] = "Cancelled"
-        task_info["completedAt"] = datetime.utcnow().isoformat()
-        await ws_manager.send_to_user(user_id, {"type": "task_update", "data": task_info})
-        
-    return task_info
+
+    task = await TaskManager.cancel_task(t_uuid, current_user.id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task.to_dict()
 
 @router.post("/tasks/{task_id}/retry")
 async def retry_task(task_id: str, current_user: User = Depends(AuthManager.get_current_user)):
-    user_id = str(current_user.id)
-    task_info = ACTIVE_TASKS.get(task_id)
-    if not task_info or task_info["userId"] != user_id:
+    try:
+        t_uuid = uuid.UUID(task_id)
+    except ValueError:
         raise HTTPException(status_code=404, detail="Task not found")
-        
-    if task_info["status"] in ["Failed", "Cancelled"]:
-        task_info["status"] = "Queued"
-        task_info["progress"] = 0
-        task_info["error"] = None
-        task_info["result"] = None
-        task_info["createdAt"] = datetime.utcnow().isoformat()
-        task_info["startedAt"] = None
-        task_info["completedAt"] = None
-        
-        t = asyncio.create_task(run_task_flow(task_id, user_id))
-        RUNNING_TASKS[task_id] = t
-        
-        await ws_manager.send_to_user(user_id, {"type": "task_update", "data": task_info})
-        
-    return task_info
+
+    task = await TaskManager.retry_task(t_uuid, current_user.id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task.to_dict()
 
 @router.delete("/tasks/{task_id}")
 async def delete_task(task_id: str, current_user: User = Depends(AuthManager.get_current_user)):
-    user_id = str(current_user.id)
-    task_info = ACTIVE_TASKS.get(task_id)
-    if not task_info or task_info["userId"] != user_id:
+    try:
+        t_uuid = uuid.UUID(task_id)
+    except ValueError:
         raise HTTPException(status_code=404, detail="Task not found")
-        
-    if task_info["status"] in ["Queued", "Starting", "Running", "Waiting"]:
-        if task_id in RUNNING_TASKS:
-            RUNNING_TASKS[task_id].cancel()
-            del RUNNING_TASKS[task_id]
-            
-    del ACTIVE_TASKS[task_id]
-    
-    user_tasks = [t for t in ACTIVE_TASKS.values() if t["userId"] == user_id]
-    await ws_manager.send_to_user(user_id, {"type": "tasks_list", "data": user_tasks})
+
+    success = TaskManager.delete_task(t_uuid, current_user.id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    user_tasks = [t.to_dict() for t in TaskManager.list_tasks(current_user.id)]
+    await ws_manager.send_to_user(str(current_user.id), {"type": "tasks_list", "data": user_tasks})
     return {"status": "deleted"}
 
 @router.delete("/tasks/clear_completed")
 async def clear_completed_tasks(current_user: User = Depends(AuthManager.get_current_user)):
-    user_id = str(current_user.id)
-    to_delete = [tid for tid, t in ACTIVE_TASKS.items() if t["userId"] == user_id and t["status"] in ["Completed", "Failed", "Cancelled"]]
-    for tid in to_delete:
-        del ACTIVE_TASKS[tid]
-        
-    user_tasks = [t for t in ACTIVE_TASKS.values() if t["userId"] == user_id]
-    await ws_manager.send_to_user(user_id, {"type": "tasks_list", "data": user_tasks})
+    TaskManager.clear_completed_tasks(current_user.id)
+    user_tasks = [t.to_dict() for t in TaskManager.list_tasks(current_user.id)]
+    await ws_manager.send_to_user(str(current_user.id), {"type": "tasks_list", "data": user_tasks})
     return {"status": "cleared"}
 
 

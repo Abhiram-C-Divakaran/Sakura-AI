@@ -1,13 +1,88 @@
+"""
+Sakura AI — Hybrid RAG Retrieval Engine
+Combines dense vector similarity searches with Okapi BM25 lexical ranking
+using Reciprocal Rank Fusion (RRF). Strictly enforces user scoping and knowledge-base isolation.
+"""
+import math
+import re
 import numpy as np
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from sqlalchemy.orm import Session
+
 from database.models import DocumentChunk, Document
 from rag.embeddings.manager import EmbeddingManager
+
+
+class BM25Scorer:
+    """
+    Production Okapi BM25 Ranking Algorithm.
+    Computes probabilistic Inverse Document Frequency (IDF),
+    term frequency saturation with k1 parameter, and document length normalization with b parameter.
+    """
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+
+    @staticmethod
+    def tokenize(text: str) -> List[str]:
+        return [t.lower() for t in re.findall(r'\b\w+\b', text or "") if len(t) > 1]
+
+    def score_corpus(self, query: str, chunks: List[DocumentChunk]) -> List[Tuple[DocumentChunk, float]]:
+        if not chunks:
+            return []
+
+        query_terms = self.tokenize(query)
+        if not query_terms:
+            return [(c, 0.0) for c in chunks]
+
+        # 1. Document tokenization & lengths
+        doc_tokens = [self.tokenize(c.content) for c in chunks]
+        doc_lens = [len(tokens) for tokens in doc_tokens]
+        total_docs = len(chunks)
+        avgdl = sum(doc_lens) / total_docs if total_docs > 0 else 1.0
+
+        # 2. Document frequency n(q) for each query term
+        df = {}
+        for q in query_terms:
+            df[q] = sum(1 for tokens in doc_tokens if q in tokens)
+
+        # 3. Calculate Robertson-Spärck Jones IDF for each query term:
+        # ln((N - n(q) + 0.5) / (n(q) + 0.5) + 1.0)
+        idf = {}
+        for q in query_terms:
+            n_q = df[q]
+            idf[q] = math.log(((total_docs - n_q + 0.5) / (n_q + 0.5)) + 1.0)
+
+        # 4. Compute BM25 score for each document chunk
+        scored = []
+        for i, chunk in enumerate(chunks):
+            tokens = doc_tokens[i]
+            d_len = doc_lens[i]
+            score = 0.0
+
+            # Term counts in this document
+            tf = {}
+            for t in tokens:
+                tf[t] = tf.get(t, 0) + 1
+
+            for q in query_terms:
+                term_freq = tf.get(q, 0)
+                if term_freq > 0:
+                    numerator = term_freq * (self.k1 + 1.0)
+                    denominator = term_freq + self.k1 * (1.0 - self.b + self.b * (d_len / avgdl))
+                    score += idf[q] * (numerator / denominator)
+
+            if score > 0.0:
+                scored.append((chunk, score))
+
+        scored.sort(key=lambda x: -x[1])
+        return scored
+
 
 class HybridRetriever:
     """
     RAG Retrieval Engine. Combines vector similarity searches with
-    keyword matches using Reciprocal Rank Fusion (RRF).
+    true Okapi BM25 lexical ranking using Reciprocal Rank Fusion (RRF).
     """
 
     def __init__(self, db: Session, embedding_manager: Optional[EmbeddingManager] = None):
@@ -19,22 +94,26 @@ class HybridRetriever:
         user_id: Any, 
         query_text: str, 
         limit: int = 5,
-        rrf_k: int = 60
+        rrf_k: int = 60,
+        only_kb: bool = True
     ) -> List[Dict[str, Any]]:
         """
-        Executes hybrid semantic + keyword query. 
-        Merges results using Reciprocal Rank Fusion.
+        Executes hybrid semantic + Okapi BM25 query.
+        Merges results using Reciprocal Rank Fusion (RRF).
+        Strictly scopes search to documents owned by user_id that are indexed in the Knowledge Base.
         """
-        query_embedding = self.embedding_manager.get_embedding(query_text)
-        
-        # 1. Fetch all documents for this user OR system user (operator_zero) to filter scope
-        from database.models import User
-        sys_user = self.db.query(User).filter_by(username="operator_zero").first()
-        sys_user_id = sys_user.id if sys_user else None
+        query_text = (query_text or "").strip()
+        if not query_text:
+            return []
 
-        docs = self.db.query(Document).filter(
-            (Document.user_id == user_id) | (Document.user_id == sys_user_id)
-        ).all()
+        query_embedding = self.embedding_manager.get_embedding(query_text)
+
+        # 1. Fetch only documents owned by this user (strictly isolated, no leaking operator_zero)
+        query = self.db.query(Document).filter(Document.user_id == user_id)
+        if only_kb:
+            query = query.filter(Document.is_knowledge_base == True)
+
+        docs = query.all()
         if not docs:
             return []
         doc_ids = [d.id for d in docs]
@@ -42,7 +121,7 @@ class HybridRetriever:
         # 2. Get Vector/Semantic Matches (if embeddings are available)
         semantic_results = self._search_semantic(doc_ids, query_embedding, limit * 2) if query_embedding else []
 
-        # 3. Get Keyword/BM25 Matches
+        # 3. Get Okapi BM25 Matches
         keyword_results = self._search_keyword(doc_ids, query_text, limit * 2)
 
         # 4. Merge results using Reciprocal Rank Fusion (RRF)
@@ -56,7 +135,7 @@ class HybridRetriever:
             chunk_lookup[chunk_id] = chunk
             rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0.0) + (1.0 / (rrf_k + (rank + 1)))
 
-        # Keyword ranking scoring
+        # BM25 ranking scoring
         for rank, chunk in enumerate(keyword_results):
             chunk_id = str(chunk.id)
             chunk_lookup[chunk_id] = chunk
@@ -72,7 +151,7 @@ class HybridRetriever:
             chunk = chunk_lookup[cid]
             doc = next((d for d in docs if d.id == chunk.document_id), None)
             filename = doc.filename if doc else "Unknown Source"
-            
+
             results.append({
                 "chunk_id": cid,
                 "content": chunk.content,
@@ -84,19 +163,17 @@ class HybridRetriever:
         return results
 
     def _search_semantic(self, doc_ids: List[Any], query_vec: Optional[List[float]], limit: int) -> List[DocumentChunk]:
-        """Runs vector database search, with CPU-level numpy fallback for local SQLite testing."""
+        """Runs vector database search with cosine similarity."""
         if not query_vec or not doc_ids:
             return []
 
-        # Check connection type (SQLite vs Postgres)
         try:
             from database.db import DATABASE_URL
             bind_url = DATABASE_URL
         except Exception:
             bind_url = "sqlite"
-        
+
         if "postgresql" in bind_url:
-            # Native PostgreSQL pgvector cosine distance search
             return (
                 self.db.query(DocumentChunk)
                 .filter(DocumentChunk.document_id.in_(doc_ids))
@@ -104,7 +181,7 @@ class HybridRetriever:
                 .limit(limit)
                 .all()
             )
-        
+
         # Fallback NumPy calculation for SQLite testing envs
         chunks = (
             self.db.query(DocumentChunk)
@@ -127,7 +204,7 @@ class HybridRetriever:
         return [m[0] for m in matches[:limit]]
 
     def _search_keyword(self, doc_ids: List[Any], query_text: str, limit: int) -> List[DocumentChunk]:
-        """Simple text-normalizing tf keyword matching search."""
+        """Runs true Okapi BM25 ranking across document chunks."""
         chunks = (
             self.db.query(DocumentChunk)
             .filter(DocumentChunk.document_id.in_(doc_ids))
@@ -136,14 +213,6 @@ class HybridRetriever:
         if not chunks:
             return []
 
-        query_tokens = set(query_text.lower().split())
-        matches = []
-        for c in chunks:
-            content_lower = c.content.lower()
-            # Calculate overlapping tokens score
-            score = sum(content_lower.count(token) for token in query_tokens)
-            if score > 0:
-                matches.append((c, score))
-
-        matches.sort(key=lambda x: -x[1])
-        return [m[0] for m in matches[:limit]]
+        scorer = BM25Scorer()
+        scored_matches = scorer.score_corpus(query_text, chunks)
+        return [m[0] for m in scored_matches[:limit]]

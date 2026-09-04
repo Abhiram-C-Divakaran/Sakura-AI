@@ -1,20 +1,64 @@
 import React, { useState, useEffect } from 'react';
 import { 
   Compass, Check, Settings, ExternalLink, ShieldCheck, 
-  Code2, Database, Globe, Image, Mic, FileSearch, Loader2, Sparkles
+  Code2, Database, Globe, Image, Mic, FileSearch, Loader2, Sparkles, AlertCircle
 } from 'lucide-react';
 import { ConnectAppsModal } from './ConnectAppsModal';
-
 import { authFetch } from '../lib/auth';
 
-interface IntegrationStatus {
+export interface IntegrationStatus {
   id: string;
   name: string;
   category: string;
   description: string;
-  is_connected: boolean;
+  state: 'NOT_CONFIGURED' | 'DISCONNECTED' | 'AUTHORIZING' | 'CONNECTED' | 'ERROR';
+  connected: boolean;
   account_name: string | null;
   connected_at: string | null;
+  updated_at: string | null;
+  capabilities: string[];
+}
+
+interface CapabilitiesResponse {
+  status: string;
+  environment?: string;
+  sandbox?: {
+    available: boolean;
+    runtime: string;
+    isolation_level: string;
+    production_safe: boolean;
+    reason?: string;
+  };
+  subsystems?: {
+    sakura_code?: {
+      status: string;
+      isolation_level: string;
+      production_safe: boolean;
+      verified_sandbox: boolean;
+    };
+    image_gen?: {
+      status: string;
+      provider: string;
+      model: string;
+      editing_available: boolean;
+      upscale_available: boolean;
+    };
+    rag_engine?: {
+      status: string;
+      dense_embeddings: boolean;
+      lexical_bm25: boolean;
+      retrieval_mode: string;
+    };
+    web_search?: {
+      status: string;
+      provider: string;
+      has_api_key: boolean;
+    };
+    audio_tts?: {
+      status: string;
+      whisper_provider: string | null;
+    };
+  };
 }
 
 interface PluginsViewProps {
@@ -25,67 +69,103 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
   apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 }) => {
   const [integrations, setIntegrations] = useState<IntegrationStatus[]>([]);
+  const [capabilities, setCapabilities] = useState<CapabilitiesResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [isConnectModalOpen, setIsConnectModalOpen] = useState(false);
 
-  const fetchIntegrations = async () => {
+  const fetchStatusAndCapabilities = async () => {
     try {
       setLoading(true);
-      const res = await authFetch(`${apiBase}/api/v1/integrations`);
-      if (res.ok) {
-        const data = await res.json();
-        setIntegrations(data);
+      const [intRes, capRes] = await Promise.all([
+        authFetch(`${apiBase}/api/v1/integrations`),
+        fetch(`${apiBase}/api/v1/capabilities`)
+      ]);
+
+      if (intRes.ok) {
+        const intData = await intRes.json();
+        setIntegrations(intData);
+      }
+
+      if (capRes.ok) {
+        const capData = await capRes.json();
+        setCapabilities(capData);
       }
     } catch (err) {
-      console.error('Failed to load integrations:', err);
+      console.error('Failed to load plugins or capabilities:', err);
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    fetchIntegrations();
-  }, []);
+    fetchStatusAndCapabilities();
+  }, [apiBase]);
 
-  const BUILTIN_CAPABILITIES = [
+  // Derive truthful engine attributes from live backend capability response
+  const sub = capabilities?.subsystems;
+  const isVerifiedSandbox = Boolean(sub?.sakura_code?.verified_sandbox);
+  const sandboxIsolation = sub?.sakura_code?.isolation_level || 'host_restricted';
+  const sandboxStatus = sub?.sakura_code?.status || 'DEGRADED';
+
+  const ragMode = sub?.rag_engine?.retrieval_mode === 'hybrid_rrf'
+    ? 'Hybrid RAG (Dense vector embeddings + Okapi BM25 ranking via RRF)'
+    : 'Knowledge Base search (True Okapi BM25 lexical ranking)';
+
+  const searchProvider = sub?.web_search?.provider === 'tavily'
+    ? 'Tavily Search API with structured citations'
+    : 'DuckDuckGo live web search fallback';
+
+  const builtinEngines = [
     {
       id: 'sakura_code',
       name: 'Sakura Frontier Coding Engine',
       category: 'Core Engineering',
-      description: 'Isolated subprocess execution, syntax validation AST parsing, unified diff patching, and test verification.',
-      status: 'Active',
+      description: `Autonomous repository coding engine. Isolation level: ${sandboxIsolation}. AST patching, multi-file synthesis, and verified test execution.`,
+      status: sandboxStatus === 'AVAILABLE' ? 'Active' : (sandboxStatus === 'DEGRADED' ? 'Local Sandbox' : 'Unavailable'),
+      statusLevel: sandboxStatus,
+      isVerified: isVerifiedSandbox,
       icon: <Code2 className="w-5 h-5 text-emerald-400" />
     },
     {
       id: 'image_gen',
       name: 'Multimodal Image & Lineage Engine',
       category: 'Visual AI',
-      description: 'High-fidelity raster image generation, iterative multi-turn editing lineage tree, and upscaling.',
-      status: 'Active',
+      description: 'High-fidelity Pollinations Flux neural rendering, multi-turn editing lineage tree, and resolution upscaling.',
+      status: sub?.image_gen?.status === 'AVAILABLE' ? 'Active' : 'Unavailable',
+      statusLevel: sub?.image_gen?.status || 'AVAILABLE',
+      isVerified: false,
       icon: <Image className="w-5 h-5 text-purple-400" />
     },
     {
       id: 'rag_engine',
-      name: 'Hybrid RAG Document Search',
-      category: 'Knowledge Base',
-      description: 'Lexical BM25 and dense vector retrieval across uploaded PDF, DOCX, TXT, and source files.',
-      status: 'Active',
+      name: 'Knowledge Base & Retrieval Engine',
+      category: 'RAG Retrieval',
+      description: ragMode,
+      status: sub?.rag_engine?.status === 'AVAILABLE' ? 'Active' : 'Unavailable',
+      statusLevel: sub?.rag_engine?.status || 'AVAILABLE',
+      isVerified: false,
       icon: <FileSearch className="w-5 h-5 text-blue-400" />
     },
     {
       id: 'web_search',
-      name: 'Live Web Research Agent',
+      name: 'Live Web Research Subsystem',
       category: 'Information Gathering',
-      description: 'Real-time multi-query web search, citation extraction, and cross-reference synthesis.',
-      status: 'Active',
+      description: `Real-time web research engine using ${searchProvider}.`,
+      status: sub?.web_search?.status === 'AVAILABLE' ? 'Active' : 'Unavailable',
+      statusLevel: sub?.web_search?.status || 'AVAILABLE',
+      isVerified: false,
       icon: <Globe className="w-5 h-5 text-amber-400" />
     },
     {
       id: 'audio_tts',
-      name: 'Voice & Audio Synthesizer',
+      name: 'Voice & Speech Transcription',
       category: 'Multimodal Speech',
-      description: 'Local and cloud Whisper transcription paired with expressive neural speech synthesis.',
-      status: 'Active',
+      description: sub?.audio_tts?.status === 'AVAILABLE' 
+        ? 'Whisper transcription paired with natural speech synthesis.' 
+        : 'Whisper audio transcription (Requires configured Groq or OpenAI API key).',
+      status: sub?.audio_tts?.status === 'AVAILABLE' ? 'Active' : 'Not Configured',
+      statusLevel: sub?.audio_tts?.status || 'NOT_CONFIGURED',
+      isVerified: false,
       icon: <Mic className="w-5 h-5 text-rose-400" />
     }
   ];
@@ -124,7 +204,7 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {BUILTIN_CAPABILITIES.map((plugin) => (
+            {builtinEngines.map((plugin) => (
               <div
                 key={plugin.id}
                 className="bg-[#181818] border border-white/[0.06] rounded-2xl p-5 flex flex-col justify-between"
@@ -134,8 +214,16 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
                     <div className="w-10 h-10 rounded-xl bg-white/[0.04] border border-white/[0.06] flex items-center justify-center">
                       {plugin.icon}
                     </div>
-                    <span className="flex items-center gap-1.5 text-[11px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                    <span className={`flex items-center gap-1.5 text-[11px] font-mono px-2 py-0.5 rounded-full border ${
+                      plugin.statusLevel === 'AVAILABLE'
+                        ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                        : plugin.statusLevel === 'DEGRADED'
+                        ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                        : 'bg-white/[0.04] text-[#888888] border-white/[0.06]'
+                    }`}>
+                      {plugin.statusLevel === 'AVAILABLE' && (
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                      )}
                       {plugin.status}
                     </span>
                   </div>
@@ -144,10 +232,16 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
                 </div>
                 <div className="text-[11.5px] text-[#666666] pt-3 border-t border-white/[0.04] flex items-center justify-between">
                   <span>{plugin.category}</span>
-                  <span className="flex items-center gap-1 text-white/60">
-                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                    Verified Sandbox
-                  </span>
+                  {plugin.isVerified ? (
+                    <span className="flex items-center gap-1 text-emerald-400">
+                      <ShieldCheck className="w-3.5 h-3.5" />
+                      Verified Sandbox
+                    </span>
+                  ) : plugin.id === 'sakura_code' ? (
+                    <span className="text-[#888888] font-mono text-[11px]">
+                      Local Host Sandbox
+                    </span>
+                  ) : null}
                 </div>
               </div>
             ))}
@@ -179,16 +273,23 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
                     <div className="flex items-center justify-between mb-3">
                       <h4 className="text-[14px] font-medium text-white">{item.name}</h4>
                       <span className={`text-[10.5px] font-mono px-2 py-0.5 rounded-full border ${
-                        item.is_connected
+                        item.connected
                           ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                          : item.state === 'DISCONNECTED'
+                          ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
                           : 'bg-white/[0.04] text-[#666666] border-white/[0.06]'
                       }`}>
-                        {item.is_connected ? 'CONNECTED' : 'DISCONNECTED'}
+                        {item.connected ? 'CONNECTED' : (item.state === 'DISCONNECTED' ? 'DISCONNECTED' : 'NOT CONFIGURED')}
                       </span>
                     </div>
                     <p className="text-[12px] text-[#888888] line-clamp-2 leading-relaxed mb-4">
                       {item.description}
                     </p>
+                    {item.connected && item.account_name && (
+                      <div className="mb-3 text-[11px] text-[#35D0BA] font-mono">
+                        Account: @{item.account_name}
+                      </div>
+                    )}
                   </div>
 
                   <div className="pt-3 border-t border-white/[0.04] flex items-center justify-between">
@@ -197,7 +298,7 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
                       onClick={() => setIsConnectModalOpen(true)}
                       className="text-[12px] text-blue-400 hover:text-blue-300 font-medium transition-colors cursor-pointer"
                     >
-                      {item.is_connected ? 'Manage' : 'Connect'}
+                      {item.connected ? 'Manage' : (item.state === 'NOT_CONFIGURED' ? 'Setup' : 'Connect')}
                     </button>
                   </div>
                 </div>
@@ -213,7 +314,7 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
           isOpen={isConnectModalOpen}
           onClose={() => {
             setIsConnectModalOpen(false);
-            fetchIntegrations();
+            fetchStatusAndCapabilities();
           }}
           apiBase={apiBase}
         />

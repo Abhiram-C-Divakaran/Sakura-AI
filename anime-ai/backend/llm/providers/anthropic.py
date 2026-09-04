@@ -93,16 +93,28 @@ class AnthropicProvider(LLMProvider):
                 if m.get("content"):
                     content_blocks.append({"type": "text", "text": m["content"]})
                 for tc in m.get("tool_calls", []):
-                    tc_args = tc.get("arguments", {})
-                    if isinstance(tc_args, str):
+                    # Support both canonical { "id", "name", "arguments" } and legacy OpenAI shape
+                    if "function" in tc:
+                        fn_name = tc["function"].get("name")
+                        raw_args = tc["function"].get("arguments", {})
+                    else:
+                        fn_name = tc.get("name")
+                        raw_args = tc.get("arguments", {})
+
+                    if isinstance(raw_args, str):
                         try:
-                            tc_args = __import__("json").loads(tc_args)
+                            tc_args = __import__("json").loads(raw_args)
                         except Exception:
                             tc_args = {}
+                    elif isinstance(raw_args, dict):
+                        tc_args = raw_args
+                    else:
+                        tc_args = {}
+
                     content_blocks.append({
                         "type": "tool_use",
                         "id": tc.get("id"),
-                        "name": tc.get("name"),
+                        "name": fn_name,
                         "input": tc_args
                     })
                 claude_messages.append({"role": "assistant", "content": content_blocks if content_blocks else ""})

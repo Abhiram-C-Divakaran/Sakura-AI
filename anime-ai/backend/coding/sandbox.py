@@ -16,6 +16,10 @@ from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List, Union
 from coding.security import WorkspaceSecurity, SecurityException
 
+class SandboxUnavailableError(Exception):
+    """Raised when secure isolated sandbox execution is required but unavailable."""
+    pass
+
 class BaseSandboxRuntime(ABC):
     """Abstract interface for sandbox execution runtimes."""
 
@@ -347,15 +351,40 @@ class SandboxManager:
         timeout_seconds: int = 60,
         force_runtime: Optional[str] = None
     ) -> BaseSandboxRuntime:
-        """Returns the appropriate Sandbox runtime according to configuration and system support."""
-        pref = force_runtime or os.getenv("SAKURA_SANDBOX_RUNTIME", "auto").lower()
+        """
+        Returns the appropriate Sandbox runtime according to configuration, system support,
+        and environment security policy.
+        In production: NEVER falls back to host subprocess execution. Fails closed with
+        SandboxUnavailableError if container isolation is unavailable.
+        """
+        env = os.getenv("ENVIRONMENT", "development").lower()
+        is_prod = env in ("production", "prod")
+        docker_ok = cls.is_docker_available()
 
-        if pref == "docker" or (pref == "auto" and cls.is_docker_available()):
-            if cls.is_docker_available():
+        pref = (force_runtime or os.getenv("SAKURA_SANDBOX_RUNTIME", "auto")).lower()
+
+        if is_prod:
+            if not docker_ok:
+                raise SandboxUnavailableError(
+                    "Production sandbox execution blocked: Container isolation (Docker) is unavailable. "
+                    "In production, code execution is fail-closed to prevent host compromise."
+                )
+            if pref == "local_restricted":
+                raise SandboxUnavailableError(
+                    "Production sandbox execution blocked: Host restricted subprocess runtime "
+                    "cannot be forced in production."
+                )
+            return DockerSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
+
+        # Development / Test environments
+        if pref == "docker":
+            if docker_ok:
                 return DockerSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
-            elif pref == "docker":
-                # Docker explicitly requested but unavailable
-                raise RuntimeError("Docker sandbox runtime was explicitly requested but Docker is not available.")
+            else:
+                raise SandboxUnavailableError("Docker sandbox runtime was explicitly requested but Docker is not available.")
+
+        if pref == "auto" and docker_ok:
+            return DockerSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
 
         return LocalRestrictedSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
 
@@ -363,11 +392,32 @@ class SandboxManager:
     def get_status(cls) -> Dict[str, Any]:
         """Returns runtime availability status for telemetry and capabilities endpoint."""
         docker_ok = cls.is_docker_available()
+        env = os.getenv("ENVIRONMENT", "development").lower()
+        is_prod = env in ("production", "prod")
+
+        production_safe = docker_ok
+        available = docker_ok or not is_prod
+
+        if docker_ok:
+            reason = "Secure container isolation active"
+            runtime_name = "docker"
+            isolation_lvl = "container"
+        elif is_prod:
+            reason = "Container isolation unavailable: code execution disabled in production"
+            runtime_name = "unavailable"
+            isolation_lvl = "none"
+        else:
+            reason = "Running in development mode using local restricted subprocess"
+            runtime_name = "local_restricted"
+            isolation_lvl = "restricted_subprocess"
+
         return {
-            "available": True,
-            "runtime": "docker" if docker_ok else "local_restricted",
+            "available": available,
+            "runtime": runtime_name,
+            "isolation_level": isolation_lvl,
+            "production_safe": production_safe,
+            "reason": reason,
             "docker_available": docker_ok,
-            "isolation_level": "container" if docker_ok else "restricted_subprocess",
             "cpu_limit": 2.0 if docker_ok else "host_shared",
             "memory_limit_mb": 512 if docker_ok else "host_shared",
             "network_disabled_by_default": True

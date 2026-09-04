@@ -327,6 +327,30 @@ class CodingAgent:
         self.toolchain = CodingToolchain(workspace.workspace_path)
         self.modified_files: List[str] = []
         self.tests_run: List[Dict[str, Any]] = []
+        self.linters_run: List[Dict[str, Any]] = []
+        self.typechecks_run: List[Dict[str, Any]] = []
+        self.builds_run: List[Dict[str, Any]] = []
+        self.diff_reviewed: bool = False
+
+    @staticmethod
+    def classify_task_kind(objective: str) -> str:
+        """Classifies task objective as READ_ONLY or MUTATING."""
+        obj_lower = (objective or "").lower()
+        read_only_indicators = [
+            "explain", "how does", "what is", "where is", "find where",
+            "search for", "review only", "read-only", "inspect only",
+            "describe", "understand", "summarize", "analyze architecture"
+        ]
+        mutating_indicators = [
+            "fix", "bug", "patch", "implement", "update", "modify", "change",
+            "refactor", "add", "remove", "delete", "create", "write", "rewrite",
+            "optimize", "upgrade", "migrate", "convert", "build", "wire", "test and fix"
+        ]
+        if any(ind in obj_lower for ind in mutating_indicators):
+            return "MUTATING"
+        if any(ind in obj_lower for ind in read_only_indicators):
+            return "READ_ONLY"
+        return "MUTATING"
 
     async def execute_tool(self, task_id: Optional[uuid.UUID], tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatches tool call to toolchain and logs execution record."""
@@ -381,14 +405,18 @@ class CodingAgent:
             self.tests_run.append(res)
         elif tool_name == "run_linter":
             res = await self.toolchain.run_linter(args.get("command", "npm run lint"))
+            self.linters_run.append(res)
         elif tool_name == "run_formatter":
             res = await self.toolchain.run_formatter(args.get("command", "npm run format"))
         elif tool_name == "run_typecheck":
             res = await self.toolchain.run_typecheck(args.get("command", "npm run typecheck"))
+            self.typechecks_run.append(res)
         elif tool_name == "run_build":
             res = await self.toolchain.run_build(args.get("command", "npm run build"))
+            self.builds_run.append(res)
         elif tool_name == "git_diff":
             res = await self.toolchain.git_diff(args.get("file_path"))
+            self.diff_reviewed = True
         elif tool_name == "git_status":
             res = await self.toolchain.git_status()
         elif tool_name == "git_log":
@@ -532,24 +560,83 @@ Please execute this task: inspect the codebase, implement the changes, run tests
                 
                 # Verify diff before completing
                 diff_res = await self.toolchain.git_diff()
-                tests_passed = len(self.tests_run) > 0 and all(t.get("exit_code") == 0 for t in self.tests_run)
-                tests_failed = len(self.tests_run) > 0 and any(t.get("exit_code") != 0 for t in self.tests_run)
+                self.diff_reviewed = True
+
+                task_kind = self.classify_task_kind(task.objective)
+                if self.modified_files:
+                    task_kind = "MUTATING"
+
+                tests_run_count = len(self.tests_run)
+                tests_passed = tests_run_count > 0 and all(t.get("exit_code") == 0 for t in self.tests_run)
+                tests_failed = tests_run_count > 0 and any(t.get("exit_code") != 0 for t in self.tests_run)
+
+                lint_passed = all(l.get("exit_code") == 0 for l in self.linters_run) if self.linters_run else None
+                lint_failed = any(l.get("exit_code") != 0 for l in self.linters_run) if self.linters_run else False
+
+                typecheck_passed = all(tc.get("exit_code") == 0 for tc in self.typechecks_run) if self.typechecks_run else None
+                typecheck_failed = any(tc.get("exit_code") != 0 for tc in self.typechecks_run) if self.typechecks_run else False
+
+                build_passed = all(b.get("exit_code") == 0 for b in self.builds_run) if self.builds_run else None
+                build_failed = any(b.get("exit_code") != 0 for b in self.builds_run) if self.builds_run else False
+
+                unverified_reasons = []
+
+                if task_kind == "MUTATING":
+                    if not self.modified_files:
+                        unverified_reasons.append("No files were modified for a mutating task objective.")
+                    if tests_run_count == 0:
+                        unverified_reasons.append("No test suite was executed to verify file modifications.")
+                    elif tests_failed:
+                        unverified_reasons.append("One or more executed test suites failed.")
+                    if lint_failed:
+                        unverified_reasons.append("Linter reported errors.")
+                    if typecheck_failed:
+                        unverified_reasons.append("Typecheck command failed.")
+                    if build_failed:
+                        unverified_reasons.append("Build command failed.")
+                    
+                    if tests_failed or build_failed:
+                        task.status = TaskOutcome.FAILED
+                    elif not self.modified_files:
+                        task.status = TaskOutcome.FAILED
+                    elif tests_passed and not typecheck_failed and not lint_failed:
+                        task.status = TaskOutcome.COMPLETED_VERIFIED
+                    else:
+                        task.status = TaskOutcome.COMPLETED_UNVERIFIED
+                else: # READ_ONLY
+                    if self.modified_files:
+                        unverified_reasons.append("Unexpected file modifications detected during read-only task.")
+                        task.status = TaskOutcome.COMPLETED_UNVERIFIED
+                    else:
+                        task.status = TaskOutcome.COMPLETED_VERIFIED
+
+                verification_passed = (len(unverified_reasons) == 0 and task.status == TaskOutcome.COMPLETED_VERIFIED)
 
                 task.files_modified = self.modified_files
                 task.verification_summary = {
-                    "tests_run_count": len(self.tests_run),
-                    "all_passed": tests_passed,
-                    "diff_bytes": len(diff_res.get("stdout", ""))
+                    "task_kind": task_kind,
+                    "files_changed": self.modified_files,
+                    "tests": {
+                        "run_count": tests_run_count,
+                        "all_passed": tests_passed,
+                        "has_failures": tests_failed
+                    },
+                    "lint": {
+                        "run": len(self.linters_run) > 0,
+                        "passed": lint_passed
+                    },
+                    "typecheck": {
+                        "run": len(self.typechecks_run) > 0,
+                        "passed": typecheck_passed
+                    },
+                    "build": {
+                        "run": len(self.builds_run) > 0,
+                        "passed": build_passed
+                    },
+                    "diff_reviewed": self.diff_reviewed,
+                    "verification_passed": verification_passed,
+                    "unverified_reasons": unverified_reasons
                 }
-
-                if tests_failed:
-                    task.status = TaskOutcome.FAILED
-                elif tests_passed:
-                    task.status = TaskOutcome.COMPLETED_VERIFIED
-                elif self.modified_files:
-                    task.status = TaskOutcome.COMPLETED_UNVERIFIED
-                else:
-                    task.status = TaskOutcome.COMPLETED_VERIFIED
 
                 self.db.commit()
 

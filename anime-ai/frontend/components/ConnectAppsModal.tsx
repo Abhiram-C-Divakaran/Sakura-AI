@@ -8,7 +8,9 @@ export interface AppConnector {
   description: string;
   iconSvg: JSX.Element;
   connected: boolean;
-  account_name?: string;
+  state?: 'NOT_CONFIGURED' | 'DISCONNECTED' | 'AUTHORIZING' | 'CONNECTED' | 'ERROR';
+  account_name?: string | null;
+  capabilities?: string[];
 }
 
 const DEFAULT_CONNECTORS: AppConnector[] = [
@@ -18,6 +20,7 @@ const DEFAULT_CONNECTORS: AppConnector[] = [
     category: 'Development',
     description: 'Sync repositories, inspect pull requests, and commit code directly.',
     connected: false,
+    state: 'NOT_CONFIGURED',
     iconSvg: (
       <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
         <path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4" />
@@ -31,6 +34,7 @@ const DEFAULT_CONNECTORS: AppConnector[] = [
     category: 'Productivity',
     description: 'Access Docs, Sheets, Presentations, and cloud storage files.',
     connected: false,
+    state: 'NOT_CONFIGURED',
     iconSvg: (
       <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
         <path d="M12 2v20" />
@@ -44,6 +48,7 @@ const DEFAULT_CONNECTORS: AppConnector[] = [
     category: 'Knowledge',
     description: 'Search pages, retrieve database rows, and sync meeting notes.',
     connected: false,
+    state: 'NOT_CONFIGURED',
     iconSvg: (
       <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
         <path d="M4 4v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2Z" />
@@ -59,6 +64,7 @@ const DEFAULT_CONNECTORS: AppConnector[] = [
     category: 'Communication',
     description: 'Read channels, synthesize threads, and post automated digests.',
     connected: false,
+    state: 'NOT_CONFIGURED',
     iconSvg: (
       <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
         <rect width="3" height="8" x="13" y="2" rx="1.5" />
@@ -74,6 +80,7 @@ const DEFAULT_CONNECTORS: AppConnector[] = [
     category: 'Database',
     description: 'Execute analytical read queries and inspect table schemas live.',
     connected: false,
+    state: 'NOT_CONFIGURED',
     iconSvg: (
       <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
         <ellipse cx="12" cy="5" rx="9" ry="3" />
@@ -88,6 +95,7 @@ const DEFAULT_CONNECTORS: AppConnector[] = [
     category: 'Project Tracking',
     description: 'Track roadmap tickets, backlog tasks, and sprint statuses.',
     connected: false,
+    state: 'NOT_CONFIGURED',
     iconSvg: (
       <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
         <path d="M12 2v20" />
@@ -111,6 +119,7 @@ export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({
   const [connectors, setConnectors] = useState<AppConnector[]>(DEFAULT_CONNECTORS);
   const [loading, setLoading] = useState(false);
   const [actionInProgress, setActionInProgress] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -118,19 +127,26 @@ export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({
     const fetchStatuses = async () => {
       try {
         setLoading(true);
+        setErrorMessage(null);
         const res = await authFetch(`${apiBase}/api/v1/integrations`);
         if (res.ok) {
           const data = await res.json();
-          const statusMap = new Map<string, { is_connected: boolean; account_name?: string }>();
+          const statusMap = new Map<string, any>();
           data.forEach((item: any) => {
-            statusMap.set(item.id, { is_connected: item.is_connected, account_name: item.account_name });
+            statusMap.set(item.id, item);
           });
 
           setConnectors((prev) =>
             prev.map((c) => {
-              const status = statusMap.get(c.id);
-              if (status !== undefined) {
-                return { ...c, connected: status.is_connected, account_name: status.account_name };
+              const item = statusMap.get(c.id);
+              if (item) {
+                return {
+                  ...c,
+                  connected: Boolean(item.connected),
+                  state: item.state,
+                  account_name: item.account_name,
+                  capabilities: item.capabilities || []
+                };
               }
               return c;
             })
@@ -150,35 +166,82 @@ export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({
 
   const toggleConnect = async (c: AppConnector) => {
     setActionInProgress(c.id);
-    const newConnected = !c.connected;
+    setErrorMessage(null);
+    const willConnect = !c.connected;
 
-    // Optimistic update
-    setConnectors((prev) =>
-      prev.map((item) => (item.id === c.id ? { ...item, connected: newConnected } : item))
-    );
+    let tokenToSubmit: string | undefined = undefined;
+
+    if (willConnect) {
+      if (c.id === 'github') {
+        const input = window.prompt(
+          'Connect GitHub to Sakura AI:\n\nEnter your GitHub Personal Access Token (classic with "repo" scope or fine-grained token with repository read/write access):'
+        );
+        if (!input || !input.trim()) {
+          setActionInProgress(null);
+          return;
+        }
+        tokenToSubmit = input.trim();
+      }
+    }
 
     try {
-      if (newConnected) {
-        await authFetch(`${apiBase}/api/v1/integrations/${c.id}/connect`, {
+      if (willConnect) {
+        const payload: Record<string, any> = {
+          account_name: `${c.name} Workspace`
+        };
+        if (tokenToSubmit) {
+          payload.access_token = tokenToSubmit;
+        }
+
+        const res = await authFetch(`${apiBase}/api/v1/integrations/${c.id}/connect`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify({
-            account_name: `${c.name} Workspace`
-          })
+          body: JSON.stringify(payload)
         });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({ detail: 'Failed to authenticate integration.' }));
+          throw new Error(errData.detail || 'Connection failed.');
+        }
+
+        const updated = await res.json();
+        setConnectors((prev) =>
+          prev.map((item) =>
+            item.id === c.id
+              ? {
+                  ...item,
+                  connected: Boolean(updated.connected),
+                  state: updated.state,
+                  account_name: updated.account_name
+                }
+              : item
+          )
+        );
       } else {
-        await authFetch(`${apiBase}/api/v1/integrations/${c.id}/disconnect`, {
+        const res = await authFetch(`${apiBase}/api/v1/integrations/${c.id}/disconnect`, {
           method: 'POST'
         });
+        if (res.ok) {
+          const updated = await res.json();
+          setConnectors((prev) =>
+            prev.map((item) =>
+              item.id === c.id
+                ? {
+                    ...item,
+                    connected: false,
+                    state: updated.state,
+                    account_name: null
+                  }
+                : item
+            )
+          );
+        }
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to toggle connection on backend:', err);
-      // Rollback on error
-      setConnectors((prev) =>
-        prev.map((item) => (item.id === c.id ? { ...item, connected: !newConnected } : item))
-      );
+      setErrorMessage(err.message || 'Action failed');
     } finally {
       setActionInProgress(null);
     }
@@ -221,6 +284,12 @@ export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({
           </button>
         </div>
 
+        {errorMessage && (
+          <div className="mx-4 mt-3 p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl text-rose-400 text-[12px] flex items-center gap-2">
+            <span>⚠ {errorMessage}</span>
+          </div>
+        )}
+
         {/* Connectors List */}
         <div className="flex-1 overflow-y-auto p-4 space-y-2.5">
           {connectors.map((c) => (
@@ -238,6 +307,11 @@ export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({
                     <span className="text-[10px] font-mono text-[#777777] bg-[#161616] px-1.5 py-0.5 rounded border border-[#2A2A2A]">
                       {c.category}
                     </span>
+                    {c.connected && c.account_name && (
+                      <span className="text-[10.5px] font-mono text-[#35D0BA] bg-[#1C2C26] px-1.5 py-0.5 rounded border border-[#35D0BA]/20">
+                        @{c.account_name}
+                      </span>
+                    )}
                   </div>
                   <span className="text-[11.5px] text-[#999999] truncate mt-0.5">
                     {c.description}
@@ -252,10 +326,16 @@ export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({
                 className={`ml-4 px-3 py-1.5 text-[12px] font-medium rounded-lg transition-all cursor-pointer flex-shrink-0 ${
                   c.connected
                     ? 'bg-[#1C2C26] text-[#35D0BA] border border-[#35D0BA]/30 hover:bg-[#223930]'
+                    : c.state === 'NOT_CONFIGURED'
+                    ? 'bg-[#252525] text-[#AAAAAA] border border-[#353535] hover:bg-[#303030]'
                     : 'bg-[#2A2A2A] text-white border border-[#383838] hover:bg-[#333333]'
                 }`}
               >
-                {actionInProgress === c.id ? 'Updating...' : c.connected ? 'Connected ✓' : 'Connect'}
+                {actionInProgress === c.id 
+                  ? 'Updating...' 
+                  : c.connected 
+                  ? 'Connected ✓' 
+                  : (c.state === 'NOT_CONFIGURED' ? 'Setup' : 'Connect')}
               </button>
             </div>
           ))}

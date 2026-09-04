@@ -35,6 +35,7 @@ class User(Base):
     memories = relationship("UserMemory", back_populates="user", cascade="all, delete-orphan")
     projects = relationship("Project", back_populates="user", cascade="all, delete-orphan")
     scheduled_tasks = relationship("ScheduledTask", back_populates="user", cascade="all, delete-orphan")
+    background_tasks = relationship("BackgroundTask", back_populates="user", cascade="all, delete-orphan")
     integrations = relationship("UserIntegration", back_populates="user", cascade="all, delete-orphan")
     workspaces = relationship("RepositoryWorkspace", back_populates="user", cascade="all, delete-orphan")
 
@@ -48,6 +49,8 @@ class Document(Base):
     mime_type = Column(String(100), nullable=False)
     storage_path = Column(String(510), nullable=False)
     metadata_json = Column(JSON, default=dict, name="metadata")
+    is_knowledge_base = Column(Boolean, default=False, nullable=False, index=True)
+    indexing_status = Column(String(50), default="UPLOADED", nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), default=utc_now)
 
     # Relationships
@@ -369,3 +372,45 @@ class ToolExecution(Base):
     created_at = Column(DateTime(timezone=True), default=utc_now)
 
     task = relationship("CodingTask", back_populates="executions")
+
+
+# ─── Durable Background Tasks ──────────────────────────────────────────────
+
+class BackgroundTask(Base):
+    __tablename__ = "background_tasks"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    type = Column(String(50), nullable=False, index=True)
+    title = Column(String(255), nullable=False)
+    payload = Column(JSON, default=dict)
+    status = Column(String(50), nullable=False, default="Queued", index=True)
+    progress = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    error = Column(Text, nullable=True)
+    result = Column(Text, nullable=True)
+    result_metadata = Column(JSON, default=dict)
+    retry_count = Column(Integer, default=0)
+    worker_id = Column(String(100), nullable=True)
+
+    user = relationship("User", back_populates="background_tasks")
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "type": self.type,
+            "title": self.title,
+            "status": self.status,
+            "progress": self.progress,
+            "createdAt": self.created_at.isoformat() if self.created_at else None,
+            "startedAt": self.started_at.isoformat() if self.started_at else None,
+            "completedAt": self.completed_at.isoformat() if self.completed_at else None,
+            "error": self.error,
+            "result": self.result,
+            "payload": self.payload or {},
+            "userId": str(self.user_id),
+            "retryCount": self.retry_count,
+            "resultMetadata": self.result_metadata or {},
+        }

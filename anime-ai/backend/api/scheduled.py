@@ -8,7 +8,8 @@ from pydantic import BaseModel
 from database.db import get_db
 from database.models import User, ScheduledTask, ScheduledTaskRun
 from auth.manager import AuthManager
-from tasks.scheduler import execute_scheduled_task_run
+from tasks.scheduler import execute_scheduled_task_run, compute_next_run
+from database.models import utc_now
 
 router = APIRouter(prefix="/scheduled", tags=["scheduled"])
 
@@ -57,11 +58,15 @@ def create_scheduled_task(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Creates a new durable scheduled task."""
+    """Creates a new durable scheduled task with immediate next_run_at calculation."""
     title = req.title.strip()
     prompt = req.prompt.strip()
     if not title or not prompt:
         raise HTTPException(status_code=400, detail="Title and prompt are required.")
+
+    is_enabled = req.enabled if req.enabled is not None else True
+    tz = req.timezone or "UTC"
+    next_run = compute_next_run(req.schedule, tz, utc_now()) if is_enabled else None
 
     task = ScheduledTask(
         id=uuid.uuid4(),
@@ -69,8 +74,9 @@ def create_scheduled_task(
         title=title,
         prompt=prompt,
         schedule=req.schedule,
-        timezone=req.timezone or "UTC",
-        enabled=req.enabled if req.enabled is not None else True
+        timezone=tz,
+        enabled=is_enabled,
+        next_run_at=next_run
     )
     db.add(task)
     db.commit()
@@ -85,7 +91,7 @@ def create_scheduled_task(
         "timezone": task.timezone,
         "enabled": task.enabled,
         "last_run_at": None,
-        "next_run_at": None,
+        "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "task": {
             "id": str(task.id),
@@ -94,6 +100,7 @@ def create_scheduled_task(
             "schedule": task.schedule,
             "timezone": task.timezone,
             "enabled": task.enabled,
+            "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
             "created_at": task.created_at.isoformat() if task.created_at else None
         }
     }
@@ -106,7 +113,7 @@ def update_scheduled_task(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Updates a scheduled task."""
+    """Updates a scheduled task and recalculates next_run_at."""
     try:
         t_uuid = uuid.UUID(task_id)
     except ValueError:
@@ -130,6 +137,11 @@ def update_scheduled_task(
     if req.enabled is not None:
         task.enabled = req.enabled
 
+    if task.enabled:
+        task.next_run_at = compute_next_run(task.schedule, task.timezone, utc_now())
+    else:
+        task.next_run_at = None
+
     db.commit()
     db.refresh(task)
     return {
@@ -138,7 +150,8 @@ def update_scheduled_task(
         "enabled": task.enabled,
         "title": task.title,
         "schedule": task.schedule,
-        "timezone": task.timezone
+        "timezone": task.timezone,
+        "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None
     }
 
 @router.delete("/{task_id}")

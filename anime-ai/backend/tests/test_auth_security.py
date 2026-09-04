@@ -60,5 +60,22 @@ class TestAuthSecurity(unittest.TestCase):
             )
         self.assertIn("Production startup failed", str(ctx.exception))
 
+    def test_production_guard_on_short_secret(self):
+        """Production must reject secrets shorter than 32 characters."""
+        with self.assertRaises(RuntimeError) as ctx:
+            AuthManager.validate_production_secret(
+                env="production",
+                secret="short_unique_custom_secret_123"
+            )
+        self.assertIn("at least 32 characters", str(ctx.exception))
+
+    def test_development_mode_allows_dev_secret(self):
+        """Development environment allows dev secret without throwing."""
+        result = AuthManager.validate_production_secret(
+            env="development",
+            secret="sakura_dev_secret_local_only_1234567890"
+        )
+        self.assertTrue(result)
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,32 +3,8 @@ from database.db import engine, Base, get_db_context
 from database.models import Character
 
 def init_tables():
-    """Create all tables in the database and ensure newly added columns exist."""
-    print("Creating database tables...")
+    """Initializes schema for local test/dev environments via SQLAlchemy metadata."""
     Base.metadata.create_all(bind=engine)
-    
-    # Safe SQLite column migration for conversations
-    try:
-        from sqlalchemy import text
-        with engine.connect() as conn:
-            # Check existing columns in conversations
-            result = conn.execute(text("PRAGMA table_info(conversations);")).fetchall()
-            existing_cols = [row[1] for row in result]
-            
-            if "pinned" not in existing_cols:
-                conn.execute(text("ALTER TABLE conversations ADD COLUMN pinned BOOLEAN DEFAULT 0;"))
-                print("Added 'pinned' column to conversations table.")
-            if "pinned_at" not in existing_cols:
-                conn.execute(text("ALTER TABLE conversations ADD COLUMN pinned_at DATETIME;"))
-                print("Added 'pinned_at' column to conversations table.")
-            if "archived_at" not in existing_cols:
-                conn.execute(text("ALTER TABLE conversations ADD COLUMN archived_at DATETIME;"))
-                print("Added 'archived_at' column to conversations table.")
-            conn.commit()
-    except Exception as e:
-        print("Column migration check note:", e)
-
-    print("Tables created successfully.")
 
 def seed_characters():
     """Seeds default vintage anime characters."""

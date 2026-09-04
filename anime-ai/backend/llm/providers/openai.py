@@ -123,6 +123,43 @@ class OpenAIProvider(LLMProvider):
         )
         return response.choices[0].message.parsed
 
+    def _convert_messages_for_openai(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Converts canonical provider-neutral messages to OpenAI API wire format."""
+        import json
+        converted = []
+        for m in messages:
+            role = m.get("role")
+            if role == "assistant" and m.get("tool_calls"):
+                formatted_calls = []
+                for tc in m["tool_calls"]:
+                    if "function" in tc:
+                        formatted_calls.append(tc)
+                    else:
+                        args = tc.get("arguments", {})
+                        args_str = json.dumps(args) if isinstance(args, dict) else str(args)
+                        formatted_calls.append({
+                            "id": tc.get("id"),
+                            "type": "function",
+                            "function": {
+                                "name": tc.get("name"),
+                                "arguments": args_str
+                            }
+                        })
+                converted.append({
+                    "role": "assistant",
+                    "content": m.get("content") or None,
+                    "tool_calls": formatted_calls
+                })
+            elif role == "tool":
+                converted.append({
+                    "role": "tool",
+                    "tool_call_id": m.get("tool_call_id"),
+                    "content": str(m.get("content") or "")
+                })
+            else:
+                converted.append(m)
+        return converted
+
     async def tool_turn(
         self,
         messages: List[Dict[str, Any]],
@@ -132,9 +169,10 @@ class OpenAIProvider(LLMProvider):
         **kwargs
     ) -> Dict[str, Any]:
         import json
+        openai_messages = self._convert_messages_for_openai(messages)
         response = await self.client.chat.completions.create(
             model=self.model,
-            messages=messages,
+            messages=openai_messages,
             tools=tools if tools else None,
             tool_choice="auto" if tools else None,
             temperature=temperature,

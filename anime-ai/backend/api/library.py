@@ -446,61 +446,21 @@ async def generate_image_to_library(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Generates an image via neural rendering and saves it as a real library file."""
+    """Generates an image via canonical ImageGenerationEngine and saves it as a real library file."""
     prompt = req.prompt.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Image prompt cannot be empty")
 
-    file_id = uuid.uuid4()
-    clean_title = req.filename or prompt[:30].replace(" ", "_").replace("/", "_") + ".png"
-    storage_path = os.path.join(UPLOAD_DIR, f"{file_id}.png")
-
-    encoded_prompt = urllib.parse.quote(prompt)
-    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&seed=42"
-
-    def download_image():
-        req_obj = urllib.request.Request(image_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req_obj, timeout=20) as resp:
-            with open(storage_path, "wb") as out:
-                out.write(resp.read())
-
-    loop = asyncio.get_event_loop()
+    from media.image_engine import ImageGenerationEngine
+    engine = ImageGenerationEngine(db, current_user.id)
     try:
-        await loop.run_in_executor(None, download_image)
-        file_size = os.path.getsize(storage_path)
+        res = await engine.generate_image(
+            prompt=prompt,
+            aspect_ratio="1:1"
+        )
+        return {"status": "success", "file": res}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
-
-    doc = Document(
-        id=file_id,
-        user_id=current_user.id,
-        filename=clean_title,
-        mime_type="image/png",
-        storage_path=storage_path,
-        metadata_json={
-            "status": "READY",
-            "indexing_status": "Ready",
-            "size": file_size,
-            "category": "images",
-            "source": "image_generation",
-            "prompt": prompt,
-            "is_knowledge_base": False,
-            "modified_at": datetime.utcnow().isoformat(),
-            "chunks": 0
-        }
-    )
-    db.add(doc)
-    db.commit()
-
-    from api.routes import ws_manager
-    serialized = serialize_document(doc)
-    await ws_manager.send_to_user(str(current_user.id), {
-        "type": "library_update",
-        "action": "created",
-        "data": serialized
-    })
-
-    return {"status": "success", "file": serialized}
 
 class RenameFileRequest(BaseModel):
     name: str
