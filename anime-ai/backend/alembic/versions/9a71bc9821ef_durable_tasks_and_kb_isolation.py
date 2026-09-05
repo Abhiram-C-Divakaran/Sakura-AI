@@ -19,37 +19,52 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # 1. Update documents with knowledge base isolation columns
-    with op.batch_alter_table('documents', schema=None) as batch_op:
-        batch_op.add_column(sa.Column('is_knowledge_base', sa.Boolean(), nullable=False, server_default=sa.text('0')))
-        batch_op.add_column(sa.Column('indexing_status', sa.String(length=50), nullable=False, server_default='UPLOADED'))
-        batch_op.create_index('ix_documents_is_knowledge_base', ['is_knowledge_base'], unique=False)
-        batch_op.create_index('ix_documents_indexing_status', ['indexing_status'], unique=False)
+    bind = op.get_bind()
+    insp = sa.inspect(bind)
 
-    # 2. Create durable background_tasks table
-    op.create_table(
-        'background_tasks',
-        sa.Column('id', sa.UUID(), nullable=False),
-        sa.Column('user_id', sa.UUID(), nullable=False),
-        sa.Column('type', sa.String(length=50), nullable=False),
-        sa.Column('title', sa.String(length=255), nullable=False),
-        sa.Column('payload', sa.JSON(), nullable=True),
-        sa.Column('status', sa.String(length=50), nullable=False, server_default='Queued'),
-        sa.Column('progress', sa.Integer(), nullable=False, server_default='0'),
-        sa.Column('created_at', sa.DateTime(timezone=True), nullable=True),
-        sa.Column('started_at', sa.DateTime(timezone=True), nullable=True),
-        sa.Column('completed_at', sa.DateTime(timezone=True), nullable=True),
-        sa.Column('error', sa.Text(), nullable=True),
-        sa.Column('result', sa.Text(), nullable=True),
-        sa.Column('result_metadata', sa.JSON(), nullable=True),
-        sa.Column('retry_count', sa.Integer(), nullable=False, server_default='0'),
-        sa.Column('worker_id', sa.String(length=100), nullable=True),
-        sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE'),
-        sa.PrimaryKeyConstraint('id')
-    )
-    op.create_index('ix_background_tasks_user_id', 'background_tasks', ['user_id'], unique=False)
-    op.create_index('ix_background_tasks_type', 'background_tasks', ['type'], unique=False)
-    op.create_index('ix_background_tasks_status', 'background_tasks', ['status'], unique=False)
+    # 1. Update documents with knowledge base isolation columns if missing
+    if insp.has_table('documents'):
+        existing_doc_cols = [c['name'] for c in insp.get_columns('documents')]
+        needs_kb = 'is_knowledge_base' not in existing_doc_cols
+        needs_status = 'indexing_status' not in existing_doc_cols
+        if needs_kb or needs_status:
+            try:
+                bind.execute(sa.text("DROP TABLE IF EXISTS _alembic_tmp_documents"))
+            except Exception:
+                pass
+            with op.batch_alter_table('documents', schema=None) as batch_op:
+                if needs_kb:
+                    batch_op.add_column(sa.Column('is_knowledge_base', sa.Boolean(), nullable=False, server_default=sa.text('0')))
+                    batch_op.create_index('ix_documents_is_knowledge_base', ['is_knowledge_base'], unique=False)
+                if needs_status:
+                    batch_op.add_column(sa.Column('indexing_status', sa.String(length=50), nullable=False, server_default='UPLOADED'))
+                    batch_op.create_index('ix_documents_indexing_status', ['indexing_status'], unique=False)
+
+    # 2. Create durable background_tasks table if not already present
+    if not insp.has_table('background_tasks'):
+        op.create_table(
+            'background_tasks',
+            sa.Column('id', sa.UUID(), nullable=False),
+            sa.Column('user_id', sa.UUID(), nullable=False),
+            sa.Column('type', sa.String(length=50), nullable=False),
+            sa.Column('title', sa.String(length=255), nullable=False),
+            sa.Column('payload', sa.JSON(), nullable=True),
+            sa.Column('status', sa.String(length=50), nullable=False, server_default='Queued'),
+            sa.Column('progress', sa.Integer(), nullable=False, server_default='0'),
+            sa.Column('created_at', sa.DateTime(timezone=True), nullable=True),
+            sa.Column('started_at', sa.DateTime(timezone=True), nullable=True),
+            sa.Column('completed_at', sa.DateTime(timezone=True), nullable=True),
+            sa.Column('error', sa.Text(), nullable=True),
+            sa.Column('result', sa.Text(), nullable=True),
+            sa.Column('result_metadata', sa.JSON(), nullable=True),
+            sa.Column('retry_count', sa.Integer(), nullable=False, server_default='0'),
+            sa.Column('worker_id', sa.String(length=100), nullable=True),
+            sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE'),
+            sa.PrimaryKeyConstraint('id')
+        )
+        op.create_index('ix_background_tasks_user_id', 'background_tasks', ['user_id'], unique=False)
+        op.create_index('ix_background_tasks_type', 'background_tasks', ['type'], unique=False)
+        op.create_index('ix_background_tasks_status', 'background_tasks', ['status'], unique=False)
 
 
 def downgrade() -> None:

@@ -7,53 +7,76 @@ on:
     branches: [ main, master ]
 
 jobs:
-  backend-test:
-    name: Backend Test Suite
+  backend-tests:
+    name: Backend Tests & Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
     env:
-      JWT_SECRET: testing_secret_key_1234567890_ci_environment
-      ENVIRONMENT: test
-      SAKURA_ALLOW_MOCKS: "true"
-      DATABASE_URL: sqlite:///./ci_test.db
+      JWT_SECRET: "test-secret-key-for-ci-minimum-32-chars-ok"
+      INTEGRATION_ENCRYPTION_KEY: "test_integration_key_32_chars_ok!"
+      SAKURA_SANDBOX_SERVICE_TOKEN: "test_sandbox_service_token_ci"
+      ENVIRONMENT: "development"
+      DATABASE_URL: "sqlite:///./ci_test.db"
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: "pip"
-          cache-dependency-path: backend/requirements.txt
+          python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
+          pip install -r requirements.txt
 
-      - name: Run Python unit & security tests
+      - name: Validate Alembic Migrations
         run: |
-          cd backend
+          python -m alembic upgrade head
+
+      - name: Validate Docker Compose Configuration
+        env:
+          POSTGRES_PASSWORD: "ci_test_postgres_password"
+          JWT_SECRET: "test-secret-key-for-ci-minimum-32-chars-ok"
+          INTEGRATION_ENCRYPTION_KEY: "test_integration_key_32_chars_ok!"
+          SAKURA_SANDBOX_SERVICE_TOKEN: "test_sandbox_service_token_ci"
+        run: |
+          docker compose -f docker-compose.prod.yml config
+
+      - name: Run Test Suite
+        run: |
           python -m unittest discover -s tests -p "test_*.py" -v
 
   frontend-build:
-    name: Frontend Build & Typecheck
+    name: Frontend Typecheck & Build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
       - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: "npm"
-          cache-dependency-path: frontend/package-lock.json
+          cache: 'npm'
+          cache-dependency-path: frontend/package.json
 
-      - name: Install dependencies
-        run: |
-          cd frontend
-          npm ci
+      - name: Install Dependencies
+        run: npm install
 
-      - name: Build Next.js application
-        run: |
-          cd frontend
-          npm run build
+      - name: TypeScript Check
+        run: npm run typecheck
+
+      - name: Production Build
+        run: npm run build

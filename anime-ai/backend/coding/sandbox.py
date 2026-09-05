@@ -12,6 +12,7 @@ import time
 import shutil
 import asyncio
 import subprocess
+import httpx
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List, Union
 from coding.security import WorkspaceSecurity, SecurityException
@@ -147,6 +148,82 @@ class DockerSandboxRuntime(BaseSandboxRuntime):
                 "stdout": "",
                 "stderr": f"Docker execution error: {str(e)}",
                 "duration_ms": duration_ms,
+                "timed_out": False
+            }
+
+
+class RemoteHttpSandboxRuntime(BaseSandboxRuntime):
+    """
+    Remote container-isolated execution runtime communicating with the internal
+    Sandbox Executor Service over authenticated HTTP.
+    Ensures the backend API process has no access to the Docker daemon or docker socket.
+    """
+
+    def __init__(
+        self,
+        workspace_root: str,
+        default_timeout_seconds: int = 60,
+        service_url: Optional[str] = None,
+        service_token: Optional[str] = None
+    ):
+        self.workspace_root = os.path.realpath(os.path.abspath(workspace_root))
+        self.default_timeout_seconds = default_timeout_seconds
+        self.service_url = (service_url or os.getenv("SAKURA_SANDBOX_EXECUTOR_URL", "http://sandbox-executor:9000")).rstrip("/")
+        self.service_token = service_token or os.getenv("SAKURA_SANDBOX_SERVICE_TOKEN", "")
+
+    async def run_command(
+        self,
+        command: Union[str, List[str]],
+        cwd_relative: Optional[str] = None,
+        timeout_seconds: Optional[int] = None,
+        tool_name: str = "run_command",
+        allow_network: bool = False
+    ) -> Dict[str, Any]:
+        timeout = timeout_seconds or self.default_timeout_seconds
+        payload = {
+            "command": command,
+            "timeout_seconds": timeout,
+            "workspace_path": self.workspace_root,
+            "cwd_relative": cwd_relative,
+            "allow_network": allow_network,
+            "tool_name": tool_name
+        }
+        headers = {}
+        if self.service_token:
+            headers["X-Sandbox-Token"] = self.service_token
+
+        start_time = time.time()
+        try:
+            async with httpx.AsyncClient(timeout=float(timeout + 10)) as client:
+                resp = await client.post(
+                    f"{self.service_url}/execute",
+                    json=payload,
+                    headers=headers
+                )
+                if resp.status_code == 401:
+                    raise SandboxUnavailableError("Sandbox executor authentication failed: invalid service token.")
+                if resp.status_code != 200:
+                    raise SandboxUnavailableError(f"Sandbox executor returned HTTP {resp.status_code}: {resp.text}")
+                data = resp.json()
+                if data.get("isolation_unavailable"):
+                    raise SandboxUnavailableError(
+                        f"Sandbox executor container isolation unavailable: {data.get('stderr')}"
+                    )
+                return data
+        except SandboxUnavailableError:
+            raise
+        except Exception as e:
+            env = os.getenv("ENVIRONMENT", "development").lower()
+            if env in ("production", "prod"):
+                raise SandboxUnavailableError(f"Production sandbox execution failed: {str(e)}") from e
+            return {
+                "success": False,
+                "tool": tool_name,
+                "command": " ".join(command) if isinstance(command, list) else str(command),
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Sandbox service connection error: {str(e)}",
+                "duration_ms": int((time.time() - start_time) * 1000),
                 "timed_out": False
             }
 
@@ -345,6 +422,20 @@ class SandboxManager:
         return cls._docker_available
 
     @classmethod
+    def is_service_available(cls, service_url: Optional[str] = None) -> bool:
+        """Checks if the internal Sandbox Executor service is reachable and healthy."""
+        url = (service_url or os.getenv("SAKURA_SANDBOX_EXECUTOR_URL", "http://sandbox-executor:9000")).rstrip("/")
+        try:
+            with httpx.Client(timeout=2.0) as client:
+                res = client.get(f"{url}/health")
+                if res.status_code == 200:
+                    data = res.json()
+                    return bool(data.get("docker_available", False))
+                return False
+        except Exception:
+            return False
+
+    @classmethod
     def get_runtime(
         cls,
         workspace_root: str,
@@ -359,66 +450,101 @@ class SandboxManager:
         """
         env = os.getenv("ENVIRONMENT", "development").lower()
         is_prod = env in ("production", "prod")
-        docker_ok = cls.is_docker_available()
-
         pref = (force_runtime or os.getenv("SAKURA_SANDBOX_RUNTIME", "auto")).lower()
 
         if is_prod:
-            if not docker_ok:
-                raise SandboxUnavailableError(
-                    "Production sandbox execution blocked: Container isolation (Docker) is unavailable. "
-                    "In production, code execution is fail-closed to prevent host compromise."
-                )
             if pref == "local_restricted":
                 raise SandboxUnavailableError(
                     "Production sandbox execution blocked: Host restricted subprocess runtime "
                     "cannot be forced in production."
                 )
-            return DockerSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
+
+            # In production, check remote executor service first
+            if cls.is_service_available():
+                return RemoteHttpSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
+
+            # Fallback to local Docker container if daemon is present
+            if cls.is_docker_available():
+                return DockerSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
+
+            raise SandboxUnavailableError(
+                "Production sandbox execution blocked: Isolated container execution is unavailable. "
+                "The sandbox executor service is unreachable and local Docker daemon is not accessible. "
+                "In production, code execution is fail-closed to prevent host compromise."
+            )
 
         # Development / Test environments
-        if pref == "docker":
-            if docker_ok:
-                return DockerSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
-            else:
-                raise SandboxUnavailableError("Docker sandbox runtime was explicitly requested but Docker is not available.")
+        if pref == "remote":
+            if cls.is_service_available():
+                return RemoteHttpSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
+            raise SandboxUnavailableError("Remote sandbox runtime was explicitly requested but service is unreachable.")
 
-        if pref == "auto" and docker_ok:
-            return DockerSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
+        if pref == "docker":
+            if cls.is_docker_available():
+                return DockerSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
+            raise SandboxUnavailableError("Docker sandbox runtime was explicitly requested but Docker is not available.")
+
+        if pref == "auto":
+            if cls.is_service_available():
+                return RemoteHttpSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
+            if cls.is_docker_available():
+                return DockerSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
 
         return LocalRestrictedSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
 
     @classmethod
     def get_status(cls) -> Dict[str, Any]:
         """Returns runtime availability status for telemetry and capabilities endpoint."""
-        docker_ok = cls.is_docker_available()
         env = os.getenv("ENVIRONMENT", "development").lower()
         is_prod = env in ("production", "prod")
+        service_ok = cls.is_service_available()
+        docker_ok = cls.is_docker_available()
 
-        production_safe = docker_ok
-        available = docker_ok or not is_prod
-
-        if docker_ok:
-            reason = "Secure container isolation active"
-            runtime_name = "docker"
-            isolation_lvl = "container"
+        if service_ok:
+            return {
+                "available": True,
+                "runtime": "remote_docker",
+                "isolation_level": "container",
+                "production_safe": True,
+                "reason": "Secure remote container sandbox executor active",
+                "docker_available": True,
+                "cpu_limit": 2.0,
+                "memory_limit_mb": 512,
+                "network_disabled_by_default": True
+            }
+        elif docker_ok:
+            return {
+                "available": True,
+                "runtime": "docker",
+                "isolation_level": "container",
+                "production_safe": True,
+                "reason": "Secure local container isolation active",
+                "docker_available": True,
+                "cpu_limit": 2.0,
+                "memory_limit_mb": 512,
+                "network_disabled_by_default": True
+            }
         elif is_prod:
-            reason = "Container isolation unavailable: code execution disabled in production"
-            runtime_name = "unavailable"
-            isolation_lvl = "none"
+            return {
+                "available": False,
+                "runtime": "unavailable",
+                "isolation_level": "none",
+                "production_safe": False,
+                "reason": "Container isolation unavailable: code execution disabled in production",
+                "docker_available": False,
+                "cpu_limit": 0,
+                "memory_limit_mb": 0,
+                "network_disabled_by_default": True
+            }
         else:
-            reason = "Running in development mode using local restricted subprocess"
-            runtime_name = "local_restricted"
-            isolation_lvl = "restricted_subprocess"
-
-        return {
-            "available": available,
-            "runtime": runtime_name,
-            "isolation_level": isolation_lvl,
-            "production_safe": production_safe,
-            "reason": reason,
-            "docker_available": docker_ok,
-            "cpu_limit": 2.0 if docker_ok else "host_shared",
-            "memory_limit_mb": 512 if docker_ok else "host_shared",
-            "network_disabled_by_default": True
-        }
+            return {
+                "available": True,
+                "runtime": "local_restricted",
+                "isolation_level": "restricted_subprocess",
+                "production_safe": False,
+                "reason": "Running in development mode using local restricted subprocess",
+                "docker_available": False,
+                "cpu_limit": "host_shared",
+                "memory_limit_mb": "host_shared",
+                "network_disabled_by_default": True
+            }

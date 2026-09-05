@@ -4,6 +4,7 @@ Persists all background tasks in PostgreSQL / SQLite via SQLAlchemy BackgroundTa
 Ensures consistency across server restarts, worker instances, and provides real status,
 cancellation semantics, and real web research without artificial sleeps or fabricated progress.
 """
+import os
 import uuid
 import asyncio
 from datetime import datetime
@@ -40,14 +41,26 @@ class TaskManager:
             db.commit()
             db.refresh(task)
 
-            # Dispatch asynchronous execution if an event loop is running
-            task_id_str = str(task.id)
+            # 1. Always enqueue to durable Redis task queue
             try:
-                loop = asyncio.get_running_loop()
-                t = loop.create_task(run_task_execution(task.id, user_id))
-                ACTIVE_ASYNCIO_TASKS[task_id_str] = t
-            except RuntimeError:
+                from tasks.worker import enqueue_task
+                enqueue_task(task.id)
+            except Exception:
                 pass
+
+            # 2. In non-production development environments, support in-process fallback
+            env = os.getenv("ENVIRONMENT", "development").lower()
+            is_prod = env in ("production", "prod")
+            embedded_worker = os.getenv("SAKURA_EMBEDDED_WORKER", "false" if is_prod else "true").lower() == "true"
+            if embedded_worker:
+                task_id_str = str(task.id)
+                try:
+                    loop = asyncio.get_running_loop()
+                    t = loop.create_task(run_task_execution(task.id, user_id))
+                    ACTIVE_ASYNCIO_TASKS[task_id_str] = t
+                except RuntimeError:
+                    pass
+
             return task
 
     @staticmethod
@@ -117,13 +130,23 @@ class TaskManager:
                 db.commit()
                 db.refresh(task)
 
-                task_id_str = str(task.id)
                 try:
-                    loop = asyncio.get_running_loop()
-                    t = loop.create_task(run_task_execution(task.id, user_id))
-                    ACTIVE_ASYNCIO_TASKS[task_id_str] = t
-                except RuntimeError:
+                    from tasks.worker import enqueue_task
+                    enqueue_task(task.id)
+                except Exception:
                     pass
+
+                env = os.getenv("ENVIRONMENT", "development").lower()
+                is_prod = env in ("production", "prod")
+                embedded_worker = os.getenv("SAKURA_EMBEDDED_WORKER", "false" if is_prod else "true").lower() == "true"
+                if embedded_worker:
+                    task_id_str = str(task.id)
+                    try:
+                        loop = asyncio.get_running_loop()
+                        t = loop.create_task(run_task_execution(task.id, user_id))
+                        ACTIVE_ASYNCIO_TASKS[task_id_str] = t
+                    except RuntimeError:
+                        pass
                 await emit_task_update(task.to_dict())
 
             return task

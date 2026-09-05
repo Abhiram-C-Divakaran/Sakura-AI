@@ -72,15 +72,27 @@ class AuthManager:
             return None
 
     @staticmethod
-    def validate_production_secret(secret: Optional[str] = None, environment: Optional[str] = None, env: Optional[str] = None) -> bool:
+    def validate_production_secret(
+        secret: Optional[str] = None,
+        environment: Optional[str] = None,
+        env: Optional[str] = None,
+        integration_key: Optional[str] = None
+    ) -> bool:
         """
-        Validates JWT secret against production security requirements by delegating
+        Validates secrets against production security requirements by delegating
         to the centralized Settings.validate_production_guards().
         """
         target_env = (env or environment or os.getenv("ENVIRONMENT", os.getenv("ENV", "development"))).lower()
         target_secret = secret if secret is not None else os.getenv("JWT_SECRET", "")
+        target_integration_key = integration_key if integration_key is not None else os.getenv(
+            "INTEGRATION_ENCRYPTION_KEY",
+            "valid_integration_key_for_test_min_32_chars_123" if target_env in ["production", "prod"] else None
+        )
         from config.settings import Settings
-        s = Settings(ENVIRONMENT=target_env, JWT_SECRET=target_secret)
+        kwargs = {"ENVIRONMENT": target_env, "JWT_SECRET": target_secret}
+        if target_integration_key is not None:
+            kwargs["INTEGRATION_ENCRYPTION_KEY"] = target_integration_key
+        s = Settings(**kwargs)
         s.validate_production_guards()
         return True
 

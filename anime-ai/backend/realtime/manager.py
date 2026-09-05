@@ -6,8 +6,10 @@ Falls back gracefully to local in-process delivery when Redis is not running.
 """
 import os
 import json
+import uuid
 import asyncio
 import logging
+import time
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
 from fastapi import WebSocket
@@ -19,6 +21,7 @@ class RealtimeManager:
     """Manages WebSocket connections and cross-worker event broadcasting via Redis pub/sub."""
 
     def __init__(self):
+        self.worker_id = f"worker_{os.getpid()}_{uuid.uuid4().hex[:8]}"
         self.user_connections: Dict[str, List[WebSocket]] = {}
         self.redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
         self._redis_client = None
@@ -78,31 +81,43 @@ class RealtimeManager:
         """
         Publishes message to Redis pub/sub for distribution across all backend workers,
         and delivers locally to any connected clients on this instance.
+        Tags message with origin_worker_id to eliminate duplicate delivery.
         """
         user_id_str = str(user_id)
+        event_payload = dict(message)
+        event_payload.setdefault("event_id", str(uuid.uuid4()))
+        event_payload["origin_worker_id"] = self.worker_id
+        event_payload.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+
         # 1. Local delivery immediately
-        await self.send_local(user_id_str, message)
+        await self.send_local(user_id_str, event_payload)
 
         # 2. Redis pub/sub for other workers
-        published = await self._publish_to_redis(f"sakura:realtime:{user_id_str}", message)
-        if not published:
-            # Redis not running; local delivery already handled
-            pass
+        await self._publish_to_redis(f"sakura:realtime:{user_id_str}", event_payload)
 
     async def broadcast(self, message: dict):
-        """Broadcasts message to all connected users across all workers."""
+        """Broadcasts message to all connected users across all workers with deduplication."""
+        event_payload = dict(message)
+        event_payload.setdefault("event_id", str(uuid.uuid4()))
+        event_payload["origin_worker_id"] = self.worker_id
+        event_payload.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+
         for user_id in list(self.user_connections.keys()):
-            await self.send_local(user_id, message)
-        await self._publish_to_redis("sakura:realtime:broadcast", message)
+            await self.send_local(user_id, event_payload)
+        await self._publish_to_redis("sakura:realtime:broadcast", event_payload)
 
     async def _get_redis(self):
         if self._redis_client is None:
+            now = time.time()
+            if hasattr(self, "_last_redis_fail") and (now - self._last_redis_fail < 5):
+                return None
             try:
                 import redis.asyncio as aioredis
-                client = aioredis.from_url(self.redis_url, decode_responses=True, socket_connect_timeout=2)
+                client = aioredis.from_url(self.redis_url, decode_responses=True, socket_connect_timeout=0.3)
                 await client.ping()
                 self._redis_client = client
             except Exception:
+                self._last_redis_fail = now
                 self._redis_client = None
         return self._redis_client
 
@@ -137,6 +152,11 @@ class RealtimeManager:
                         data_str = raw_message.get("data", "")
                         try:
                             msg = json.loads(data_str)
+                            # Dedup: If this event originated from our own worker, it was already
+                            # delivered locally to connected websockets via send_local(). Discard!
+                            if msg.get("origin_worker_id") == self.worker_id:
+                                continue
+
                             if channel == "sakura:realtime:broadcast":
                                 for uid in list(self.user_connections.keys()):
                                     await self.send_local(uid, msg)
@@ -150,6 +170,27 @@ class RealtimeManager:
             except Exception:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
+
+    async def get_status(self) -> dict:
+        """Returns truthful telemetry on realtime subsystem connectivity and topology."""
+        redis_ok = False
+        try:
+            client = await self._get_redis()
+            if client:
+                await client.ping()
+                redis_ok = True
+        except Exception:
+            redis_ok = False
+
+        total_conns = sum(len(conns) for conns in self.user_connections.values())
+        return {
+            "status": "AVAILABLE" if (redis_ok or total_conns > 0) else "DEGRADED",
+            "worker_id": self.worker_id,
+            "redis_connected": redis_ok,
+            "local_delivery_available": True,
+            "cross_worker_delivery_available": redis_ok,
+            "active_local_connections": total_conns
+        }
 
 
 # Singleton manager instance

@@ -11,6 +11,7 @@ export interface AppConnector {
   state?: 'NOT_CONFIGURED' | 'DISCONNECTED' | 'AUTHORIZING' | 'CONNECTED' | 'ERROR';
   account_name?: string | null;
   capabilities?: string[];
+  is_implemented?: boolean;
 }
 
 const DEFAULT_CONNECTORS: AppConnector[] = [
@@ -21,6 +22,7 @@ const DEFAULT_CONNECTORS: AppConnector[] = [
     description: 'Sync repositories, inspect pull requests, and commit code directly.',
     connected: false,
     state: 'NOT_CONFIGURED',
+    is_implemented: true,
     iconSvg: (
       <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
         <path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4" />
@@ -145,7 +147,8 @@ export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({
                   connected: Boolean(item.connected),
                   state: item.state,
                   account_name: item.account_name,
-                  capabilities: item.capabilities || []
+                  capabilities: item.capabilities || [],
+                  is_implemented: item.is_implemented !== undefined ? Boolean(item.is_implemented) : c.is_implemented
                 };
               }
               return c;
@@ -168,6 +171,12 @@ export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({
     setActionInProgress(c.id);
     setErrorMessage(null);
     const willConnect = !c.connected;
+
+    if (willConnect && !c.is_implemented) {
+      setErrorMessage(`${c.name} connector is coming soon and cannot be configured yet.`);
+      setActionInProgress(null);
+      return;
+    }
 
     let tokenToSubmit: string | undefined = undefined;
 
@@ -319,24 +328,34 @@ export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({
                 </div>
               </div>
 
-              <button
-                type="button"
-                disabled={actionInProgress === c.id}
-                onClick={() => toggleConnect(c)}
-                className={`ml-4 px-3 py-1.5 text-[12px] font-medium rounded-lg transition-all cursor-pointer flex-shrink-0 ${
-                  c.connected
-                    ? 'bg-[#1C2C26] text-[#35D0BA] border border-[#35D0BA]/30 hover:bg-[#223930]'
-                    : c.state === 'NOT_CONFIGURED'
-                    ? 'bg-[#252525] text-[#AAAAAA] border border-[#353535] hover:bg-[#303030]'
-                    : 'bg-[#2A2A2A] text-white border border-[#383838] hover:bg-[#333333]'
-                }`}
-              >
-                {actionInProgress === c.id 
-                  ? 'Updating...' 
-                  : c.connected 
-                  ? 'Connected ✓' 
-                  : (c.state === 'NOT_CONFIGURED' ? 'Setup' : 'Connect')}
-              </button>
+              {!c.is_implemented ? (
+                <button
+                  type="button"
+                  disabled
+                  className="ml-4 px-3 py-1.5 text-[12px] font-medium rounded-lg bg-[#202020] text-[#666666] border border-[#2A2A2A] cursor-not-allowed flex-shrink-0"
+                >
+                  Coming Soon
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={actionInProgress === c.id}
+                  onClick={() => toggleConnect(c)}
+                  className={`ml-4 px-3 py-1.5 text-[12px] font-medium rounded-lg transition-all cursor-pointer flex-shrink-0 ${
+                    c.connected
+                      ? 'bg-[#1C2C26] text-[#35D0BA] border border-[#35D0BA]/30 hover:bg-[#223930]'
+                      : c.state === 'NOT_CONFIGURED'
+                      ? 'bg-[#252525] text-[#AAAAAA] border border-[#353535] hover:bg-[#303030]'
+                      : 'bg-[#2A2A2A] text-white border border-[#383838] hover:bg-[#333333]'
+                  }`}
+                >
+                  {actionInProgress === c.id 
+                    ? 'Updating...' 
+                    : c.connected 
+                    ? 'Connected ✓' 
+                    : (c.state === 'NOT_CONFIGURED' ? 'Setup' : 'Connect')}
+                </button>
+              )}
             </div>
           ))}
         </div>

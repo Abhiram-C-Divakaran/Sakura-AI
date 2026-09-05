@@ -17,6 +17,7 @@ export interface IntegrationStatus {
   connected_at: string | null;
   updated_at: string | null;
   capabilities: string[];
+  is_implemented?: boolean;
 }
 
 interface CapabilitiesResponse {
@@ -132,7 +133,7 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
       category: 'Visual AI',
       description: 'High-fidelity Pollinations Flux neural rendering, multi-turn editing lineage tree, and resolution upscaling.',
       status: sub?.image_gen?.status === 'AVAILABLE' ? 'Active' : 'Unavailable',
-      statusLevel: sub?.image_gen?.status || 'AVAILABLE',
+      statusLevel: sub?.image_gen?.status || 'UNKNOWN',
       isVerified: false,
       icon: <Image className="w-5 h-5 text-purple-400" />
     },
@@ -142,7 +143,7 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
       category: 'RAG Retrieval',
       description: ragMode,
       status: sub?.rag_engine?.status === 'AVAILABLE' ? 'Active' : 'Unavailable',
-      statusLevel: sub?.rag_engine?.status || 'AVAILABLE',
+      statusLevel: sub?.rag_engine?.status || 'UNKNOWN',
       isVerified: false,
       icon: <FileSearch className="w-5 h-5 text-blue-400" />
     },
@@ -152,7 +153,7 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
       category: 'Information Gathering',
       description: `Real-time web research engine using ${searchProvider}.`,
       status: sub?.web_search?.status === 'AVAILABLE' ? 'Active' : 'Unavailable',
-      statusLevel: sub?.web_search?.status || 'AVAILABLE',
+      statusLevel: sub?.web_search?.status || 'UNKNOWN',
       isVerified: false,
       icon: <Globe className="w-5 h-5 text-amber-400" />
     },
@@ -264,45 +265,58 @@ export const PluginsView: React.FC<PluginsViewProps> = ({
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {integrations.map((item) => (
-                <div
-                  key={item.id}
-                  className="bg-[#181818] border border-white/[0.06] rounded-2xl p-5 flex flex-col justify-between"
-                >
-                  <div>
-                    <div className="flex items-center justify-between mb-3">
-                      <h4 className="text-[14px] font-medium text-white">{item.name}</h4>
-                      <span className={`text-[10.5px] font-mono px-2 py-0.5 rounded-full border ${
-                        item.connected
-                          ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
-                          : item.state === 'DISCONNECTED'
-                          ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
-                          : 'bg-white/[0.04] text-[#666666] border-white/[0.06]'
-                      }`}>
-                        {item.connected ? 'CONNECTED' : (item.state === 'DISCONNECTED' ? 'DISCONNECTED' : 'NOT CONFIGURED')}
-                      </span>
-                    </div>
-                    <p className="text-[12px] text-[#888888] line-clamp-2 leading-relaxed mb-4">
-                      {item.description}
-                    </p>
-                    {item.connected && item.account_name && (
-                      <div className="mb-3 text-[11px] text-[#35D0BA] font-mono">
-                        Account: @{item.account_name}
+              {integrations.map((item) => {
+                const isSupported = item.is_implemented !== false;
+                return (
+                  <div
+                    key={item.id}
+                    className="bg-[#181818] border border-white/[0.06] rounded-2xl p-5 flex flex-col justify-between"
+                  >
+                    <div>
+                      <div className="flex items-center justify-between mb-3">
+                        <h4 className="text-[14px] font-medium text-white">{item.name}</h4>
+                        <span className={`text-[10.5px] font-mono px-2 py-0.5 rounded-full border ${
+                          !isSupported
+                            ? 'bg-white/[0.04] text-[#888888] border-white/[0.08]'
+                            : item.connected
+                            ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                            : item.state === 'DISCONNECTED'
+                            ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                            : 'bg-white/[0.04] text-[#666666] border-white/[0.06]'
+                        }`}>
+                          {!isSupported
+                            ? 'COMING SOON'
+                            : (item.connected ? 'CONNECTED' : (item.state === 'DISCONNECTED' ? 'DISCONNECTED' : 'NOT CONFIGURED'))}
+                        </span>
                       </div>
-                    )}
-                  </div>
+                      <p className="text-[12px] text-[#888888] line-clamp-2 leading-relaxed mb-4">
+                        {item.description}
+                      </p>
+                      {item.connected && item.account_name && (
+                        <div className="mb-3 text-[11px] text-[#35D0BA] font-mono">
+                          Account: @{item.account_name}
+                        </div>
+                      )}
+                    </div>
 
-                  <div className="pt-3 border-t border-white/[0.04] flex items-center justify-between">
-                    <span className="text-[11px] text-[#666666]">{item.category}</span>
-                    <button
-                      onClick={() => setIsConnectModalOpen(true)}
-                      className="text-[12px] text-blue-400 hover:text-blue-300 font-medium transition-colors cursor-pointer"
-                    >
-                      {item.connected ? 'Manage' : (item.state === 'NOT_CONFIGURED' ? 'Setup' : 'Connect')}
-                    </button>
+                    <div className="pt-3 border-t border-white/[0.04] flex items-center justify-between">
+                      <span className="text-[11px] text-[#666666]">{item.category}</span>
+                      {isSupported ? (
+                        <button
+                          onClick={() => setIsConnectModalOpen(true)}
+                          className="text-[12px] text-blue-400 hover:text-blue-300 font-medium transition-colors cursor-pointer"
+                        >
+                          {item.connected ? 'Manage' : (item.state === 'NOT_CONFIGURED' ? 'Setup' : 'Connect')}
+                        </button>
+                      ) : (
+                        <span className="text-[11.5px] text-[#666666] font-medium">
+                          Coming Soon
+                        </span>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </section>

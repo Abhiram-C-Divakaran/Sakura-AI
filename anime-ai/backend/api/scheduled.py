@@ -66,7 +66,10 @@ def create_scheduled_task(
 
     is_enabled = req.enabled if req.enabled is not None else True
     tz = req.timezone or "UTC"
-    next_run = compute_next_run(req.schedule, tz, utc_now()) if is_enabled else None
+    try:
+        next_run = compute_next_run(req.schedule, tz, utc_now()) if is_enabled else None
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     task = ScheduledTask(
         id=uuid.uuid4(),
@@ -126,21 +129,26 @@ def update_scheduled_task(
     if not task:
         raise HTTPException(status_code=404, detail="Scheduled task not found")
 
+    new_schedule = req.schedule if req.schedule is not None else task.schedule
+    new_timezone = req.timezone if req.timezone is not None else task.timezone
+    new_enabled = req.enabled if req.enabled is not None else task.enabled
+
+    if new_enabled:
+        try:
+            next_run = compute_next_run(new_schedule, new_timezone, utc_now())
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    else:
+        next_run = None
+
     if req.title is not None:
         task.title = req.title.strip()
     if req.prompt is not None:
         task.prompt = req.prompt.strip()
-    if req.schedule is not None:
-        task.schedule = req.schedule
-    if req.timezone is not None:
-        task.timezone = req.timezone
-    if req.enabled is not None:
-        task.enabled = req.enabled
-
-    if task.enabled:
-        task.next_run_at = compute_next_run(task.schedule, task.timezone, utc_now())
-    else:
-        task.next_run_at = None
+    task.schedule = new_schedule
+    task.timezone = new_timezone
+    task.enabled = new_enabled
+    task.next_run_at = next_run
 
     db.commit()
     db.refresh(task)

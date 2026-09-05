@@ -64,13 +64,17 @@ async def on_startup():
     except Exception as e:
         print(f"Sakura AI Platform: Startup database error: {e}")
 
-    try:
-        from tasks.scheduler import TaskSchedulerService
-        scheduler_service = TaskSchedulerService(poll_interval_seconds=60)
-        await scheduler_service.start()
-        print("Sakura AI Platform: Task scheduler service started.")
-    except Exception as e:
-        print(f"Sakura AI Platform: Task scheduler start error: {e}")
+    embedded_scheduler = os.getenv("SAKURA_EMBEDDED_SCHEDULER", "false" if is_prod else "true").lower() == "true"
+    if embedded_scheduler:
+        try:
+            from tasks.scheduler import TaskSchedulerService
+            scheduler_service = TaskSchedulerService(poll_interval_seconds=60)
+            await scheduler_service.start()
+            print("Sakura AI Platform: Embedded task scheduler service started.")
+        except Exception as e:
+            print(f"Sakura AI Platform: Task scheduler start error: {e}")
+    else:
+        print("Sakura AI Platform: Embedded scheduler disabled (standalone scheduler service expected).")
 
 @app.on_event("shutdown")
 async def on_shutdown():

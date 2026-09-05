@@ -20,7 +20,7 @@ router = APIRouter(prefix="/capabilities", tags=["capabilities"])
 
 @router.get("", response_model=Dict[str, Any])
 @router.get("/", response_model=Dict[str, Any])
-def get_system_capabilities(
+async def get_system_capabilities(
     current_user: Optional[User] = Depends(AuthManager.get_optional_current_user),
     db: Session = Depends(get_db)
 ):
@@ -148,10 +148,7 @@ def get_system_capabilities(
             "upscale_available": True,
             "status": "AVAILABLE"
         },
-        "realtime": {
-            "status": "AVAILABLE",
-            "redis_connected": bool(ws_manager._redis_client is not None)
-        },
+        "realtime": await ws_manager.get_status(),
         "providers": available_providers,
         "subsystems": subsystems
     }

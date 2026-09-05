@@ -113,6 +113,62 @@ class TestIntegrationsSystem(unittest.TestCase):
         self.assertFalse(data["connected"])
         self.assertIn(data["state"], ["NOT_CONFIGURED", "DISCONNECTED"])
 
+    def test_unsupported_integrations_cannot_connect_return_501(self):
+        """Unsupported connectors must return 501 Not Implemented and never persist connected=True."""
+        unsupported = ["google_drive", "notion", "slack", "postgres", "jira"]
+        for provider in unsupported:
+            with self.subTest(provider=provider):
+                res = self.client.post(
+                    f"/api/v1/integrations/{provider}/connect",
+                    json={"token": "some_token"},
+                    headers=self.headers
+                )
+                self.assertEqual(res.status_code, 501, f"{provider} should return 501")
+                # Ensure no connected row was saved in the DB
+                with get_db_context() as db:
+                    rec = db.query(UserIntegration).filter(
+                        UserIntegration.user_id == self.user_id,
+                        UserIntegration.provider == provider
+                    ).first()
+                    self.assertTrue(rec is None or not rec.connected)
+
+    def test_integration_encryption_independent_from_jwt(self):
+        """Integration encryption uses INTEGRATION_ENCRYPTION_KEY and is decoupled from JWT_SECRET."""
+        from auth.crypto import encrypt_secret, decrypt_secret, _derive_fernet
+        from config.settings import get_settings
+
+        secret_text = "github_pat_super_secret_token_value_12345"
+
+        # Encrypt with custom integration key
+        int_key_1 = "integration-secret-key-number-one-abcdef123"
+        encrypted = encrypt_secret(secret_text, custom_key=int_key_1)
+        self.assertIn("version", encrypted)
+        self.assertIn("ciphertext", encrypted)
+
+        # Decrypting with matching integration key succeeds
+        decrypted = decrypt_secret(encrypted, custom_key=int_key_1)
+        self.assertEqual(decrypted, secret_text)
+
+        # Decrypting with wrong key fails safely
+        wrong_key = "completely-wrong-key-that-should-fail-gracefully"
+        failed_decrypted = decrypt_secret(encrypted, custom_key=wrong_key)
+        self.assertEqual(failed_decrypted, "")
+
+    def test_legacy_jwt_derived_ciphertext_migration(self):
+        """Legacy ciphertexts encrypted directly with JWT_SECRET decrypt via backward compatibility."""
+        from auth.crypto import _derive_fernet, decrypt_secret
+        from config.settings import get_settings
+
+        settings = get_settings()
+        legacy_fernet = _derive_fernet(settings.jwt_secret)
+        raw_token = "legacy_ghp_pat_token_legacy_format"
+        # Directly encrypt raw string with legacy fernet (no version envelope)
+        legacy_ct = legacy_fernet.encrypt(raw_token.encode("utf-8")).decode("utf-8")
+
+        # decrypt_secret should detect and successfully decrypt legacy token
+        decrypted = decrypt_secret(legacy_ct)
+        self.assertEqual(decrypted, raw_token)
+
 
 if __name__ == "__main__":
     unittest.main()

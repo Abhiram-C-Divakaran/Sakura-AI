@@ -10,9 +10,16 @@ jobs:
   backend-tests:
     name: Backend Tests & Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: anime-ai/backend
+    env:
+      JWT_SECRET: "test-secret-key-for-ci-minimum-32-chars-ok"
+      INTEGRATION_ENCRYPTION_KEY: "test_integration_key_32_chars_ok!"
+      SAKURA_SANDBOX_SERVICE_TOKEN: "test_sandbox_service_token_ci"
+      ENVIRONMENT: "development"
+      DATABASE_URL: "sqlite:///./ci_test.db"
 
     steps:
       - name: Checkout Code
@@ -29,17 +36,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Test Suite
+      - name: Validate Alembic Migrations
+        run: |
+          python -m alembic upgrade head
+
+      - name: Validate Docker Compose Configuration
+        working-directory: anime-ai
         env:
+          POSTGRES_PASSWORD: "ci_test_postgres_password"
           JWT_SECRET: "test-secret-key-for-ci-minimum-32-chars-ok"
-          ENVIRONMENT: "development"
-          DATABASE_URL: "sqlite:///./ci_test.db"
+          INTEGRATION_ENCRYPTION_KEY: "test_integration_key_32_chars_ok!"
+          SAKURA_SANDBOX_SERVICE_TOKEN: "test_sandbox_service_token_ci"
+        run: |
+          docker compose -f docker-compose.prod.yml config
+
+      - name: Run Test Suite
         run: |
           python -m unittest discover -s tests -p "test_*.py" -v
 
   frontend-build:
     name: Frontend Typecheck & Build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: anime-ai/frontend

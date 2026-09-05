@@ -20,6 +20,7 @@ KNOWN_DEV_SECRETS = {
     "password",
     "12345678",
     "sakura_dev_secret_local_only_1234567890",
+    "sakura_dev_integration_key_local_only_1234567890",
 }
 
 class Settings(BaseSettings):
@@ -38,6 +39,12 @@ class Settings(BaseSettings):
         alias="JWT_SECRET"
     )
     access_token_expire_minutes: int = Field(default=1440, alias="ACCESS_TOKEN_EXPIRE_MINUTES")
+
+    # Integration Encryption (independent from JWT_SECRET)
+    integration_encryption_key: Optional[str] = Field(
+        default="sakura_dev_integration_key_local_only_1234567890",
+        alias="INTEGRATION_ENCRYPTION_KEY"
+    )
 
     # CORS
     cors_allowed_origins: str = Field(
@@ -60,9 +67,11 @@ class Settings(BaseSettings):
     sakura_model_code: str = Field(default="qwen/qwen3.8-27b", alias="SAKURA_MODEL_CODE")
     sakura_model_reasoning: str = Field(default="deepseek-r1-distill-llama-70b", alias="SAKURA_MODEL_REASONING")
 
-    # Sandbox Isolation
+    # Sandbox Isolation & Internal Executor Service
     sakura_sandbox_runtime: str = Field(default="auto", alias="SAKURA_SANDBOX_RUNTIME")
-    sakura_sandbox_image: str = Field(default="python:3.11-slim", alias="SAKURA_SANDBOX_IMAGE")
+    sakura_sandbox_image: str = Field(default="sakura-sandbox:latest", alias="SAKURA_SANDBOX_IMAGE")
+    sakura_sandbox_executor_url: str = Field(default="http://sandbox-executor:9000", alias="SAKURA_SANDBOX_EXECUTOR_URL")
+    sakura_sandbox_service_token: Optional[str] = Field(default=None, alias="SAKURA_SANDBOX_SERVICE_TOKEN")
 
     # Mocks & Reliability
     sakura_allow_mocks: bool = Field(default=False, alias="SAKURA_ALLOW_MOCKS")
@@ -101,6 +110,16 @@ class Settings(BaseSettings):
                 raise RuntimeError(
                     "Production startup failed: FATAL PRODUCTION SECURITY ERROR: JWT_SECRET must be at least 32 characters long "
                     f"in production (current length: {len(self.jwt_secret)})."
+                )
+            if not self.integration_encryption_key or self.integration_encryption_key in KNOWN_DEV_SECRETS:
+                raise RuntimeError(
+                    "Production startup failed: FATAL PRODUCTION SECURITY ERROR: INTEGRATION_ENCRYPTION_KEY must be explicitly provided in production "
+                    "and cannot match any known default or development keys."
+                )
+            if len(self.integration_encryption_key) < 32:
+                raise RuntimeError(
+                    "Production startup failed: FATAL PRODUCTION SECURITY ERROR: INTEGRATION_ENCRYPTION_KEY must be at least 32 characters long "
+                    f"in production (current length: {len(self.integration_encryption_key)})."
                 )
 
 

@@ -19,7 +19,7 @@ def local_mock_response(prompt: str) -> str:
     
     # 4. Check for escalation condition
     if frequency > 2:
-        return "Adjusting tracking... Beep! 📟 I notice this issue is recurring. I'm escalating your connection to Neo-Tokyo Senior Operations. Standby while we sync analog signal levels."
+        return "I notice this issue has recurred multiple times. I am escalating your session to Senior Operations for priority investigation. Please stand by while I package our diagnostic logs."
         
     # 5. Extract failed solutions (blacklisted memory)
     failed_solutions = []
@@ -34,29 +34,29 @@ def local_mock_response(prompt: str) -> str:
 
     # 6. Generate character-themed answers matching rules
     if intent == "billing_issue":
-        solution = "Checking system registers... 💾 I found the double charge on your tape record! I've initiated a direct charge reversal to your bank terminal. It'll take 3-5 standard boot cycles (business days) to clear."
+        solution = "I have investigated your account transactions. I identified the duplicate charge in the billing ledger and initiated a full reversal. It will reflect on your statement within 3-5 business days."
         if any("refund" in s.lower() or "billing" in s.lower() for s in failed_solutions):
-            solution = "System anomaly! Since the automatic charge reversal failed, I've manually locked this transaction register. Could you read me the Invoice ID printed on your CRT terminal?"
+            solution = "Since the automatic charge reversal could not be completed, I have flagged this transaction for manual review. Could you please confirm your invoice or transaction ID?"
         return solution
         
     elif intent == "login_issue":
-        solution = "Cleaning magnetic tape heads... 📼 Try clearing your browser cache and cookies, then hit password reset on the Neo-Tokyo auth portal. Let me know if the verification packet arrives!"
+        solution = "Let's resolve your authentication issue. Please clear your browser cache and cookies, then use the password reset link. A verification link will be dispatched to your registered email."
         if any("forgot" in s.lower() or "cache" in s.lower() for s in failed_solutions):
-            solution = "Access error! Since the reset email isn't routing, let's bypass the main stack. I've generated a temporary hardware bypass token. Should I transmit it to your backup terminal?"
+            solution = "Since the standard reset email is not reaching your inbox, I have generated a temporary verification token. Would you like me to dispatch it to your backup contact method?"
         return solution
         
     elif intent == "app_crash":
-        solution = "Static distortion detected! 🖥️ The console is freezing. Let's try power cycling: close the terminal completely, restart your operating system, and make sure your firmware is up-to-date."
+        solution = "I have analyzed the application crash report. Let's restart the application service and verify that your system runtime meets all environment requirements."
         if any("restart" in s.lower() or "store" in s.lower() for s in failed_solutions):
-            solution = "Thermal overload! Restarting didn't clear the error registers. Please dump the stack trace or send a screenshot of the display so I can submit it to the hardware lab."
+            solution = "The restart did not resolve the issue. Please provide the stack trace or terminal logs so we can diagnose the exact module failure."
         return solution
 
     elif intent == "performance_issue":
-        solution = "Adjusting tracking... ⚙️ If the latency is high, check your dial-up speed (5Mbps recommended) and kill any background compiler scripts on your system."
+        solution = "To optimize system latency, please verify your network connection and inspect resource utilization for any runaway background processes."
         return solution
 
     elif intent == "connectivity":
-        solution = "Signal degradation! Check the coaxial cable, verify your router power cells, and verify if other nodes on the network are responding."
+        solution = "Network connection issue detected. Please check your network adapter settings, gateway DNS, and confirm if upstream services are reachable."
         return solution
 
     elif intent == "code_generation":
