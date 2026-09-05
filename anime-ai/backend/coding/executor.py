@@ -23,12 +23,14 @@ class SandboxExecutor:
         self,
         workspace_root: str = ".",
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
-        runtime: Optional[BaseSandboxRuntime] = None
+        runtime: Optional[BaseSandboxRuntime] = None,
+        workspace_id: Optional[str] = None
     ):
         self.workspace_root = os.path.realpath(os.path.abspath(workspace_root))
         self.default_timeout_seconds = timeout_seconds
         os.makedirs(self.workspace_root, exist_ok=True)
         self._explicit_runtime = runtime
+        self.workspace_id = workspace_id or os.path.basename(self.workspace_root)
 
     @property
     def runtime(self) -> BaseSandboxRuntime:
@@ -36,7 +38,8 @@ class SandboxExecutor:
             return self._explicit_runtime
         return SandboxManager.get_runtime(
             self.workspace_root,
-            timeout_seconds=self.default_timeout_seconds
+            timeout_seconds=self.default_timeout_seconds,
+            workspace_id=self.workspace_id
         )
 
     def execute(

@@ -222,13 +222,15 @@ def get_task_runs(
         for r in runs
     ]
 
-@router.post("/{task_id}/run")
+from fastapi.responses import JSONResponse
+
+@router.post("/{task_id}/run", status_code=status.HTTP_202_ACCEPTED)
 async def trigger_scheduled_task(
     task_id: str,
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Manually triggers real execution of a scheduled task."""
+    """Manually triggers real execution of a scheduled task, enqueuing a durable background run."""
     try:
         t_uuid = uuid.UUID(task_id)
     except ValueError:
@@ -241,12 +243,38 @@ async def trigger_scheduled_task(
     if not task:
         raise HTTPException(status_code=404, detail="Scheduled task not found")
 
-    # Run the scheduled task and record run outcome
-    result = await execute_scheduled_task_run(task.id)
+    now = utc_now()
+    run = ScheduledTaskRun(
+        id=uuid.uuid4(),
+        task_id=task.id,
+        status="QUEUED",
+        scheduled_for=now,
+        started_at=now
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
 
-    return {
-        "status": "triggered",
-        "id": str(task.id),
-        "title": task.title,
-        "run_result": result
-    }
+    from tasks.task_manager import TaskManager
+    bg_task = TaskManager.create_task(
+        user_id=current_user.id,
+        task_type="scheduled_run",
+        title=f"Manual Run: {task.title}",
+        payload={
+            "scheduled_task_id": str(task.id),
+            "run_id": str(run.id),
+            "scheduled_for": now.isoformat(),
+            "manual": True
+        }
+    )
+
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "status": "QUEUED",
+            "run_id": str(run.id),
+            "task_id": str(task.id),
+            "background_task_id": str(bg_task.id),
+            "message": "Scheduled task run enqueued durably."
+        }
+    )

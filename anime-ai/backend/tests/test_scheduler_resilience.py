@@ -93,16 +93,24 @@ class TestSchedulerResilience(unittest.TestCase):
         service1 = TaskSchedulerService()
         service2 = TaskSchedulerService()
 
-        # Mock execute_scheduled_task_run so it doesn't invoke real LLM
-        with patch("tasks.scheduler.execute_scheduled_task_run") as mock_exec:
-            # Simulate both schedulers polling at the same moment
-            import asyncio
-            asyncio.run(service1.poll_and_execute())
-            asyncio.run(service2.poll_and_execute())
+        from database.models import ScheduledTaskRun, BackgroundTask
 
-            # Exactly one execution should have been dispatched!
-            dispatched_task_ids = [call.args[0] for call in mock_exec.call_args_list if call.args[0] == task_id]
-            self.assertEqual(len(dispatched_task_ids), 1, "Task must be claimed and executed exactly once.")
+        # Simulate both schedulers polling at the same moment
+        import asyncio
+        asyncio.run(service1.poll_and_execute())
+        asyncio.run(service2.poll_and_execute())
+
+        with get_db_context() as db:
+            runs = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.task_id == task_id).all()
+            self.assertEqual(len(runs), 1, "Exactly one durable ScheduledTaskRun must be created for the occurrence.")
+            self.assertIn(runs[0].status, ["QUEUED", "RUNNING", "COMPLETED"])
+
+            # Check that exactly one BackgroundTask was enqueued
+            bg_tasks = db.query(BackgroundTask).filter(
+                BackgroundTask.type == "scheduled_run"
+            ).all()
+            matching_bg = [b for b in bg_tasks if b.payload and b.payload.get("scheduled_task_id") == str(task_id)]
+            self.assertEqual(len(matching_bg), 1, "Exactly one BackgroundTask must be enqueued.")
 
 
 if __name__ == "__main__":

@@ -22,6 +22,10 @@ class WorkspaceSecurity:
 
     DISALLOWED_ENV_VARS = {
         "JWT_SECRET",
+        "INTEGRATION_ENCRYPTION_KEY",
+        "SAKURA_SANDBOX_SERVICE_TOKEN",
+        "GITHUB_CLIENT_SECRET",
+        "POSTGRES_PASSWORD",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "GROQ_API_KEY",
@@ -96,6 +100,14 @@ class WorkspaceSecurity:
         env = dict(base_env or os.environ)
         for secret_key in WorkspaceSecurity.DISALLOWED_ENV_VARS:
             env.pop(secret_key, None)
+        # Scrub any keys containing sensitive keywords
+        sensitive_patterns = ("SECRET", "PASSWORD", "TOKEN", "KEY", "CREDENTIAL", "PRIVATE")
+        to_delete = [
+            k for k in env.keys()
+            if any(p in k.upper() for p in sensitive_patterns) and k not in ("TERM", "PATH")
+        ]
+        for k in to_delete:
+            env.pop(k, None)
         # Force non-interactive modes
         env["CI"] = "true"
         env["NONINTERACTIVE"] = "1"

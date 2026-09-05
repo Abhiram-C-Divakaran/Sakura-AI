@@ -135,14 +135,18 @@ class RealtimeManager:
 
     async def _redis_subscriber_loop(self):
         """Background loop subscribing to Redis channels and routing events to local websockets."""
-        backoff = 2
+        import random
+        backoff = 2.0
         while self._running:
+            client = None
+            pubsub = None
             try:
                 import redis.asyncio as aioredis
                 client = aioredis.from_url(self.redis_url, decode_responses=True, socket_connect_timeout=3)
                 pubsub = client.pubsub()
                 await pubsub.psubscribe("sakura:realtime:*")
-                backoff = 2
+                # Reset backoff after successful connection
+                backoff = 2.0
 
                 async for raw_message in pubsub.listen():
                     if not self._running:
@@ -167,9 +171,22 @@ class RealtimeManager:
                             pass
             except asyncio.CancelledError:
                 break
-            except Exception:
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+            except Exception as e:
+                logger.debug(f"Redis subscriber loop disconnect/error: {e}")
+                jitter = random.uniform(0.1, 0.5)
+                await asyncio.sleep(min(backoff + jitter, 30.0))
+                backoff = min(backoff * 1.5, 30.0)
+            finally:
+                if pubsub:
+                    try:
+                        await pubsub.close()
+                    except Exception:
+                        pass
+                if client:
+                    try:
+                        await client.close()
+                    except Exception:
+                        pass
 
     async def get_status(self) -> dict:
         """Returns truthful telemetry on realtime subsystem connectivity and topology."""
@@ -183,8 +200,19 @@ class RealtimeManager:
             redis_ok = False
 
         total_conns = sum(len(conns) for conns in self.user_connections.values())
+        if redis_ok:
+            overall_status = "AVAILABLE"
+            topology_mode = "CROSS_WORKER_AVAILABLE"
+        elif total_conns > 0:
+            overall_status = "DEGRADED"
+            topology_mode = "LOCAL_AVAILABLE"
+        else:
+            overall_status = "DEGRADED"
+            topology_mode = "OFFLINE"
+
         return {
-            "status": "AVAILABLE" if (redis_ok or total_conns > 0) else "DEGRADED",
+            "status": overall_status,
+            "mode": topology_mode,
             "worker_id": self.worker_id,
             "redis_connected": redis_ok,
             "local_delivery_available": True,

@@ -248,6 +248,8 @@ class IntegrationResponse(BaseModel):
     account_name: Optional[str] = None
     connected_at: Optional[str] = None
     updated_at: Optional[str] = None
+    last_verified_at: Optional[str] = None
+    health_status: Optional[str] = None
     capabilities: List[str] = []
     is_implemented: bool = False
 
@@ -267,9 +269,16 @@ def _serialize_integration(
     prov_id = provider.id
     # Only implemented providers with genuine verification can be CONNECTED
     is_connected = bool(provider.is_implemented and record and record.connected)
+    cfg = (record.config_json or {}) if record else {}
+    last_verified_at = cfg.get("last_verified_at")
+    health_status = cfg.get("health_status")
 
     if is_connected:
         state = "CONNECTED"
+        if not health_status:
+            health_status = "HEALTHY"
+    elif record and cfg.get("health_status") == "ERROR":
+        state = "ERROR"
     elif provider.is_implemented:
         if prov_id == "github":
             has_client = bool(os.getenv("GITHUB_CLIENT_ID") and os.getenv("GITHUB_CLIENT_SECRET"))
@@ -293,6 +302,8 @@ def _serialize_integration(
         account_name=record.account_name if (record and is_connected) else None,
         connected_at=connected_at,
         updated_at=updated_at,
+        last_verified_at=last_verified_at,
+        health_status=health_status,
         capabilities=provider.capabilities,
         is_implemented=provider.is_implemented
     )
@@ -363,6 +374,8 @@ def connect_integration(
 
     config_payload = dict(req.config or {})
     config_payload["encrypted_token"] = encrypted_token
+    config_payload["last_verified_at"] = utc_now().isoformat()
+    config_payload["health_status"] = "HEALTHY"
     config_payload.pop("access_token", None)
 
     if not integration:
@@ -411,6 +424,63 @@ def disconnect_integration(
         db.commit()
         db.refresh(integration)
 
+    return _serialize_integration(adapter, integration)
+
+
+@router.post("/{provider}/revalidate", response_model=IntegrationResponse)
+def revalidate_integration(
+    provider: str,
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Revalidates credential health against upstream provider.
+    Transitions state to ERROR/DISCONNECTED if revoked or expired.
+    Upgrades legacy encryption envelopes transparently.
+    """
+    adapter = INTEGRATION_PROVIDERS.get(provider)
+    if not adapter:
+        raise HTTPException(status_code=400, detail=f"Unsupported integration provider '{provider}'")
+
+    if not adapter.is_implemented:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=f"Integration provider '{provider}' is not implemented yet."
+        )
+
+    integration = db.query(UserIntegration).filter(
+        UserIntegration.user_id == current_user.id,
+        UserIntegration.provider == provider
+    ).first()
+
+    if not integration:
+        raise HTTPException(status_code=404, detail="Integration not found.")
+
+    cfg = dict(integration.config_json or {})
+    enc_token = cfg.get("encrypted_token")
+
+    from auth.crypto import decrypt_and_upgrade_secret
+    raw_token, upgraded_envelope = decrypt_and_upgrade_secret(enc_token)
+    if upgraded_envelope:
+        cfg["encrypted_token"] = upgraded_envelope
+
+    now_iso = utc_now().isoformat()
+    cfg["last_verified_at"] = now_iso
+
+    try:
+        credentials = {"access_token": raw_token}
+        validation_data = adapter.validate_credentials(credentials)
+        integration.account_name = adapter.get_account_identity(credentials, validation_data) or integration.account_name
+        integration.connected = True
+        cfg["health_status"] = "HEALTHY"
+    except Exception as e:
+        integration.connected = False
+        cfg["health_status"] = "ERROR"
+
+    integration.config_json = cfg
+    integration.updated_at = utc_now()
+    db.commit()
+    db.refresh(integration)
     return _serialize_integration(adapter, integration)
 
 

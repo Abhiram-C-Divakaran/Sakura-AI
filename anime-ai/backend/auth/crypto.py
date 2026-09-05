@@ -24,6 +24,12 @@ def _get_integration_fernet(custom_key: Optional[str] = None) -> Fernet:
     if custom_key:
         return _derive_fernet(custom_key)
     settings = get_settings()
+    is_prod = settings.environment in ["production", "prod"]
+    if is_prod and not settings.integration_encryption_key:
+        raise ValueError(
+            "Production security error: INTEGRATION_ENCRYPTION_KEY must be configured "
+            "independently of JWT_SECRET."
+        )
     key_str = settings.integration_encryption_key or settings.jwt_secret
     return _derive_fernet(key_str)
 
@@ -52,31 +58,50 @@ def decrypt_secret(ciphertext: str, custom_key: Optional[str] = None) -> str:
     First attempts decryption of versioned envelope with the current integration encryption key.
     Falls back transparently to legacy JWT_SECRET-derived decryption for backward compatibility.
     """
+    pt, _ = decrypt_and_upgrade_secret(ciphertext, custom_key)
+    return pt
+
+
+def decrypt_and_upgrade_secret(ciphertext: str, custom_key: Optional[str] = None) -> tuple:
+    """
+    Decrypts ciphertext and determines if it requires rotation/re-encryption.
+    Returns (plaintext, upgraded_ciphertext_or_none).
+    If the ciphertext was legacy (plain unversioned or decrypted via legacy JWT key),
+    returns the plaintext and newly encrypted versioned envelope using the current
+    INTEGRATION_ENCRYPTION_KEY.
+    """
     if not ciphertext or not isinstance(ciphertext, str):
-        return ""
+        return "", None
 
     raw_payload = ciphertext.strip()
+    is_versioned = False
     target_ct = raw_payload
 
-    # 1. Attempt parsing versioned JSON envelope
     if raw_payload.startswith("{") and raw_payload.endswith("}"):
         try:
             parsed = json.loads(raw_payload)
             if isinstance(parsed, dict) and "ciphertext" in parsed:
                 target_ct = parsed["ciphertext"]
+                is_versioned = True
         except Exception:
             target_ct = raw_payload
 
-    # 2. Try decrypting with integration encryption key
+    # 1. Try decrypting with integration encryption key
     f_int = _get_integration_fernet(custom_key)
     try:
-        return f_int.decrypt(target_ct.encode("utf-8")).decode("utf-8")
-    except (InvalidToken, Exception):
+        plaintext = f_int.decrypt(target_ct.encode("utf-8")).decode("utf-8")
+        if is_versioned:
+            return plaintext, None
+        return plaintext, encrypt_secret(plaintext, custom_key)
+    except Exception:
         pass
 
-    # 3. Transparent backward compatibility: Try decrypting with legacy JWT_SECRET key
+    # 2. Transparent backward compatibility: Try decrypting with legacy JWT_SECRET key
     try:
         f_legacy = _get_legacy_fernet()
-        return f_legacy.decrypt(target_ct.encode("utf-8")).decode("utf-8")
-    except (InvalidToken, Exception):
-        return ""
+        plaintext = f_legacy.decrypt(target_ct.encode("utf-8")).decode("utf-8")
+        # Upgrade legacy encryption to current INTEGRATION_ENCRYPTION_KEY
+        new_envelope = encrypt_secret(plaintext, custom_key)
+        return plaintext, new_envelope
+    except Exception:
+        return "", None

@@ -20,6 +20,7 @@ class TestIntegrationsSystem(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         Base.metadata.create_all(bind=engine)
+        app.dependency_overrides.clear()
         cls.client = TestClient(app)
         cls.user_id = uuid.uuid4()
         cls.username = f"int_user_{uuid.uuid4().hex[:8]}"

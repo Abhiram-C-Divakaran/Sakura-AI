@@ -54,11 +54,26 @@ def seed_characters():
         else:
             current_config = sakura.config or {}
             cfg_version = current_config.get("version", 1)
-            style = str(current_config.get("speech_style", ""))
-            desc = str(sakura.description or "")
-            is_retro = any(term in (style + desc).lower() for term in ["retro computer", "crt", "vhs", "tape deck", "magnetic tape", "neo-tokyo"])
+            is_customized = current_config.get("customized", False) or bool(current_config.get("user_overrides"))
 
-            if cfg_version < 2 or is_retro:
+            if is_customized:
+                # User or administrator has customized Sakura.
+                # Update underlying default profile reference without obliterating custom overrides.
+                print("Preserving user-customized Sakura personality while updating baseline profile metadata...")
+                merged_config = dict(sakura_config_v2)
+                user_overrides = current_config.get("user_overrides") or {}
+                if not user_overrides:
+                    for k, v in current_config.items():
+                        if k not in ("version",):
+                            user_overrides[k] = v
+                merged_config.update(user_overrides)
+                merged_config["customized"] = True
+                merged_config["version"] = 2
+                merged_config["user_overrides"] = user_overrides
+                sakura.config = merged_config
+                db.commit()
+                print("User-customized Sakura profile preserved with v2 metadata.")
+            elif cfg_version < 2:
                 print(f"Migrating Sakura personality from legacy v{cfg_version} to modern v2...")
                 sakura.description = "A capable, high-precision technical assistant and autonomous software engineer dedicated to clean architecture, debugging, and systems intelligence."
                 sakura.config = sakura_config_v2

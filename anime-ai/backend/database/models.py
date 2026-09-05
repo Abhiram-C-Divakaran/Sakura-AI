@@ -278,6 +278,7 @@ class ScheduledTaskRun(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     task_id = Column(UUID(as_uuid=True), ForeignKey("scheduled_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
     status = Column(String(50), default="RUNNING")  # RUNNING, COMPLETED, FAILED
+    scheduled_for = Column(DateTime(timezone=True), nullable=True, index=True)
     started_at = Column(DateTime(timezone=True), default=utc_now)
     completed_at = Column(DateTime(timezone=True), nullable=True)
     error = Column(Text, nullable=True)
@@ -285,6 +286,10 @@ class ScheduledTaskRun(Base):
     duration_ms = Column(Integer, default=0)
 
     task = relationship("ScheduledTask", back_populates="runs")
+
+    __table_args__ = (
+        Index("ix_scheduled_task_runs_task_occurrence", "task_id", "scheduled_for"),
+    )
 
 
 class TaskOutcome:
@@ -394,6 +399,9 @@ class BackgroundTask(Base):
     result_metadata = Column(JSON, default=dict)
     retry_count = Column(Integer, default=0)
     worker_id = Column(String(100), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    cancel_requested = Column(Boolean, default=False, nullable=False)
 
     user = relationship("User", back_populates="background_tasks")
 
@@ -412,5 +420,8 @@ class BackgroundTask(Base):
             "payload": self.payload or {},
             "userId": str(self.user_id),
             "retryCount": self.retry_count,
+            "workerId": self.worker_id,
+            "leaseExpiresAt": self.lease_expires_at.isoformat() if self.lease_expires_at else None,
+            "cancelRequested": self.cancel_requested,
             "resultMetadata": self.result_metadata or {},
         }

@@ -236,17 +236,28 @@ class TaskSchedulerService:
             ).all()
 
             for t in due_tasks:
+                occurrence_time = t.next_run_at
                 try:
                     next_run = compute_next_run(t.schedule, t.timezone, now)
                 except Exception as e:
                     logger.error(f"Cannot compute next run for task {t.id}: {e}")
                     continue
 
-                # Atomic claim in DB: only succeeds if next_run_at <= now
+                # Idempotency check: Ensure we haven't already created a run for this task and occurrence
+                existing_run = db.query(ScheduledTaskRun).filter(
+                    ScheduledTaskRun.task_id == t.id,
+                    ScheduledTaskRun.scheduled_for == occurrence_time
+                ).first()
+                if existing_run:
+                    t.next_run_at = next_run
+                    db.commit()
+                    continue
+
+                # Atomic claim in DB: only succeeds if next_run_at == occurrence_time
                 rows = db.query(ScheduledTask).filter(
                     ScheduledTask.id == t.id,
                     ScheduledTask.enabled == True,
-                    ScheduledTask.next_run_at <= now
+                    ScheduledTask.next_run_at == occurrence_time
                 ).update({
                     ScheduledTask.next_run_at: next_run,
                     ScheduledTask.last_run_at: now
@@ -254,8 +265,28 @@ class TaskSchedulerService:
                 db.commit()
 
                 if rows > 0:
-                    logger.info(f"Claimed scheduled task {t.id} ('{t.title}'). Dispatching execution...")
-                    asyncio.create_task(execute_scheduled_task_run(t.id))
+                    logger.info(f"Claimed scheduled task {t.id} ('{t.title}'). Enqueueing durable background job...")
+                    run = ScheduledTaskRun(
+                        id=uuid.uuid4(),
+                        task_id=t.id,
+                        status="QUEUED",
+                        scheduled_for=occurrence_time,
+                        started_at=now
+                    )
+                    db.add(run)
+                    db.commit()
+
+                    from tasks.task_manager import TaskManager
+                    TaskManager.create_task(
+                        user_id=t.user_id,
+                        task_type="scheduled_run",
+                        title=f"Scheduled: {t.title}",
+                        payload={
+                            "scheduled_task_id": str(t.id),
+                            "run_id": str(run.id),
+                            "scheduled_for": occurrence_time.isoformat() if occurrence_time else None
+                        }
+                    )
 
 
 async def run_scheduler_forever():

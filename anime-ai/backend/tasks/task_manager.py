@@ -103,6 +103,7 @@ class TaskManager:
 
             if task.status in ["Queued", "Starting", "Running", "Waiting"]:
                 task.status = "Cancelled"
+                task.cancel_requested = True
                 task.completed_at = utc_now()
                 db.commit()
                 db.refresh(task)
@@ -202,11 +203,25 @@ async def update_task_state(
     result: Optional[str] = None,
     result_metadata: Optional[dict] = None
 ) -> Optional[dict]:
-    """Updates task in database and broadcasts update."""
+    """Updates task in database and broadcasts update. Protects terminal states and respects cancellation."""
     with get_db_context() as db:
         task = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
         if not task:
             return None
+
+        # Terminal state protection: Completed, Failed, and Cancelled cannot be overwritten by progress updates
+        if task.status in ["Cancelled", "Failed", "Completed"] and status not in ["Queued"]:
+            return task.to_dict()
+
+        # Cancellation enforcement: if cancel_requested is set, force Cancelled status
+        if task.cancel_requested and status not in ["Cancelled", "Queued"]:
+            task.status = "Cancelled"
+            task.completed_at = utc_now()
+            db.commit()
+            db.refresh(task)
+            task_dict = task.to_dict()
+            await emit_task_update(task_dict)
+            return task_dict
 
         task.status = status
         task.progress = progress
@@ -251,6 +266,8 @@ async def run_task_execution(task_id: uuid.UUID, user_id: uuid.UUID):
             await execute_dataset_analysis(task_id, user_id, payload, router)
         elif task_type == "web_research":
             await execute_web_research(task_id, user_id, payload, router)
+        elif task_type == "scheduled_run":
+            await execute_scheduled_task_job(task_id, user_id, payload, router)
         else:
             await update_task_state(task_id, "Failed", 100, error=f"Unknown task type: {task_type}")
 
@@ -413,3 +430,105 @@ async def execute_web_research(task_id: uuid.UUID, user_id: uuid.UUID, payload: 
         result=response,
         result_metadata=metadata
     )
+
+
+async def execute_scheduled_task_job(
+    task_id: uuid.UUID,
+    user_id: uuid.UUID,
+    payload: dict,
+    router: LLMRouter
+):
+    """Executes a durable scheduled task run within the background worker pipeline."""
+    import time
+    from database.models import ScheduledTask, ScheduledTaskRun
+    start_time = time.time()
+
+    scheduled_task_id_str = payload.get("scheduled_task_id")
+    run_id_str = payload.get("run_id")
+    if not scheduled_task_id_str or not run_id_str:
+        await update_task_state(task_id, "Failed", 100, error="Missing scheduled_task_id or run_id in payload.")
+        return
+
+    try:
+        st_uuid = uuid.UUID(scheduled_task_id_str)
+        run_uuid = uuid.UUID(run_id_str)
+    except ValueError:
+        await update_task_state(task_id, "Failed", 100, error="Invalid UUID for scheduled_task_id or run_id.")
+        return
+
+    with get_db_context() as db:
+        st = db.query(ScheduledTask).filter(ScheduledTask.id == st_uuid).first()
+        run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+        if not st or not run:
+            await update_task_state(task_id, "Failed", 100, error="Scheduled task or run record not found.")
+            return
+
+        run.status = "RUNNING"
+        run.started_at = utc_now()
+        db.commit()
+        prompt_text = st.prompt
+
+    await update_task_state(task_id, "Running", 25)
+
+    # Check cancellation before expensive LLM generation
+    with get_db_context() as db:
+        curr = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
+        if curr and (curr.cancel_requested or curr.status == "Cancelled"):
+            with get_db_context() as db2:
+                r = db2.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+                if r:
+                    r.status = "FAILED"
+                    r.error = "Execution cancelled by user."
+                    r.completed_at = utc_now()
+                    db2.commit()
+            await update_task_state(task_id, "Cancelled", 100)
+            return
+
+    try:
+        provider_name, provider = router.get_provider("general_inquiry")
+        system_prompt = (
+            "You are Sakura AI executing a scheduled automated task on behalf of the user. "
+            "Provide a clear, detailed, and high-quality report."
+        )
+        response_text = await provider.generate(
+            prompt=prompt_text,
+            system_prompt=system_prompt,
+            temperature=0.4,
+            max_tokens=2048
+        )
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        # Check cancellation before final persistence
+        with get_db_context() as db:
+            curr = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
+            if curr and (curr.cancel_requested or curr.status == "Cancelled"):
+                r = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+                if r:
+                    r.status = "FAILED"
+                    r.error = "Execution cancelled by user."
+                    r.completed_at = utc_now()
+                    db.commit()
+                await update_task_state(task_id, "Cancelled", 100)
+                return
+
+            run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+            if run:
+                run.status = "COMPLETED"
+                run.output = response_text
+                run.completed_at = utc_now()
+                run.duration_ms = duration_ms
+                db.commit()
+
+        await update_task_state(task_id, "Completed", 100, result=response_text)
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        with get_db_context() as db:
+            run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+            if run:
+                run.status = "FAILED"
+                run.error = str(e)
+                run.completed_at = utc_now()
+                run.duration_ms = duration_ms
+                db.commit()
+        await update_task_state(task_id, "Failed", 100, error=str(e))
+

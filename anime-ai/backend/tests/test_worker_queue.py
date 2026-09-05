@@ -2,7 +2,7 @@ import os
 import sys
 import uuid
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 os.environ["DATABASE_URL"] = "sqlite:///./test_anime_ai.db"
 os.environ["ENVIRONMENT"] = "test"
@@ -83,6 +83,7 @@ class TestWorkerQueue(unittest.TestCase):
                 status="Running",
                 worker_id="dead_worker_999",
                 started_at=utc_now(),
+                lease_expires_at=utc_now() - timedelta(minutes=2),
                 retry_count=0
             )
             db.add(stale_task)
@@ -110,6 +111,7 @@ class TestWorkerQueue(unittest.TestCase):
                 status="Running",
                 worker_id="dead_worker_abc",
                 started_at=utc_now(),
+                lease_expires_at=utc_now() - timedelta(minutes=2),
                 retry_count=MAX_RETRIES
             )
             db.add(dead_task)

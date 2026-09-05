@@ -8,7 +8,7 @@ from coding.tools import CodingToolchain
 from coding.executor import SandboxExecutor
 from coding.security import WorkspaceSecurity
 
-WORKSPACES_ROOT = os.path.realpath(os.path.abspath("./workspaces"))
+WORKSPACES_ROOT = os.path.realpath(os.path.abspath(os.getenv("SAKURA_WORKSPACE_ROOT", "./workspaces")))
 os.makedirs(WORKSPACES_ROOT, exist_ok=True)
 
 class WorkspaceManager:
@@ -50,7 +50,7 @@ class WorkspaceManager:
             # Validate URL to prevent shell/flag injection
             WorkspaceSecurity.validate_repository_url(repository_url)
 
-            executor = SandboxExecutor(workspace_dir)
+            executor = SandboxExecutor(workspace_dir, workspace_id=str(workspace_id))
             clone_cmd = ["git", "clone", "--depth", "1", "--branch", branch, repository_url, "."]
             clone_res = await executor.run_command(clone_cmd, allow_network=True)
             if not clone_res["success"]:
@@ -61,7 +61,7 @@ class WorkspaceManager:
                     base_commit = rev_res["stdout"].strip()
         else:
             # Initialize git repository locally
-            executor = SandboxExecutor(workspace_dir)
+            executor = SandboxExecutor(workspace_dir, workspace_id=str(workspace_id))
             await executor.run_command(["git", "init"])
             await executor.run_command(["git", "config", "user.name", "Sakura AI"])
             await executor.run_command(["git", "config", "user.email", "sakura@sakura.ai"])

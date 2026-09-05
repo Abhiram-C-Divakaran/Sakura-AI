@@ -12,7 +12,7 @@ import signal
 import asyncio
 import logging
 from typing import Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from database.models import BackgroundTask, utc_now
 from database.db import get_db_context
@@ -22,6 +22,7 @@ from tasks.task_manager import (
     execute_doc_summary,
     execute_dataset_analysis,
     execute_web_research,
+    execute_scheduled_task_job,
     emit_task_update,
 )
 from llm.router import LLMRouter
@@ -32,6 +33,8 @@ logger = logging.getLogger("sakura.worker")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 TASK_QUEUE_NAME = "sakura:tasks:queue"
 MAX_RETRIES = 3
+LEASE_DURATION_SECONDS = 60
+HEARTBEAT_INTERVAL_SECONDS = 15
 
 
 def get_sync_redis():
@@ -67,29 +70,34 @@ class DurableTaskWorker:
 
     def recover_stale_tasks(self) -> int:
         """
-        Recovers tasks orphaned in 'Running' or 'Starting' status from crashed or restarted workers.
+        Recovers tasks orphaned in 'Running' or 'Starting' status whose lease has expired.
+        Never requeues an active worker's task whose heartbeat is healthy.
         Re-queues them if retries remain, or marks them Failed.
         """
         logger.info(f"Worker {self.worker_id} performing stale task recovery check...")
         recovered_count = 0
+        now = utc_now()
         with get_db_context() as db:
             stale_tasks = db.query(BackgroundTask).filter(
-                BackgroundTask.status.in_(["Running", "Starting"])
+                BackgroundTask.status.in_(["Running", "Starting"]),
+                BackgroundTask.lease_expires_at < now
             ).all()
 
             for task in stale_tasks:
                 current_retries = task.retry_count or 0
                 if current_retries >= MAX_RETRIES:
                     task.status = "Failed"
-                    task.error = f"Task exceeded maximum retries ({MAX_RETRIES}). Worker terminated unexpectedly."
-                    task.completed_at = utc_now()
-                    logger.warning(f"Task {task.id} failed after exceeding max retries.")
+                    task.error = f"Task exceeded maximum retries ({MAX_RETRIES}). Lease expired without heartbeat."
+                    task.completed_at = now
+                    logger.warning(f"Task {task.id} failed after lease expiration and exceeding max retries.")
                 else:
                     task.status = "Queued"
                     task.retry_count = current_retries + 1
                     task.worker_id = None
                     task.started_at = None
-                    logger.info(f"Task {task.id} recovered from stale state and re-queued (retry {task.retry_count}).")
+                    task.heartbeat_at = None
+                    task.lease_expires_at = None
+                    logger.info(f"Task {task.id} lease expired and recovered to Queued (retry {task.retry_count}).")
                     recovered_count += 1
             db.commit()
 
@@ -97,7 +105,7 @@ class DurableTaskWorker:
 
     def claim_next_task(self) -> Optional[BackgroundTask]:
         """
-        Atomically claims a queued task for this worker.
+        Atomically claims a queued task for this worker with lease and heartbeat timestamps.
         First checks Redis queue, then falls back to DB polling.
         """
         candidate_id_str: Optional[str] = None
@@ -110,6 +118,9 @@ class DurableTaskWorker:
             except Exception as e:
                 logger.debug(f"Redis pop error: {e}")
 
+        now = utc_now()
+        lease_exp = now + timedelta(seconds=LEASE_DURATION_SECONDS)
+
         # 2. If Redis had a task ID, try to claim it atomically in DB
         if candidate_id_str:
             try:
@@ -121,7 +132,9 @@ class DurableTaskWorker:
                     ).update({
                         BackgroundTask.status: "Running",
                         BackgroundTask.worker_id: self.worker_id,
-                        BackgroundTask.started_at: utc_now()
+                        BackgroundTask.started_at: now,
+                        BackgroundTask.heartbeat_at: now,
+                        BackgroundTask.lease_expires_at: lease_exp
                     })
                     db.commit()
                     if rows > 0:
@@ -144,7 +157,9 @@ class DurableTaskWorker:
             ).update({
                 BackgroundTask.status: "Running",
                 BackgroundTask.worker_id: self.worker_id,
-                BackgroundTask.started_at: utc_now()
+                BackgroundTask.started_at: now,
+                BackgroundTask.heartbeat_at: now,
+                BackgroundTask.lease_expires_at: lease_exp
             })
             db.commit()
 
@@ -154,7 +169,7 @@ class DurableTaskWorker:
         return None
 
     async def execute_task(self, task: BackgroundTask):
-        """Dispatches claimed task to its respective execution handler."""
+        """Dispatches claimed task to its respective execution handler with live heartbeat renewal."""
         task_id = task.id
         user_id = task.user_id
         task_type = task.type
@@ -165,13 +180,42 @@ class DurableTaskWorker:
         # Check for immediate cancellation
         with get_db_context() as db:
             current = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
-            if not current or current.status == "Cancelled":
+            if not current or current.cancel_requested or current.status == "Cancelled":
                 logger.info(f"Task {task_id} was cancelled before execution started.")
+                await update_task_state(task_id, "Cancelled", 100)
                 return
 
-        await update_task_state(task_id, "Running", 10)
+        # Start periodic background heartbeat loop to keep lease active
+        heartbeat_stop = asyncio.Event()
+
+        async def _heartbeat_loop():
+            while not heartbeat_stop.is_set():
+                try:
+                    await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+                    if heartbeat_stop.is_set():
+                        break
+                    with get_db_context() as db:
+                        hb_now = utc_now()
+                        hb_lease = hb_now + timedelta(seconds=LEASE_DURATION_SECONDS)
+                        db.query(BackgroundTask).filter(
+                            BackgroundTask.id == task_id,
+                            BackgroundTask.worker_id == self.worker_id,
+                            BackgroundTask.status == "Running"
+                        ).update({
+                            BackgroundTask.heartbeat_at: hb_now,
+                            BackgroundTask.lease_expires_at: hb_lease
+                        })
+                        db.commit()
+                except asyncio.CancelledError:
+                    break
+                except Exception as ex:
+                    logger.warning(f"Heartbeat update failed for task {task_id}: {ex}")
+
+        hb_coro = asyncio.create_task(_heartbeat_loop())
 
         try:
+            await update_task_state(task_id, "Running", 10)
+
             if task_type == "code_analysis":
                 await execute_code_analysis(task_id, user_id, payload, self.router)
             elif task_type == "doc_summary":
@@ -180,6 +224,8 @@ class DurableTaskWorker:
                 await execute_dataset_analysis(task_id, user_id, payload, self.router)
             elif task_type == "web_research":
                 await execute_web_research(task_id, user_id, payload, self.router)
+            elif task_type == "scheduled_run":
+                await execute_scheduled_task_job(task_id, user_id, payload, self.router)
             else:
                 await update_task_state(task_id, "Failed", 100, error=f"Unknown task type: {task_type}")
 
@@ -190,6 +236,13 @@ class DurableTaskWorker:
         except Exception as e:
             logger.error(f"Error executing task {task_id}: {e}", exc_info=True)
             await update_task_state(task_id, "Failed", 100, error=str(e))
+        finally:
+            heartbeat_stop.set()
+            hb_coro.cancel()
+            try:
+                await hb_coro
+            except asyncio.CancelledError:
+                pass
 
     async def run(self, max_iterations: Optional[int] = None):
         """Main worker loop."""

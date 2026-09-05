@@ -84,8 +84,23 @@ async def get_system_capabilities(
 
     # 6. Embeddings diagnostics
     embeddings_configured = bool(openai_key)
+    rag_status = "AVAILABLE" if embeddings_configured else "DEGRADED"
 
-    # 7. Subsystems map for PluginsView
+    # 7. Image generation diagnostics
+    if openai_key:
+        image_gen_status = "AVAILABLE"
+        image_provider = "openai"
+        image_model = "dall-e-3"
+    elif not is_production:
+        image_gen_status = "DEGRADED"
+        image_provider = "pollinations-flux"
+        image_model = "flux-schnell"
+    else:
+        image_gen_status = "NOT_CONFIGURED"
+        image_provider = None
+        image_model = None
+
+    # 8. Subsystems map for PluginsView
     subsystems = {
         "sakura_code": {
             "status": sandbox_subsystem_status,
@@ -94,14 +109,14 @@ async def get_system_capabilities(
             "verified_sandbox": bool(sandbox_status.get("production_safe"))
         },
         "image_gen": {
-            "status": "AVAILABLE",
-            "provider": "pollinations-flux",
-            "model": "flux-schnell",
-            "editing_available": True,
-            "upscale_available": True
+            "status": image_gen_status,
+            "provider": image_provider,
+            "model": image_model,
+            "editing_available": False,
+            "upscale_available": False
         },
         "rag_engine": {
-            "status": "AVAILABLE",
+            "status": rag_status,
             "dense_embeddings": embeddings_configured,
             "lexical_bm25": True,
             "retrieval_mode": "hybrid_rrf" if embeddings_configured else "okapi_bm25_lexical"
@@ -141,12 +156,12 @@ async def get_system_capabilities(
         },
         "web_search": search_info,
         "image_generation": {
-            "available": True,
-            "provider": "pollinations-flux",
-            "model": "flux-schnell",
-            "editing_available": True,
-            "upscale_available": True,
-            "status": "AVAILABLE"
+            "available": image_gen_status in ("AVAILABLE", "DEGRADED"),
+            "provider": image_provider,
+            "model": image_model,
+            "editing_available": False,
+            "upscale_available": False,
+            "status": image_gen_status
         },
         "realtime": await ws_manager.get_status(),
         "providers": available_providers,

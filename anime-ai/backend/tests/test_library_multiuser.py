@@ -17,6 +17,8 @@ class TestLibraryMultiuser(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         Base.metadata.create_all(bind=engine)
+        from main import app
+        app.dependency_overrides.clear()
         cls.client = TestClient(app)
 
         # Create user A

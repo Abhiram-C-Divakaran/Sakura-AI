@@ -100,8 +100,8 @@ class TestPlatformFeatures(unittest.TestCase):
 
         # 3. Trigger manual execution
         run_res = self.client.post(f"/api/v1/scheduled/{task_id}/run", headers=self.headers)
-        self.assertEqual(run_res.status_code, 200)
-        self.assertEqual(run_res.json()["status"], "triggered")
+        self.assertIn(run_res.status_code, [200, 202])
+        self.assertIn(run_res.json()["status"], ["triggered", "QUEUED"])
 
         # 4. Delete task
         del_res = self.client.delete(f"/api/v1/scheduled/{task_id}", headers=self.headers)
