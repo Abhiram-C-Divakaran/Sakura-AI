@@ -90,7 +90,16 @@ class TestCodingSubsystem(unittest.TestCase):
         if not SandboxManager.is_docker_available():
             self.skipTest("Docker daemon is not available on this host.")
 
-        docker_runtime = DockerSandboxRuntime(workspace_root=self.temp_dir, default_timeout_seconds=30)
+        import subprocess
+        img_check = subprocess.run(
+            ["docker", "image", "inspect", DockerSandboxRuntime.DEFAULT_IMAGE],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        if img_check.returncode != 0:
+            self.skipTest(f"Docker image {DockerSandboxRuntime.DEFAULT_IMAGE} not available locally.")
+
+        docker_runtime = DockerSandboxRuntime(workspace_root=self.temp_dir, default_timeout_seconds=10)
         executor = SandboxExecutor(workspace_root=self.temp_dir, runtime=docker_runtime)
         # Use in-container valid python command
         res = executor.execute(["python", "-c", "print('SAKURA_CODE_OK')"])
