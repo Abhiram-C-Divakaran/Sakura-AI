@@ -32,7 +32,7 @@ def upgrade() -> None:
             if 'heartbeat_at' not in existing_cols:
                 batch_op.add_column(sa.Column('heartbeat_at', sa.DateTime(timezone=True), nullable=True))
             if 'cancel_requested' not in existing_cols:
-                batch_op.add_column(sa.Column('cancel_requested', sa.Boolean(), nullable=False, server_default=sa.text('0')))
+                batch_op.add_column(sa.Column('cancel_requested', sa.Boolean(), nullable=False, server_default=sa.false()))
 
     # 2. Update scheduled_task_runs with scheduled_for and occurrence index
     if insp.has_table('scheduled_task_runs'):

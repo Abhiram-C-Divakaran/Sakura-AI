@@ -79,7 +79,7 @@ def upgrade() -> None:
         conv_cols = [c['name'] for c in insp.get_columns('conversations')]
         with op.batch_alter_table('conversations', schema=None) as batch_op:
             if 'pinned' not in conv_cols:
-                batch_op.add_column(sa.Column('pinned', sa.Boolean(), nullable=True, server_default=sa.text('0')))
+                batch_op.add_column(sa.Column('pinned', sa.Boolean(), nullable=True, server_default=sa.false()))
             if 'pinned_at' not in conv_cols:
                 batch_op.add_column(sa.Column('pinned_at', sa.DateTime(timezone=True), nullable=True))
             if 'archived_at' not in conv_cols:
@@ -93,7 +93,7 @@ def upgrade() -> None:
             sa.Column('conversation_id', sa.UUID(), sa.ForeignKey('conversations.id', ondelete='CASCADE'), nullable=False),
             sa.Column('user_id', sa.UUID(), sa.ForeignKey('users.id', ondelete='CASCADE'), nullable=False),
             sa.Column('share_token', sa.String(64), unique=True, nullable=False),
-            sa.Column('is_active', sa.Boolean(), nullable=True, server_default=sa.text('1')),
+            sa.Column('is_active', sa.Boolean(), nullable=True, server_default=sa.true()),
             sa.Column('expires_at', sa.DateTime(timezone=True), nullable=True),
             sa.Column('revoked_at', sa.DateTime(timezone=True), nullable=True),
             sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.func.now()),
@@ -107,7 +107,7 @@ def upgrade() -> None:
             if 'token' in cs_cols and 'share_token' not in cs_cols:
                 batch_op.alter_column('token', new_column_name='share_token', existing_type=sa.String(64), nullable=False)
             if 'is_active' not in cs_cols:
-                batch_op.add_column(sa.Column('is_active', sa.Boolean(), nullable=True, server_default=sa.text('1')))
+                batch_op.add_column(sa.Column('is_active', sa.Boolean(), nullable=True, server_default=sa.true()))
             if 'expires_at' not in cs_cols:
                 batch_op.add_column(sa.Column('expires_at', sa.DateTime(timezone=True), nullable=True))
             if 'revoked_at' not in cs_cols:

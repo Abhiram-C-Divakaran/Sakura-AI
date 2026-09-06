@@ -34,7 +34,7 @@ def upgrade() -> None:
                 pass
             with op.batch_alter_table('documents', schema=None) as batch_op:
                 if needs_kb:
-                    batch_op.add_column(sa.Column('is_knowledge_base', sa.Boolean(), nullable=False, server_default=sa.text('0')))
+                    batch_op.add_column(sa.Column('is_knowledge_base', sa.Boolean(), nullable=False, server_default=sa.false()))
                     batch_op.create_index('ix_documents_is_knowledge_base', ['is_knowledge_base'], unique=False)
                 if needs_status:
                     batch_op.add_column(sa.Column('indexing_status', sa.String(length=50), nullable=False, server_default='UPLOADED'))
