@@ -8,9 +8,25 @@ on:
 
 jobs:
   backend-tests:
-    name: Backend Tests & Lint
+    name: Backend Tests & Schema Verification
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg15
+        env:
+          POSTGRES_USER: sakura_ci
+          POSTGRES_PASSWORD: sakura_ci_password
+          POSTGRES_DB: sakura_ci_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     defaults:
       run:
         working-directory: anime-ai/backend
@@ -18,8 +34,9 @@ jobs:
       JWT_SECRET: "test-secret-key-for-ci-minimum-32-chars-ok"
       INTEGRATION_ENCRYPTION_KEY: "test_integration_key_32_chars_ok!"
       SAKURA_SANDBOX_SERVICE_TOKEN: "test_sandbox_service_token_ci"
-      ENVIRONMENT: "development"
-      DATABASE_URL: "sqlite:///./ci_test.db"
+      ENVIRONMENT: "test"
+      SAKURA_EMBEDDED_WORKER: "false"
+      SAKURA_EMBEDDED_SCHEDULER: "false"
 
     steps:
       - name: Checkout Code
@@ -30,15 +47,28 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
+          cache-dependency-path: anime-ai/backend/requirements.txt
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Validate Alembic Migrations
+      - name: Validate Python Static Compilation
+        run: |
+          python -m compileall -q .
+
+      - name: Validate Alembic Migrations on PostgreSQL
+        env:
+          DATABASE_URL: "postgresql://sakura_ci:sakura_ci_password@localhost:5432/sakura_ci_db"
         run: |
           python -m alembic upgrade head
+
+      - name: Run Schema Parity Test on PostgreSQL
+        env:
+          DATABASE_URL: "postgresql://sakura_ci:sakura_ci_password@localhost:5432/sakura_ci_db"
+        run: |
+          python -m unittest tests/test_schema_parity.py -v
 
       - name: Validate Docker Compose Configuration
         working-directory: anime-ai
@@ -50,7 +80,9 @@ jobs:
         run: |
           docker compose -f docker-compose.prod.yml config
 
-      - name: Run Test Suite
+      - name: Run Backend Test Suite
+        env:
+          DATABASE_URL: "sqlite:///./ci_test.db"
         run: |
           python -m unittest discover -s tests -p "test_*.py" -v
 
@@ -71,10 +103,10 @@ jobs:
         with:
           node-version: 20
           cache: 'npm'
-          cache-dependency-path: anime-ai/frontend/package.json
+          cache-dependency-path: anime-ai/frontend/package-lock.json
 
       - name: Install Dependencies
-        run: npm install
+        run: npm ci
 
       - name: TypeScript Check
         run: npm run typecheck

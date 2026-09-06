@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 import os
 import sys
 import uuid
@@ -81,16 +82,17 @@ class TestDurableTasks(unittest.IsolatedAsyncioTestCase):
 
     async def test_web_research_truthful_failure_when_empty_or_unavailable(self):
         """Web research must fail truthfully without fabricating research results if query is empty."""
-        task = TaskManager.create_task(
-            user_id=self.user1_id,
-            task_type="web_research",
-            title="Empty Query Research",
-            payload={"query": "   "}
-        )
-        task_id_str = str(task.id)
-        from tasks.task_manager import ACTIVE_ASYNCIO_TASKS
-        if task_id_str in ACTIVE_ASYNCIO_TASKS:
-            await ACTIVE_ASYNCIO_TASKS[task_id_str]
+        with patch.dict(os.environ, {"SAKURA_EMBEDDED_WORKER": "true"}):
+            task = TaskManager.create_task(
+                user_id=self.user1_id,
+                task_type="web_research",
+                title="Empty Query Research",
+                payload={"query": "   "}
+            )
+            task_id_str = str(task.id)
+            from tasks.task_manager import ACTIVE_ASYNCIO_TASKS
+            if task_id_str in ACTIVE_ASYNCIO_TASKS:
+                await ACTIVE_ASYNCIO_TASKS[task_id_str]
 
         fetched = TaskManager.get_task(task.id, self.user1_id)
         self.assertEqual(fetched.status, "Failed")

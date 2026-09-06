@@ -57,7 +57,7 @@ services:
   sandbox-executor:
     build:
       context: ./backend
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.sandbox-executor
     container_name: sakura_sandbox_executor
     restart: always
     user: "0:0"
@@ -66,7 +66,7 @@ services:
       - SAKURA_SANDBOX_SERVICE_TOKEN=${SAKURA_SANDBOX_SERVICE_TOKEN:?Production requires SAKURA_SANDBOX_SERVICE_TOKEN}
       - SAKURA_SANDBOX_IMAGE=${SAKURA_SANDBOX_IMAGE:-sakura-sandbox:${SAKURA_SANDBOX_IMAGE_TAG:-1.0.0}}
       - SAKURA_WORKSPACE_ROOT=/workspaces
-      - SAKURA_WORKSPACES_VOLUME=sakura_workspaces
+      - SAKURA_WORKSPACES_VOLUME=${SAKURA_WORKSPACES_VOLUME_NAME:-sakura_workspaces}
       - ENVIRONMENT=production
       - PORT=9000
     volumes:
@@ -74,7 +74,7 @@ services:
       - sakura_workspaces:/workspaces
     # Internal port 9000 only; not exposed to host
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import httpx; r = httpx.get('http://localhost:9000/health'); exit(0 if r.status_code == 200 else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import httpx; r = httpx.get('http://localhost:9000/readiness'); exit(0 if r.status_code == 200 else 1)\""]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -187,3 +187,4 @@ volumes:
   postgres_data:
   redis_data:
   sakura_workspaces:
+    name: ${SAKURA_WORKSPACES_VOLUME_NAME:-sakura_workspaces}

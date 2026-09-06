@@ -13,7 +13,7 @@ import shutil
 import hmac
 import asyncio
 import subprocess
-from typing import Dict, Any, Optional, List, Union
+from typing import Dict, Any, Optional, List, Union, Tuple
 from fastapi import FastAPI, Header, HTTPException, Depends, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -32,11 +32,15 @@ SANDBOX_IMAGE = os.getenv("SAKURA_SANDBOX_IMAGE", "python:3.11-slim")
 CPU_LIMIT = float(os.getenv("SAKURA_SANDBOX_CPUS", "2.0"))
 MEMORY_MB = int(os.getenv("SAKURA_SANDBOX_MEMORY_MB", "512"))
 PIDS_LIMIT = int(os.getenv("SAKURA_SANDBOX_PIDS", "64"))
-MAX_OUTPUT_BYTES = int(os.getenv("SAKURA_MAX_OUTPUT_BYTES", str(512 * 1024)))
+CAPTURE_LIMIT_BYTES = int(os.getenv("SAKURA_CAPTURE_LIMIT_BYTES", str(512 * 1024)))      # 512 KiB
+HARD_OUTPUT_LIMIT_BYTES = int(os.getenv("SAKURA_HARD_OUTPUT_LIMIT_BYTES", str(5 * 1024 * 1024))) # 5 MiB
+MAX_OUTPUT_BYTES = CAPTURE_LIMIT_BYTES
 WORKSPACE_ROOT = os.path.realpath(os.path.abspath(os.getenv("SAKURA_WORKSPACE_ROOT", "/workspaces")))
 WORKSPACES_VOLUME = os.getenv("SAKURA_WORKSPACES_VOLUME", "")
 
 os.makedirs(WORKSPACE_ROOT, exist_ok=True)
+
+_readiness_cache: Dict[str, Any] = {"last_check": 0.0, "result": None}
 
 
 def check_docker_operational() -> bool:
@@ -55,6 +59,25 @@ def check_docker_operational() -> bool:
         return res.returncode == 0
     except Exception:
         return False
+
+
+def get_volume_host_mountpoint(volume_name: str) -> Optional[str]:
+    """Inspects Docker volume mountpoint on host if running in Docker."""
+    if not volume_name or not check_docker_operational():
+        return None
+    try:
+        res = subprocess.run(
+            ["docker", "volume", "inspect", volume_name, "--format", "{{ .Mountpoint }}"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return None
 
 
 def verify_service_token(
@@ -83,7 +106,6 @@ def verify_service_token(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Sandbox service token not configured in production environment."
             )
-        # Allow dev/test when no token is explicitly configured
         return True
 
     if not provided_token:
@@ -123,30 +145,51 @@ class TestExecutionRequest(BaseModel):
     environment: Optional[Dict[str, str]] = None
 
 
-async def _read_stream_bounded(stream: asyncio.StreamReader, max_bytes: int):
-    """Reads stream asynchronously in chunks up to max_bytes, returning (data_bytes, is_truncated)."""
-    chunks = []
-    total = 0
-    truncated = False
-    while True:
-        chunk = await stream.read(4096)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total <= max_bytes:
-            chunks.append(chunk)
-        else:
-            overflow = max_bytes - (total - len(chunk))
-            if overflow > 0:
-                chunks.append(chunk[:overflow])
-            truncated = True
-            break
-    return b"".join(chunks), truncated
+class StreamDrainer:
+    """
+    Asynchronously drains an output stream into a bounded memory buffer while
+    continuing to read until EOF. Prevents OS pipe deadlock when output exceeds capture limit,
+    and signals hard limit violations.
+    """
+    def __init__(self, capture_limit: int, hard_limit: int, on_hard_limit_exceeded=None):
+        self.capture_limit = capture_limit
+        self.hard_limit = hard_limit
+        self.on_hard_limit_exceeded = on_hard_limit_exceeded
+        self.captured = bytearray()
+        self.total_bytes = 0
+        self.truncated = False
+        self.hard_limit_exceeded = False
+
+    async def read(self, stream: Optional[asyncio.StreamReader]) -> bytes:
+        if not stream:
+            return b""
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                break
+            chunk_len = len(chunk)
+            self.total_bytes += chunk_len
+
+            if len(self.captured) < self.capture_limit:
+                rem = self.capture_limit - len(self.captured)
+                self.captured.extend(chunk[:rem])
+                if chunk_len > rem:
+                    self.truncated = True
+            else:
+                self.truncated = True
+
+            if self.total_bytes > self.hard_limit:
+                self.hard_limit_exceeded = True
+                self.truncated = True
+                if self.on_hard_limit_exceeded:
+                    self.on_hard_limit_exceeded()
+                break
+        return bytes(self.captured)
 
 
 @app.get("/health")
 async def health():
-    """Liveness check returning container isolation status."""
+    """Liveness check returning process alive and docker availability."""
     docker_ok = check_docker_operational()
     return {
         "status": "ok" if docker_ok else "degraded",
@@ -160,34 +203,104 @@ async def health():
 
 @app.get("/readiness")
 async def readiness():
-    """Readiness probe validating Docker operational status, runtime image, and workspace root."""
+    """
+    Readiness probe validating:
+    - Docker daemon reachable
+    - Configured sandbox image exists
+    - Image can start and execute code
+    - Execution user is non-root
+    - Expected binaries exist (python, git, node, npm)
+    - Workspace storage available
+    """
+    now = time.time()
+    if _readiness_cache["result"] is not None and (now - _readiness_cache["last_check"] < 30):
+        is_ready, payload = _readiness_cache["result"]
+        if not is_ready:
+            return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=payload)
+        return payload
+
+    env = os.getenv("ENVIRONMENT", "development").lower()
+    is_prod = env in ("production", "prod")
+
     docker_ok = check_docker_operational()
     image_ok = False
+    container_can_start = False
+    non_root = False
+    binaries = {"python": False, "git": False, "node": False, "npm": False}
+
     if docker_ok:
         try:
-            res = subprocess.run(
+            inspect_res = subprocess.run(
                 ["docker", "image", "inspect", SANDBOX_IMAGE],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=3,
                 check=False
             )
-            image_ok = (res.returncode == 0)
+            image_ok = (inspect_res.returncode == 0)
         except Exception:
             image_ok = False
 
+        if image_ok:
+            smoke_name = f"sakura-smoke-{uuid.uuid4().hex[:8]}"
+            try:
+                smoke_res = subprocess.run(
+                    [
+                        "docker", "run", "--rm",
+                        "--name", smoke_name,
+                        "--network", "none",
+                        "--security-opt", "no-new-privileges:true",
+                        "--cap-drop", "ALL",
+                        SANDBOX_IMAGE,
+                        "sh", "-c",
+                        "id -u && which python3 python git node npm"
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False
+                )
+                if smoke_res.returncode == 0:
+                    container_can_start = True
+                    lines = smoke_res.stdout.strip().splitlines()
+                    if lines:
+                        uid_str = lines[0].strip()
+                        non_root = (uid_str != "0")
+                        out_text = smoke_res.stdout
+                        binaries["python"] = ("python" in out_text)
+                        binaries["git"] = ("git" in out_text)
+                        binaries["node"] = ("node" in out_text)
+                        binaries["npm"] = ("npm" in out_text)
+            except Exception:
+                pass
+            finally:
+                try:
+                    subprocess.run(["docker", "rm", "-f", smoke_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+                except Exception:
+                    pass
+
     ws_root_ok = os.path.isdir(WORKSPACE_ROOT)
-    is_ready = docker_ok and image_ok and ws_root_ok
+
+    if is_prod:
+        is_ready = docker_ok and image_ok and container_can_start and non_root and all(binaries.values()) and ws_root_ok
+    else:
+        is_ready = docker_ok and image_ok and ws_root_ok
 
     payload = {
         "ready": is_ready,
         "docker_available": docker_ok,
         "image_available": image_ok,
+        "container_can_start": container_can_start,
+        "non_root_execution": non_root,
+        "binaries": binaries,
         "workspace_root_available": ws_root_ok,
         "workspace_root": WORKSPACE_ROOT,
         "image": SANDBOX_IMAGE,
-        "timestamp": time.time()
+        "timestamp": now
     }
+    _readiness_cache["last_check"] = now
+    _readiness_cache["result"] = (is_ready, payload)
+
     if not is_ready:
         return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=payload)
     return payload
@@ -198,7 +311,10 @@ async def execute_command(
     req: ExecuteRequest,
     _auth: bool = Depends(verify_service_token)
 ):
-    """Executes an arbitrary shell command in an ephemeral isolated Docker container."""
+    """
+    Executes an arbitrary shell command in an ephemeral isolated Docker container.
+    Guarantees strict per-workspace isolation (child mounts only /workspace, never /workspaces).
+    """
     start_time = time.time()
     timeout = req.timeout_seconds or 60
     env = os.getenv("ENVIRONMENT", "development").lower()
@@ -221,27 +337,35 @@ async def execute_command(
             "timed_out": False,
             "blocked": True,
             "isolation_unavailable": False,
-            "output_truncated": False
+            "output_truncated": False,
+            "output_limit_exceeded": False
         }
 
-    # 2. Workspace resolution & path boundary checks
+    # 2. Strict UUID workspace validation & canonical path resolution
+    canonical_ws_id = None
     if req.workspace_id:
-        if not re.match(r"^[a-zA-Z0-9_\-]+$", req.workspace_id):
+        try:
+            ws_uuid = uuid.UUID(str(req.workspace_id).strip())
+            canonical_ws_id = str(ws_uuid)
+        except (ValueError, TypeError, AttributeError):
             return {
                 "success": False,
                 "tool": req.tool_name,
                 "command": cmd_display,
                 "exit_code": -1,
                 "stdout": "",
-                "stderr": "Security Error: Invalid workspace ID format.",
+                "stderr": "Security Error: workspace_id must be a valid UUID format.",
                 "duration_ms": 0,
                 "timed_out": False,
                 "blocked": True,
                 "isolation_unavailable": False,
-                "output_truncated": False
+                "output_truncated": False,
+                "output_limit_exceeded": False
             }
-        canonical_ws = os.path.realpath(os.path.join(WORKSPACE_ROOT, req.workspace_id))
-        if not canonical_ws.startswith(WORKSPACE_ROOT + os.sep) and canonical_ws != WORKSPACE_ROOT:
+
+        canonical_ws = os.path.realpath(os.path.join(WORKSPACE_ROOT, canonical_ws_id))
+        canonical_root = os.path.realpath(WORKSPACE_ROOT)
+        if os.path.commonpath([canonical_ws, canonical_root]) != canonical_root or canonical_ws == canonical_root:
             return {
                 "success": False,
                 "tool": req.tool_name,
@@ -253,7 +377,8 @@ async def execute_command(
                 "timed_out": False,
                 "blocked": True,
                 "isolation_unavailable": False,
-                "output_truncated": False
+                "output_truncated": False,
+                "output_limit_exceeded": False
             }
         if not os.path.exists(canonical_ws):
             return {
@@ -262,15 +387,15 @@ async def execute_command(
                 "command": cmd_display,
                 "exit_code": -1,
                 "stdout": "",
-                "stderr": f"Workspace Error: Workspace ID '{req.workspace_id}' does not exist on disk.",
+                "stderr": f"Workspace Error: Workspace ID '{canonical_ws_id}' does not exist on disk.",
                 "duration_ms": 0,
                 "timed_out": False,
                 "blocked": True,
                 "isolation_unavailable": False,
-                "output_truncated": False
+                "output_truncated": False,
+                "output_limit_exceeded": False
             }
         resolved_workspace = canonical_ws
-        use_shared_volume = bool(WORKSPACES_VOLUME)
     else:
         if is_prod:
             return {
@@ -284,7 +409,8 @@ async def execute_command(
                 "timed_out": False,
                 "blocked": True,
                 "isolation_unavailable": False,
-                "output_truncated": False
+                "output_truncated": False,
+                "output_limit_exceeded": False
             }
         raw_path = os.path.realpath(os.path.abspath(req.workspace_path or "/workspace"))
         prohibited = ["/", "/etc", "/var/run", "/proc", "/sys", "/dev", "C:\\", "C:\\Windows"]
@@ -300,10 +426,10 @@ async def execute_command(
                 "timed_out": False,
                 "blocked": True,
                 "isolation_unavailable": False,
-                "output_truncated": False
+                "output_truncated": False,
+                "output_limit_exceeded": False
             }
         resolved_workspace = raw_path
-        use_shared_volume = False
 
     # 3. Working directory setup
     clean_rel = ""
@@ -323,7 +449,8 @@ async def execute_command(
                 "timed_out": False,
                 "blocked": True,
                 "isolation_unavailable": False,
-                "output_truncated": False
+                "output_truncated": False,
+                "output_limit_exceeded": False
             }
 
     # 4. Check docker daemon availability
@@ -339,10 +466,11 @@ async def execute_command(
             "timed_out": False,
             "blocked": False,
             "isolation_unavailable": True,
-            "output_truncated": False
+            "output_truncated": False,
+            "output_limit_exceeded": False
         }
 
-    # 5. Command invocation & Docker flags
+    # 5. Build Docker mount and execution specifications
     if isinstance(req.command, list):
         cmd_args = req.command
     else:
@@ -351,14 +479,17 @@ async def execute_command(
     network_flag = "bridge" if req.allow_network else "none"
     mount_mode = "ro" if req.read_only else "rw"
 
-    if use_shared_volume:
-        mount_spec = f"{WORKSPACES_VOLUME}:/workspaces:{mount_mode}"
-        container_workdir = f"/workspaces/{req.workspace_id}/{clean_rel}" if clean_rel else f"/workspaces/{req.workspace_id}"
+    # PER-WORKSPACE ISOLATION: Mount ONLY this specific workspace to /workspace.
+    # Never mount the parent /workspaces volume.
+    vol_mountpoint = get_volume_host_mountpoint(WORKSPACES_VOLUME) if WORKSPACES_VOLUME else None
+    if vol_mountpoint and canonical_ws_id:
+        host_target = f"{vol_mountpoint}/{canonical_ws_id}"
     else:
-        mount_spec = f"{resolved_workspace}:/workspace:{mount_mode}"
-        container_workdir = f"/workspace/{clean_rel}" if clean_rel else "/workspace"
+        host_target = resolved_workspace
 
-    container_name = f"sakura-exec-{uuid.uuid4().hex[:12]}"
+    mount_spec = f"{host_target}:/workspace:{mount_mode}"
+    container_workdir = f"/workspace/{clean_rel}" if clean_rel else "/workspace"
+    container_name = f"sakura-exec-{uuid.uuid4().hex}"
 
     docker_cmd = [
         "docker", "run", "--rm",
@@ -374,8 +505,8 @@ async def execute_command(
         "-w", container_workdir
     ]
 
-    # Add environment variables safely (scrubbing secrets)
-    safe_env = WorkspaceSecurity.sanitize_environment(req.environment or {})
+    # Explicit allowlist environment policy (no os.environ inheritance)
+    safe_env = WorkspaceSecurity.build_safe_child_environment(req.environment or {})
     for k, v in safe_env.items():
         docker_cmd.extend(["-e", f"{k}={v}"])
 
@@ -383,7 +514,11 @@ async def execute_command(
     docker_cmd.extend(cmd_args)
 
     proc = None
-    output_truncated = False
+    timed_out = False
+    output_limit_exceeded = False
+    stdout_drainer = None
+    stderr_drainer = None
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *docker_cmd,
@@ -391,61 +526,85 @@ async def execute_command(
             stderr=asyncio.subprocess.PIPE
         )
 
-        try:
-            # Incremental bounded streaming consumption
-            async def consume_streams():
-                stdout_fut = asyncio.create_task(_read_stream_bounded(proc.stdout, MAX_OUTPUT_BYTES))
-                stderr_fut = asyncio.create_task(_read_stream_bounded(proc.stderr, MAX_OUTPUT_BYTES))
-                stdout_res, stderr_res = await asyncio.gather(stdout_fut, stderr_fut)
-                await proc.wait()
-                return stdout_res, stderr_res
-
-            (stdout_bytes, stdout_trunc), (stderr_bytes, stderr_trunc) = await asyncio.wait_for(
-                consume_streams(),
-                timeout=timeout
-            )
-            output_truncated = stdout_trunc or stderr_trunc
-
-            duration_ms = int((time.time() - start_time) * 1000)
-            stdout_str = stdout_bytes.decode("utf-8", errors="replace")
-            stderr_str = stderr_bytes.decode("utf-8", errors="replace")
-            if stdout_trunc:
-                stdout_str += f"\n[OUTPUT TRUNCATED: Exceeded maximum allowed buffer limit of {MAX_OUTPUT_BYTES} bytes]"
-            if stderr_trunc:
-                stderr_str += f"\n[OUTPUT TRUNCATED: Exceeded maximum allowed buffer limit of {MAX_OUTPUT_BYTES} bytes]"
-
-            return {
-                "success": proc.returncode == 0,
-                "tool": req.tool_name,
-                "command": cmd_display,
-                "exit_code": proc.returncode,
-                "stdout": stdout_str,
-                "stderr": stderr_str,
-                "duration_ms": duration_ms,
-                "timed_out": False,
-                "blocked": False,
-                "isolation_unavailable": False,
-                "output_truncated": output_truncated
-            }
-        except asyncio.TimeoutError:
+        def kill_runaway_container():
+            nonlocal output_limit_exceeded
+            output_limit_exceeded = True
             try:
-                proc.kill()
+                subprocess.run(["docker", "kill", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
             except Exception:
                 pass
-            duration_ms = int((time.time() - start_time) * 1000)
-            return {
-                "success": False,
-                "tool": req.tool_name,
-                "command": cmd_display,
-                "exit_code": -1,
-                "stdout": "",
-                "stderr": f"Execution timed out after {timeout} seconds.",
-                "duration_ms": duration_ms,
-                "timed_out": True,
-                "blocked": False,
-                "isolation_unavailable": False,
-                "output_truncated": False
-            }
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        stdout_drainer = StreamDrainer(
+            capture_limit=CAPTURE_LIMIT_BYTES,
+            hard_limit=HARD_OUTPUT_LIMIT_BYTES,
+            on_hard_limit_exceeded=kill_runaway_container
+        )
+        stderr_drainer = StreamDrainer(
+            capture_limit=CAPTURE_LIMIT_BYTES,
+            hard_limit=HARD_OUTPUT_LIMIT_BYTES,
+            on_hard_limit_exceeded=kill_runaway_container
+        )
+
+        try:
+            async def drain_all():
+                so_task = asyncio.create_task(stdout_drainer.read(proc.stdout))
+                se_task = asyncio.create_task(stderr_drainer.read(proc.stderr))
+                so_bytes, se_bytes = await asyncio.gather(so_task, se_task)
+                await proc.wait()
+                return so_bytes, se_bytes
+
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(drain_all(), timeout=timeout)
+        except asyncio.TimeoutError:
+            timed_out = True
+            try:
+                subprocess.run(["docker", "kill", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            except Exception:
+                pass
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            stdout_bytes = bytes(stdout_drainer.captured) if stdout_drainer else b""
+            stderr_bytes = bytes(stderr_drainer.captured) if stderr_drainer else b""
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        stdout_str = stdout_bytes.decode("utf-8", errors="replace")
+        stderr_str = stderr_bytes.decode("utf-8", errors="replace")
+
+        output_truncated = bool(
+            (stdout_drainer and stdout_drainer.truncated)
+            or (stderr_drainer and stderr_drainer.truncated)
+            or output_limit_exceeded
+        )
+
+        if output_limit_exceeded:
+            stderr_str += f"\n[OUTPUT HARD LIMIT EXCEEDED: Runaway process terminated after exceeding {HARD_OUTPUT_LIMIT_BYTES} bytes]"
+        elif stdout_drainer and stdout_drainer.truncated:
+            stdout_str += f"\n[OUTPUT TRUNCATED: Exceeded maximum allowed buffer limit of {CAPTURE_LIMIT_BYTES} bytes]"
+
+        exit_code = proc.returncode if (proc is not None and not timed_out) else -1
+
+        return {
+            "success": (exit_code == 0) and not timed_out and not output_limit_exceeded,
+            "tool": req.tool_name,
+            "command": cmd_display,
+            "exit_code": exit_code,
+            "stdout": stdout_str,
+            "stderr": stderr_str if not timed_out else (stderr_str + f"\nExecution timed out after {timeout} seconds."),
+            "duration_ms": duration_ms,
+            "timed_out": timed_out,
+            "blocked": False,
+            "isolation_unavailable": False,
+            "output_truncated": output_truncated,
+            "output_limit_exceeded": output_limit_exceeded
+        }
+
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
         return {
@@ -454,26 +613,26 @@ async def execute_command(
             "command": cmd_display,
             "exit_code": -1,
             "stdout": "",
-            "stderr": f"Docker executor failure: {str(e)}",
+            "stderr": f"Execution error: {str(e)}",
             "duration_ms": duration_ms,
             "timed_out": False,
             "blocked": False,
-            "isolation_unavailable": True,
-            "output_truncated": False
+            "isolation_unavailable": False,
+            "output_truncated": False,
+            "output_limit_exceeded": False
         }
     finally:
-        # Guarantee child container is destroyed on completion, timeout, cancellation, or error
-        if check_docker_operational():
-            try:
-                subprocess.run(
-                    ["docker", "rm", "-f", container_name],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=5,
-                    check=False
-                )
-            except Exception:
-                pass
+        # Idempotent cleanup: unconditionally ensure execution container is removed from Docker
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False
+            )
+        except Exception:
+            pass
 
 
 @app.post("/tests")

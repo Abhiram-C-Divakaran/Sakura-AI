@@ -5,25 +5,19 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install system dependencies needed for runtime
+# Dedicated sandbox executor Dockerfile: includes docker.io to interact with Docker daemon
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
     curl \
+    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Create dedicated non-root application user
-RUN groupadd -g 1001 sakura && \
-    useradd -u 1001 -g sakura -s /bin/bash -m sakura
-
 COPY . .
-RUN chown -R sakura:sakura /app
 
-USER sakura
+EXPOSE 9000
 
-EXPOSE 8000
-
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "coding.sandbox_service:app", "--host", "0.0.0.0", "--port", "9000"]

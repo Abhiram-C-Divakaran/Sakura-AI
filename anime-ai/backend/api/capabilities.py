@@ -73,7 +73,7 @@ async def get_system_capabilities(
             github_username = gh_integration.account_name
 
     github_state = "CONNECTED" if github_connected else (
-        "DISCONNECTED" if (github_client_id and github_client_secret) or os.getenv("GITHUB_TOKEN") else "NOT_CONFIGURED"
+        "DISCONNECTED" if (github_client_id and github_client_secret) else "NOT_CONFIGURED"
     )
 
     # 4. Web search diagnostics
@@ -86,19 +86,12 @@ async def get_system_capabilities(
     embeddings_configured = bool(openai_key)
     rag_status = "AVAILABLE" if embeddings_configured else "DEGRADED"
 
-    # 7. Image generation diagnostics
-    if openai_key:
-        image_gen_status = "AVAILABLE"
-        image_provider = "openai"
-        image_model = "dall-e-3"
-    elif not is_production:
-        image_gen_status = "DEGRADED"
-        image_provider = "pollinations-flux"
-        image_model = "flux-schnell"
-    else:
-        image_gen_status = "NOT_CONFIGURED"
-        image_provider = None
-        image_model = None
+    # 7. Image generation diagnostics (runtime source of truth from ImageGenerationEngine)
+    from media.image_engine import ImageGenerationEngine
+    img_status = ImageGenerationEngine.get_status()
+    image_gen_status = img_status.get("status", "AVAILABLE")
+    image_provider = img_status.get("provider", "pollinations")
+    image_model = img_status.get("models", ["flux"])[0]
 
     # 8. Subsystems map for PluginsView
     subsystems = {
@@ -112,8 +105,13 @@ async def get_system_capabilities(
             "status": image_gen_status,
             "provider": image_provider,
             "model": image_model,
+            "models": img_status.get("models", ["flux", "turbo"]),
+            "text_to_image": True,
             "editing_available": False,
-            "upscale_available": False
+            "upscale_available": False,
+            "image_conditioned_edit": False,
+            "true_upscale": False,
+            "variations": True
         },
         "rag_engine": {
             "status": rag_status,
@@ -157,11 +155,17 @@ async def get_system_capabilities(
         "web_search": search_info,
         "image_generation": {
             "available": image_gen_status in ("AVAILABLE", "DEGRADED"),
+            "status": image_gen_status,
             "provider": image_provider,
             "model": image_model,
+            "models": img_status.get("models", ["flux", "turbo"]),
+            "text_to_image": True,
             "editing_available": False,
             "upscale_available": False,
-            "status": image_gen_status
+            "image_conditioned_edit": False,
+            "true_upscale": False,
+            "variations": True,
+            "health_verified_at": img_status.get("health_verified_at")
         },
         "realtime": await ws_manager.get_status(),
         "providers": available_providers,

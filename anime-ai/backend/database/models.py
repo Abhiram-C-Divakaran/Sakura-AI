@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Float, ForeignKey, DateTime, Text, Boolean, Integer, JSON, Index
+from sqlalchemy import Column, String, Float, ForeignKey, DateTime, Text, Boolean, Integer, JSON, Index, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
@@ -288,7 +288,8 @@ class ScheduledTaskRun(Base):
     task = relationship("ScheduledTask", back_populates="runs")
 
     __table_args__ = (
-        Index("ix_scheduled_task_runs_task_occurrence", "task_id", "scheduled_for"),
+        UniqueConstraint("task_id", "scheduled_for", name="uq_scheduled_task_run_occurrence"),
+        Index("ix_scheduled_task_runs_task_occurrence", "task_id", "scheduled_for", unique=True),
     )
 
 

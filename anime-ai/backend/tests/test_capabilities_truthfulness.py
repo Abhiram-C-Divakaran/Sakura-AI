@@ -41,23 +41,20 @@ class TestCapabilitiesTruthfulness(unittest.TestCase):
         app.dependency_overrides.clear()
 
     def test_image_generation_capability_truthful(self):
-        """Image generation capability must reflect actual runtime, not hardcoded available."""
-        with patch.dict(os.environ, {"ENVIRONMENT": "production"}):
-            resp = self.client.get("/api/v1/capabilities")
-            self.assertEqual(resp.status_code, 200)
-            data = resp.json()
-            image_cap = data.get("image_generation", {})
-            self.assertEqual(image_cap.get("status"), "NOT_CONFIGURED")
-            self.assertFalse(image_cap.get("editing_available", True))
-            self.assertFalse(image_cap.get("upscale_available", True))
-
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-mock-key"}):
-            resp = self.client.get("/api/v1/capabilities")
-            self.assertEqual(resp.status_code, 200)
-            data = resp.json()
-            image_cap = data.get("image_generation", {})
-            self.assertEqual(image_cap.get("status"), "AVAILABLE")
-            self.assertEqual(image_cap.get("provider"), "openai")
+        """Image generation capability must reflect actual runtime (Pollinations/Flux/Turbo), not DALL-E 3."""
+        resp = self.client.get("/api/v1/capabilities")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        image_cap = data.get("image_generation", {})
+        self.assertEqual(image_cap.get("status"), "AVAILABLE")
+        self.assertEqual(image_cap.get("provider"), "pollinations")
+        self.assertIn("flux", image_cap.get("models", []))
+        self.assertIn("turbo", image_cap.get("models", []))
+        self.assertTrue(image_cap.get("text_to_image"))
+        self.assertFalse(image_cap.get("editing_available", True))
+        self.assertFalse(image_cap.get("upscale_available", True))
+        self.assertFalse(image_cap.get("image_conditioned_edit", True))
+        self.assertFalse(image_cap.get("true_upscale", True))
 
     def test_rag_capability_truthful(self):
         """RAG capability must reflect whether dense embeddings are configured."""

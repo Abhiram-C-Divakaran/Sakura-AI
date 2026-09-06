@@ -19,6 +19,11 @@ from tasks.task_manager import TaskManager, update_task_state
 
 
 class TestSchedulerDurableQueue(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        from database.db import Base, engine
+        Base.metadata.create_all(bind=engine)
+
     def setUp(self):
         self._env_patch = patch.dict(os.environ, {"SAKURA_EMBEDDED_WORKER": "false"})
         self._env_patch.start()

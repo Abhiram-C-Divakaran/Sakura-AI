@@ -89,6 +89,74 @@ class TestWorkspaceTopologyE2E(unittest.IsolatedAsyncioTestCase):
         resolved = WorkspaceSecurity.resolve_safe_path(self.ws_dir, "src/calc.py")
         self.assertTrue(resolved.startswith(self.ws_dir))
 
+    def test_workspace_tenant_isolation_cannot_access_sibling_workspace(self):
+        """Workspace A cannot inspect, read, or list sibling Workspace B."""
+        ws_a_id = uuid.uuid4()
+        ws_b_id = uuid.uuid4()
+        ws_a_dir = os.path.join(self.temp_root, str(ws_a_id))
+        ws_b_dir = os.path.join(self.temp_root, str(ws_b_id))
+        os.makedirs(ws_a_dir, exist_ok=True)
+        os.makedirs(ws_b_dir, exist_ok=True)
+
+        secret_b = os.path.join(ws_b_dir, "secret-b.txt")
+        with open(secret_b, "w") as f:
+            f.write("confidential_tenant_b_data")
+
+        # In workspace A context, attempting to resolve path to workspace B fails
+        with self.assertRaises(SecurityException):
+            WorkspaceSecurity.resolve_safe_path(ws_a_dir, f"../{ws_b_id}/secret-b.txt")
+
+        # Absolute target to sibling directory is rejected
+        with self.assertRaises(SecurityException):
+            WorkspaceSecurity.resolve_safe_path(ws_a_dir, ws_b_dir)
+
+    def test_invalid_workspace_uuid_rejected(self):
+        """Malformed or directory traversal workspace IDs must be rejected by UUID validation."""
+        invalid_ids = [
+            "../sibling",
+            "../../etc/passwd",
+            "ws-1234-invalid",
+            "not-a-uuid",
+            "; rm -rf /",
+            ""
+        ]
+        for bad_id in invalid_ids:
+            with self.subTest(bad_id=bad_id):
+                with self.assertRaises(ValueError):
+                    uuid.UUID(bad_id)
+
+    def test_child_environment_allowlist_strips_all_secrets(self):
+        """Untrusted child process environment only receives allowlisted variables, never backend secrets."""
+        host_env_with_secrets = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "HOME": "/home/sandbox",
+            "LANG": "C.UTF-8",
+            "JWT_SECRET": "critical_jwt_secret_value_must_not_leak",
+            "DATABASE_URL": "postgresql://user:pw@host:5432/sakura",
+            "REDIS_URL": "redis://:pw@host:6379/0",
+            "INTEGRATION_ENCRYPTION_KEY": "encryption_key_never_leak",
+            "GITHUB_TOKEN": "ghp_admin_secret_token",
+            "SAKURA_SANDBOX_SERVICE_TOKEN": "internal_token_secret",
+            "OPENAI_API_KEY": "sk-proj-secret-key",
+            "GROQ_API_KEY": "gsk_secret_key",
+            "CUSTOM_SAFE_TASK_VAR": "my_task_param"
+        }
+        child_env = WorkspaceSecurity.build_safe_child_environment(host_env_with_secrets)
+
+        # Allowlisted baseline is preserved
+        self.assertEqual(child_env["PATH"], "/usr/local/bin:/usr/bin:/bin")
+        self.assertEqual(child_env["HOME"], "/home/sandbox")
+        self.assertEqual(child_env["LANG"], "C.UTF-8")
+        self.assertEqual(child_env["CUSTOM_SAFE_TASK_VAR"], "my_task_param")
+
+        # Backend secrets must NEVER reach child environment
+        forbidden_secrets = [
+            "JWT_SECRET", "DATABASE_URL", "REDIS_URL", "INTEGRATION_ENCRYPTION_KEY",
+            "GITHUB_TOKEN", "SAKURA_SANDBOX_SERVICE_TOKEN", "OPENAI_API_KEY", "GROQ_API_KEY"
+        ]
+        for sec in forbidden_secrets:
+            self.assertNotIn(sec, child_env, f"Secret {sec} was not scrubbed from child environment!")
+
 
 if __name__ == "__main__":
     unittest.main()

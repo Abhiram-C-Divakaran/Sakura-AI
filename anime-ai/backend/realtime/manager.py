@@ -44,11 +44,13 @@ class RealtimeManager:
                 await self._pubsub_task
             except asyncio.CancelledError:
                 pass
+            self._pubsub_task = None
         if self._redis_client:
             try:
                 await self._redis_client.close()
             except Exception:
                 pass
+            self._redis_client = None
 
     async def connect(self, user_id: str, websocket: WebSocket):
         """Registers a client WebSocket connection on this worker instance."""
@@ -111,6 +113,7 @@ class RealtimeManager:
             now = time.time()
             if hasattr(self, "_last_redis_fail") and (now - self._last_redis_fail < 5):
                 return None
+            client = None
             try:
                 import redis.asyncio as aioredis
                 client = aioredis.from_url(self.redis_url, decode_responses=True, socket_connect_timeout=0.3)
@@ -118,6 +121,11 @@ class RealtimeManager:
                 self._redis_client = client
             except Exception:
                 self._last_redis_fail = now
+                if client:
+                    try:
+                        await client.close()
+                    except Exception:
+                        pass
                 self._redis_client = None
         return self._redis_client
 
@@ -130,7 +138,13 @@ class RealtimeManager:
             await client.publish(channel, payload)
             return True
         except Exception:
+            old_client = self._redis_client
             self._redis_client = None
+            if old_client:
+                try:
+                    await old_client.close()
+                except Exception:
+                    pass
             return False
 
     async def _redis_subscriber_loop(self):
@@ -182,11 +196,13 @@ class RealtimeManager:
                         await pubsub.close()
                     except Exception:
                         pass
+                    pubsub = None
                 if client:
                     try:
                         await client.close()
                     except Exception:
                         pass
+                    client = None
 
     async def get_status(self) -> dict:
         """Returns truthful telemetry on realtime subsystem connectivity and topology."""
@@ -198,6 +214,13 @@ class RealtimeManager:
                 redis_ok = True
         except Exception:
             redis_ok = False
+            old_client = self._redis_client
+            self._redis_client = None
+            if old_client:
+                try:
+                    await old_client.close()
+                except Exception:
+                    pass
 
         total_conns = sum(len(conns) for conns in self.user_connections.values())
         if redis_ok:

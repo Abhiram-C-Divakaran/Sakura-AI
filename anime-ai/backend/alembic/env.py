@@ -57,12 +57,28 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
-    from database.db import engine
-    connectable = engine
-
-    with connectable.connect() as connection:
+    connection = config.attributes.get('connection', None)
+    if connection:
         context.configure(
             connection=connection,
+            target_metadata=target_metadata,
+            render_as_batch=True
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+        return
+
+    custom_url = config.get_main_option("sqlalchemy.url")
+    if custom_url and custom_url != "driver://user:pass@localhost/dbname":
+        from sqlalchemy import create_engine
+        connectable = create_engine(custom_url)
+    else:
+        from database.db import engine
+        connectable = engine
+
+    with connectable.connect() as conn:
+        context.configure(
+            connection=conn,
             target_metadata=target_metadata,
             render_as_batch=True
         )

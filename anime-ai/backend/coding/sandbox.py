@@ -426,14 +426,14 @@ class SandboxManager:
 
     @classmethod
     def is_service_available(cls, service_url: Optional[str] = None) -> bool:
-        """Checks if the internal Sandbox Executor service is reachable and healthy."""
+        """Checks if the internal Sandbox Executor service is reachable and ready to execute code."""
         url = (service_url or os.getenv("SAKURA_SANDBOX_EXECUTOR_URL", "http://sandbox-executor:9000")).rstrip("/")
         try:
-            with httpx.Client(timeout=2.0) as client:
-                res = client.get(f"{url}/health")
+            with httpx.Client(timeout=3.0) as client:
+                res = client.get(f"{url}/readiness")
                 if res.status_code == 200:
                     data = res.json()
-                    return bool(data.get("docker_available", False))
+                    return bool(data.get("ready", False))
                 return False
         except Exception:
             return False

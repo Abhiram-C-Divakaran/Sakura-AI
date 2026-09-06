@@ -79,7 +79,7 @@ async def on_startup():
         if is_prod:
             raise RuntimeError(f"Critical production database initialization failed: {e}") from e
 
-    embedded_scheduler = os.getenv("SAKURA_EMBEDDED_SCHEDULER", "false" if is_prod else "true").lower() == "true"
+    embedded_scheduler = os.getenv("SAKURA_EMBEDDED_SCHEDULER", "false").lower() == "true"
     if embedded_scheduler:
         try:
             from tasks.scheduler import TaskSchedulerService
@@ -114,7 +114,9 @@ async def readiness_check():
     redis_ok = False
     errors = []
 
-    # 1. DB connectivity
+    # 1. DB connectivity and migration revision
+    EXPECTED_MIGRATION_HEAD = "c3e1a89f4b20"
+    migration_ok = False
     try:
         with get_db_context() as db:
             db.execute(sa.text("SELECT 1"))
@@ -126,6 +128,23 @@ async def readiness_check():
             else:
                 missing = required_tables - existing_tables
                 errors.append(f"Missing required database tables: {missing}")
+
+            # Validate Alembic schema revision
+            if "alembic_version" in existing_tables:
+                res = db.execute(sa.text("SELECT version_num FROM alembic_version")).fetchone()
+                current_revision = res[0] if res else None
+                if current_revision == EXPECTED_MIGRATION_HEAD:
+                    migration_ok = True
+                else:
+                    if is_prod:
+                        tables_ok = False
+                        errors.append("Database schema migration revision is incompatible.")
+            elif is_prod:
+                tables_ok = False
+                errors.append("Missing alembic_version table in production.")
+            else:
+                migration_ok = True
+
             db_ok = True
     except Exception as e:
         errors.append(f"Database error: {str(e)}")

@@ -19,6 +19,11 @@ from tasks.scheduler import (
 
 
 class TestSchedulerResilience(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from database.db import Base, engine
+        Base.metadata.create_all(bind=engine)
+
     def test_invalid_schedule_expression_raises_value_error(self):
         """Invalid cron and unknown schedule strings must raise ValueError (no silent 24h fallback)."""
         invalid_schedules = [

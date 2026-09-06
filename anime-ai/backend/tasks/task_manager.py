@@ -45,13 +45,11 @@ class TaskManager:
             try:
                 from tasks.worker import enqueue_task
                 enqueue_task(task.id)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to enqueue task {task.id} to Redis: {e}")
 
-            # 2. In non-production development environments, support in-process fallback
-            env = os.getenv("ENVIRONMENT", "development").lower()
-            is_prod = env in ("production", "prod")
-            embedded_worker = os.getenv("SAKURA_EMBEDDED_WORKER", "false" if is_prod else "true").lower() == "true"
+            # Embedded worker is opt-in only (default false everywhere)
+            embedded_worker = os.getenv("SAKURA_EMBEDDED_WORKER", "false").lower() == "true"
             if embedded_worker:
                 task_id_str = str(task.id)
                 try:
@@ -105,6 +103,21 @@ class TaskManager:
                 task.status = "Cancelled"
                 task.cancel_requested = True
                 task.completed_at = utc_now()
+
+                # If this background task is linked to a scheduled task run, update it to CANCELLED
+                payload = dict(task.payload or {})
+                run_id_str = payload.get("run_id") or payload.get("scheduled_task_run_id")
+                if run_id_str:
+                    try:
+                        from database.models import ScheduledTaskRun
+                        run_uuid = uuid.UUID(run_id_str)
+                        run_rec = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+                        if run_rec and run_rec.status in ["QUEUED", "RUNNING"]:
+                            run_rec.status = "CANCELLED"
+                            run_rec.completed_at = utc_now()
+                    except Exception:
+                        pass
+
                 db.commit()
                 db.refresh(task)
                 await emit_task_update(task.to_dict())
@@ -125,8 +138,13 @@ class TaskManager:
                 task.progress = 0
                 task.error = None
                 task.result = None
+                task.result_metadata = {}
                 task.started_at = None
                 task.completed_at = None
+                task.cancel_requested = False
+                task.worker_id = None
+                task.heartbeat_at = None
+                task.lease_expires_at = None
                 task.retry_count = (task.retry_count or 0) + 1
                 db.commit()
                 db.refresh(task)
@@ -134,12 +152,10 @@ class TaskManager:
                 try:
                     from tasks.worker import enqueue_task
                     enqueue_task(task.id)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to enqueue retried task {task.id} to Redis: {e}")
 
-                env = os.getenv("ENVIRONMENT", "development").lower()
-                is_prod = env in ("production", "prod")
-                embedded_worker = os.getenv("SAKURA_EMBEDDED_WORKER", "false" if is_prod else "true").lower() == "true"
+                embedded_worker = os.getenv("SAKURA_EMBEDDED_WORKER", "false").lower() == "true"
                 if embedded_worker:
                     task_id_str = str(task.id)
                     try:
@@ -477,7 +493,7 @@ async def execute_scheduled_task_job(
             with get_db_context() as db2:
                 r = db2.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
                 if r:
-                    r.status = "FAILED"
+                    r.status = "CANCELLED"
                     r.error = "Execution cancelled by user."
                     r.completed_at = utc_now()
                     db2.commit()
@@ -504,7 +520,7 @@ async def execute_scheduled_task_job(
             if curr and (curr.cancel_requested or curr.status == "Cancelled"):
                 r = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
                 if r:
-                    r.status = "FAILED"
+                    r.status = "CANCELLED"
                     r.error = "Execution cancelled by user."
                     r.completed_at = utc_now()
                     db.commit()

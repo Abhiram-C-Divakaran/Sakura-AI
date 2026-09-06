@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from database.db import get_db
 from database.models import User, ScheduledTask, ScheduledTaskRun
 from auth.manager import AuthManager
-from tasks.scheduler import execute_scheduled_task_run, compute_next_run
+from tasks.scheduler import compute_next_run
 from database.models import utc_now
 
 router = APIRouter(prefix="/scheduled", tags=["scheduled"])
@@ -244,37 +244,50 @@ async def trigger_scheduled_task(
         raise HTTPException(status_code=404, detail="Scheduled task not found")
 
     now = utc_now()
+    run_id = uuid.uuid4()
     run = ScheduledTaskRun(
-        id=uuid.uuid4(),
+        id=run_id,
         task_id=task.id,
         status="QUEUED",
         scheduled_for=now,
         started_at=now
     )
     db.add(run)
-    db.commit()
-    db.refresh(run)
 
-    from tasks.task_manager import TaskManager
-    bg_task = TaskManager.create_task(
+    from database.models import BackgroundTask
+    bg_task_id = uuid.uuid4()
+    bg_task = BackgroundTask(
+        id=bg_task_id,
         user_id=current_user.id,
-        task_type="scheduled_run",
+        type="scheduled_run",
         title=f"Manual Run: {task.title}",
         payload={
             "scheduled_task_id": str(task.id),
-            "run_id": str(run.id),
+            "run_id": str(run_id),
             "scheduled_for": now.isoformat(),
             "manual": True
-        }
+        },
+        status="Queued",
+        progress=0,
+        created_at=now,
+        cancel_requested=False
     )
+    db.add(bg_task)
+    db.commit()
+
+    try:
+        from tasks.worker import enqueue_task
+        enqueue_task(bg_task_id)
+    except Exception:
+        pass
 
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
         content={
             "status": "QUEUED",
-            "run_id": str(run.id),
+            "run_id": str(run_id),
             "task_id": str(task.id),
-            "background_task_id": str(bg_task.id),
+            "background_task_id": str(bg_task_id),
             "message": "Scheduled task run enqueued durably."
         }
     )

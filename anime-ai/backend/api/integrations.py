@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 from database.db import get_db
 from database.models import User, UserIntegration, utc_now
 from auth.manager import AuthManager
-from auth.crypto import encrypt_secret, decrypt_secret
+from auth.crypto import encrypt_secret, decrypt_secret, decrypt_and_upgrade_secret
 
 router = APIRouter(prefix="/integrations", tags=["integrations"])
 
@@ -282,8 +282,7 @@ def _serialize_integration(
     elif provider.is_implemented:
         if prov_id == "github":
             has_client = bool(os.getenv("GITHUB_CLIENT_ID") and os.getenv("GITHUB_CLIENT_SECRET"))
-            has_token = bool(os.getenv("GITHUB_TOKEN"))
-            state = "DISCONNECTED" if (has_client or has_token) else "NOT_CONFIGURED"
+            state = "DISCONNECTED" if has_client else "NOT_CONFIGURED"
         else:
             state = "NOT_CONFIGURED"
     else:
@@ -358,9 +357,12 @@ def connect_integration(
             detail=f"Integration provider '{provider}' is not implemented yet. Unverified connections are prohibited."
         )
 
-    raw_token = req.access_token or (req.config or {}).get("access_token")
-    if not raw_token and provider == "github":
-        raw_token = os.getenv("GITHUB_TOKEN")
+    raw_token = (req.access_token or (req.config or {}).get("access_token") or "").strip()
+    if not raw_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"An explicit user access token or PAT is required to connect {provider}."
+        )
 
     credentials = {"access_token": raw_token}
     validation_data = adapter.validate_credentials(credentials)
@@ -484,6 +486,8 @@ def revalidate_integration(
     return _serialize_integration(adapter, integration)
 
 
+import urllib.error
+
 @router.get("/github/repos")
 async def list_github_repositories(
     current_user: User = Depends(AuthManager.get_current_user),
@@ -499,15 +503,32 @@ async def list_github_repositories(
     if not gh_integration:
         return {"connected": False, "repositories": []}
 
-    enc_token = (gh_integration.config_json or {}).get("encrypted_token")
-    raw_token = decrypt_secret(enc_token) if enc_token else os.getenv("GITHUB_TOKEN")
-
-    if not raw_token:
+    cfg = dict(gh_integration.config_json or {})
+    enc_token = cfg.get("encrypted_token")
+    if not enc_token:
         return {
-            "connected": True,
+            "connected": False,
             "account": gh_integration.account_name,
             "repositories": [],
             "error": "No authenticated GitHub access token stored for this account."
+        }
+
+    raw_token, upgraded_envelope = decrypt_and_upgrade_secret(enc_token)
+    if upgraded_envelope:
+        cfg["encrypted_token"] = upgraded_envelope
+        gh_integration.config_json = cfg
+        db.commit()
+
+    if not raw_token:
+        gh_integration.connected = False
+        cfg["health_status"] = "ERROR"
+        gh_integration.config_json = cfg
+        db.commit()
+        return {
+            "connected": False,
+            "account": gh_integration.account_name,
+            "repositories": [],
+            "error": "Failed to decrypt GitHub credentials. Please reconnect."
         }
 
     try:
@@ -531,15 +552,56 @@ async def list_github_repositories(
                 }
                 for r in data if isinstance(r, dict)
             ]
+            cfg["health_status"] = "HEALTHY"
+            cfg["last_verified_at"] = utc_now().isoformat()
+            gh_integration.config_json = cfg
+            db.commit()
             return {
                 "connected": True,
                 "account": gh_integration.account_name,
                 "repositories": repos
             }
-    except Exception as e:
+    except urllib.error.HTTPError as he:
+        if he.code in (401, 403):
+            gh_integration.connected = False
+            cfg["health_status"] = "ERROR"
+            cfg["last_verified_at"] = utc_now().isoformat()
+            gh_integration.config_json = cfg
+            db.commit()
+            return {
+                "connected": False,
+                "account": gh_integration.account_name,
+                "repositories": [],
+                "error": "GitHub credentials expired or revoked. Please reconnect."
+            }
+        elif he.code == 429:
+            cfg["health_status"] = "DEGRADED"
+            gh_integration.config_json = cfg
+            db.commit()
+            return {
+                "connected": True,
+                "account": gh_integration.account_name,
+                "repositories": [],
+                "error": "GitHub API rate limit reached. Please try again later."
+            }
+        else:
+            cfg["health_status"] = "DEGRADED"
+            gh_integration.config_json = cfg
+            db.commit()
+            return {
+                "connected": True,
+                "account": gh_integration.account_name,
+                "repositories": [],
+                "error": f"Upstream GitHub service error ({he.code})."
+            }
+    except Exception:
+        cfg["health_status"] = "DEGRADED"
+        gh_integration.config_json = cfg
+        db.commit()
         return {
             "connected": True,
             "account": gh_integration.account_name,
             "repositories": [],
-            "error": f"Failed to fetch repositories from GitHub API: {str(e)}"
+            "error": "Network timeout or error communicating with GitHub."
         }
+

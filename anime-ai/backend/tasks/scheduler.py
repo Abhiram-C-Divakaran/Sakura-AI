@@ -106,82 +106,8 @@ def compute_next_run(schedule: str, tz_name: str = "UTC", from_time: Optional[da
     return next_local.astimezone(timezone.utc)
 
 
-async def execute_scheduled_task_run(task_id: uuid.UUID) -> Optional[Dict[str, Any]]:
-    """Executes a single scheduled task, generating output via LLMRouter and saving run history."""
-    start_time = time.time()
-    with get_db_context() as db:
-        task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
-        if not task:
-            return None
-
-        run = ScheduledTaskRun(
-            id=uuid.uuid4(),
-            task_id=task.id,
-            status="RUNNING",
-            started_at=utc_now()
-        )
-        db.add(run)
-        db.commit()
-        db.refresh(run)
-
-        try:
-            router = LLMRouter()
-            provider_name, provider = router.get_provider("general_inquiry")
-
-            system_prompt = (
-                "You are Sakura AI executing a scheduled automated task on behalf of the user. "
-                "Provide a clear, detailed, and high-quality report."
-            )
-            response_text = await provider.generate(
-                prompt=task.prompt,
-                system_prompt=system_prompt,
-                temperature=0.4,
-                max_tokens=2048
-            )
-
-            duration_ms = int((time.time() - start_time) * 1000)
-            now = utc_now()
-
-            run.status = "COMPLETED"
-            run.output = response_text
-            run.completed_at = now
-            run.duration_ms = duration_ms
-
-            task.last_run_at = now
-            task.next_run_at = compute_next_run(task.schedule, task.timezone, now)
-
-            db.commit()
-            return {
-                "run_id": str(run.id),
-                "status": "COMPLETED",
-                "output": response_text,
-                "duration_ms": duration_ms
-            }
-
-        except Exception as e:
-            duration_ms = int((time.time() - start_time) * 1000)
-            now = utc_now()
-            run.status = "FAILED"
-            run.error = str(e)
-            run.completed_at = now
-            run.duration_ms = duration_ms
-            task.last_run_at = now
-            # Prevent corruption: calculate next run even on error so task continues running
-            try:
-                task.next_run_at = compute_next_run(task.schedule, task.timezone, now)
-            except Exception:
-                task.next_run_at = now + timedelta(days=1)
-            db.commit()
-            return {
-                "run_id": str(run.id),
-                "status": "FAILED",
-                "error": str(e),
-                "duration_ms": duration_ms
-            }
-
-
 class TaskSchedulerService:
-    """Background service polling enabled tasks with atomic DB locking and executing them asynchronously."""
+    """Background service polling enabled tasks with atomic DB locking and dispatching durable worker jobs."""
 
     def __init__(self, poll_interval_seconds: int = 30):
         self.poll_interval = poll_interval_seconds
@@ -212,7 +138,14 @@ class TaskSchedulerService:
             await asyncio.sleep(self.poll_interval)
 
     async def poll_and_execute(self):
-        """Polls due tasks and claims them atomically using database UPDATE statements."""
+        """
+        Polls due tasks and transactionally dispatches durable jobs within ONE database transaction:
+        1. Atomically claim due ScheduledTask and advance next_run_at
+        2. Create ScheduledTaskRun occurrence record
+        3. Create BackgroundTask queue record
+        4. Commit transaction
+        5. Best-effort push to Redis queue for immediate worker wake-up
+        """
         with get_db_context() as db:
             now = utc_now()
 
@@ -241,52 +174,89 @@ class TaskSchedulerService:
                     next_run = compute_next_run(t.schedule, t.timezone, now)
                 except Exception as e:
                     logger.error(f"Cannot compute next run for task {t.id}: {e}")
-                    continue
-
-                # Idempotency check: Ensure we haven't already created a run for this task and occurrence
+                # Idempotency pre-check: skip if run for this occurrence was already created
                 existing_run = db.query(ScheduledTaskRun).filter(
                     ScheduledTaskRun.task_id == t.id,
                     ScheduledTaskRun.scheduled_for == occurrence_time
                 ).first()
                 if existing_run:
-                    t.next_run_at = next_run
+                    logger.info(f"Occurrence for task {t.id} at {occurrence_time} already claimed. Advancing next_run_at.")
+                    db.query(ScheduledTask).filter(
+                        ScheduledTask.id == t.id,
+                        ScheduledTask.next_run_at == occurrence_time
+                    ).update({
+                        ScheduledTask.next_run_at: next_run,
+                        ScheduledTask.last_run_at: now
+                    }, synchronize_session=False)
                     db.commit()
                     continue
 
-                # Atomic claim in DB: only succeeds if next_run_at == occurrence_time
-                rows = db.query(ScheduledTask).filter(
-                    ScheduledTask.id == t.id,
-                    ScheduledTask.enabled == True,
-                    ScheduledTask.next_run_at == occurrence_time
-                ).update({
-                    ScheduledTask.next_run_at: next_run,
-                    ScheduledTask.last_run_at: now
-                }, synchronize_session=False)
-                db.commit()
+                bg_task_id = None
+                try:
+                    # Atomic claim in DB: only succeeds if next_run_at == occurrence_time
+                    rows = db.query(ScheduledTask).filter(
+                        ScheduledTask.id == t.id,
+                        ScheduledTask.enabled == True,
+                        ScheduledTask.next_run_at == occurrence_time
+                    ).update({
+                        ScheduledTask.next_run_at: next_run,
+                        ScheduledTask.last_run_at: now
+                    }, synchronize_session=False)
 
-                if rows > 0:
-                    logger.info(f"Claimed scheduled task {t.id} ('{t.title}'). Enqueueing durable background job...")
+                    if rows == 0:
+                        # Claim lost to concurrent scheduler instance
+                        continue
+
+                    # Transactional creation of occurrence run + durable background job
+                    run_id = uuid.uuid4()
                     run = ScheduledTaskRun(
-                        id=uuid.uuid4(),
+                        id=run_id,
                         task_id=t.id,
                         status="QUEUED",
                         scheduled_for=occurrence_time,
                         started_at=now
                     )
                     db.add(run)
-                    db.commit()
 
-                    from tasks.task_manager import TaskManager
-                    TaskManager.create_task(
+                    from database.models import BackgroundTask
+                    bg_task_id = uuid.uuid4()
+                    bg_task = BackgroundTask(
+                        id=bg_task_id,
                         user_id=t.user_id,
-                        task_type="scheduled_run",
+                        type="scheduled_run",
                         title=f"Scheduled: {t.title}",
                         payload={
                             "scheduled_task_id": str(t.id),
-                            "run_id": str(run.id),
+                            "run_id": str(run_id),
                             "scheduled_for": occurrence_time.isoformat() if occurrence_time else None
-                        }
+                        },
+                        status="Queued",
+                        progress=0,
+                        created_at=now,
+                        cancel_requested=False
                     )
+                    db.add(bg_task)
+
+                    # Commit all 3 state mutations atomically
+                    db.commit()
+                    logger.info(f"Transactionally dispatched scheduled task {t.id} (Run: {run_id}, Job: {bg_task_id})")
+
+                except sa.exc.IntegrityError:
+                    db.rollback()
+                    logger.info(f"Occurrence for task {t.id} at {occurrence_time} already claimed (idempotency enforced by DB). Skipping.")
+                    continue
+                except Exception as e:
+                    db.rollback()
+                    logger.error(f"Error during transactional dispatch for task {t.id}: {e}", exc_info=True)
+                    continue
+
+                # 5. Best-effort Redis wake-up ONLY AFTER commit
+                if bg_task_id:
+                    try:
+                        from tasks.worker import enqueue_task
+                        enqueue_task(bg_task_id)
+                    except Exception as e:
+                        logger.warning(f"Redis wake-up dispatch failed for job {bg_task_id} (worker DB polling will pick it up): {e}")
 
 
 async def run_scheduler_forever():

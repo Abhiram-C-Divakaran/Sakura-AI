@@ -57,6 +57,7 @@ class TestSandboxOutputLimitsAndCleanup(unittest.TestCase):
             mock_proc.stderr = AsyncMock()
             mock_proc.stderr.read = AsyncMock(return_value=b"")
             mock_proc.wait = AsyncMock(side_effect=asyncio.TimeoutError())
+            return mock_proc
         def fake_subprocess_run(cmd, *args, **kwargs):
             if isinstance(cmd, list) and "rm" in cmd:
                 rm_container_names.append(cmd[-1])

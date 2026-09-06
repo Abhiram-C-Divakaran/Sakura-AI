@@ -57,6 +57,8 @@ def enqueue_task(task_id: uuid.UUID) -> bool:
             return True
         except Exception as e:
             logger.warning(f"Failed to enqueue task {task_id} to Redis: {e}")
+    else:
+        logger.warning(f"Redis client unavailable; task {task_id} stored authoritatively in PostgreSQL for DB polling.")
     return False
 
 
@@ -106,7 +108,7 @@ class DurableTaskWorker:
     def claim_next_task(self) -> Optional[BackgroundTask]:
         """
         Atomically claims a queued task for this worker with lease and heartbeat timestamps.
-        First checks Redis queue, then falls back to DB polling.
+        First checks Redis queue, then falls back to DB polling (using PostgreSQL FOR UPDATE SKIP LOCKED if available).
         """
         candidate_id_str: Optional[str] = None
 
@@ -144,6 +146,24 @@ class DurableTaskWorker:
 
         # 3. Fallback: Query database for earliest Queued task
         with get_db_context() as db:
+            is_postgres = bool(db.bind and db.bind.dialect.name == "postgresql")
+            if is_postgres:
+                # High-concurrency claim using PostgreSQL FOR UPDATE SKIP LOCKED
+                candidate = db.query(BackgroundTask).filter(
+                    BackgroundTask.status == "Queued"
+                ).order_by(BackgroundTask.created_at.asc()).with_for_update(skip_locked=True).first()
+                if candidate:
+                    candidate.status = "Running"
+                    candidate.worker_id = self.worker_id
+                    candidate.started_at = now
+                    candidate.heartbeat_at = now
+                    candidate.lease_expires_at = lease_exp
+                    db.commit()
+                    db.refresh(candidate)
+                    return candidate
+                return None
+
+            # SQLite / fallback atomic update
             candidate = db.query(BackgroundTask).filter(
                 BackgroundTask.status == "Queued"
             ).order_by(BackgroundTask.created_at.asc()).first()

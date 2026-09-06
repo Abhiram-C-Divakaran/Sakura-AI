@@ -95,24 +95,41 @@ class WorkspaceSecurity:
                 raise SecurityException(f"Command rejected by security policy: matches forbidden pattern '{pattern}'")
 
     @staticmethod
-    def sanitize_environment(base_env: dict = None) -> dict:
-        """Strips backend secrets and sensitive keys from the environment passed to code runs."""
-        env = dict(base_env or os.environ)
-        for secret_key in WorkspaceSecurity.DISALLOWED_ENV_VARS:
-            env.pop(secret_key, None)
-        # Scrub any keys containing sensitive keywords
-        sensitive_patterns = ("SECRET", "PASSWORD", "TOKEN", "KEY", "CREDENTIAL", "PRIVATE")
-        to_delete = [
-            k for k in env.keys()
-            if any(p in k.upper() for p in sensitive_patterns) and k not in ("TERM", "PATH")
-        ]
-        for k in to_delete:
-            env.pop(k, None)
-        # Force non-interactive modes
-        env["CI"] = "true"
-        env["NONINTERACTIVE"] = "1"
-        env["DEBIAN_FRONTEND"] = "noninteractive"
+    def build_safe_child_environment(requested_env: dict = None) -> dict:
+        """
+        Constructs child execution container environment using strict allowlist policy.
+        NEVER inherits os.environ and never passes host backend secrets.
+        Baseline: PATH, HOME, LANG, LC_ALL, TERM, CI, NONINTERACTIVE, DEBIAN_FRONTEND, NODE_ENV.
+        """
+        env = {
+            "CI": "true",
+            "NONINTERACTIVE": "1",
+            "DEBIAN_FRONTEND": "noninteractive",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME": "/tmp",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "TERM": "xterm-256color",
+            "NODE_ENV": "production"
+        }
+        if requested_env and isinstance(requested_env, dict):
+            sensitive_patterns = (
+                "SECRET", "PASSWORD", "TOKEN", "KEY", "CREDENTIAL", "PRIVATE",
+                "AUTH", "DATABASE", "REDIS", "JWT", "ENCRYPTION", "DSN"
+            )
+            for k, v in requested_env.items():
+                k_clean = str(k).strip()
+                if not k_clean or any(p in k_clean.upper() for p in sensitive_patterns):
+                    continue
+                if k_clean in WorkspaceSecurity.DISALLOWED_ENV_VARS:
+                    continue
+                env[k_clean] = str(v)
         return env
+
+    @staticmethod
+    def sanitize_environment(base_env: dict = None) -> dict:
+        """Alias for build_safe_child_environment ensuring strict allowlist policy."""
+        return WorkspaceSecurity.build_safe_child_environment(base_env)
 
     @staticmethod
     def validate_repository_url(url: str) -> None:

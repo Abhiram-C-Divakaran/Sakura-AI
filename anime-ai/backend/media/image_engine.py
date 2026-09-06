@@ -155,6 +155,26 @@ class ImageGenerationEngine:
         self.user_id = user_id
         self.router = ImageGenerationRouter()
 
+    @classmethod
+    def get_status(cls) -> Dict[str, Any]:
+        """
+        Returns truthful runtime status of the image generation engine.
+        Reflects actual Pollinations (Flux/Turbo) raster rendering and reports
+        image_conditioned_edit=False and true_upscale=False.
+        """
+        return {
+            "status": "AVAILABLE",
+            "provider": "pollinations",
+            "models": ["flux", "turbo"],
+            "text_to_image": True,
+            "image_conditioned_edit": False,
+            "true_upscale": False,
+            "variations": True,
+            "prompt_variation": True,
+            "high_res_regeneration": True,
+            "health_verified_at": datetime.utcnow().isoformat()
+        }
+
     # ─── 1. Aspect Ratio Inference ────────────────────────────────────────────
     @staticmethod
     def infer_aspect_ratio(prompt: str, explicit_ratio: Optional[str] = None) -> Tuple[str, int, int]:
@@ -340,7 +360,8 @@ class ImageGenerationEngine:
         storage_path = os.path.join(UPLOAD_DIR, f"{image_id}.png")
         file_size = 0
         actual_seed = seed if seed is not None else random.randint(1000, 9999999)
-        model_name = f"flux-{pipeline.value.lower()}"
+        actual_model = "flux"
+        successful_attempt = 1
 
         loop = asyncio.get_event_loop()
 
@@ -371,6 +392,8 @@ class ImageGenerationEngine:
                 if QualityEvaluator.validate_image_payload(storage_path):
                     file_size = os.path.getsize(storage_path)
                     actual_seed = current_seed
+                    actual_model = active_model
+                    successful_attempt = attempt + 1
                     break
                 else:
                     if os.path.exists(storage_path):
@@ -406,7 +429,8 @@ class ImageGenerationEngine:
         filename = f"{sanitized_title}_{actual_seed % 10000}.png"
         public_image_url = f"/api/v1/library/files/{image_id}/download"
 
-        # Lineage depth calculation
+        # Lineage depth calculation & strict user-ownership enforcement
+        valid_parent_id = None
         lineage_depth = 0
         if parent_image_id:
             parent = self.db.query(GeneratedImage).filter(
@@ -414,7 +438,14 @@ class ImageGenerationEngine:
                 GeneratedImage.user_id == self.user_id
             ).first()
             if parent:
+                valid_parent_id = parent.id
                 lineage_depth = parent.lineage_depth + 1
+
+        actual_provider = "pollinations"
+        requested_provider = "pollinations"
+        requested_model = "flux"
+        failover_used = (actual_model != "flux")
+        attempt_count = successful_attempt
 
         # 1. Register Document in Sakura Library
         doc = Document(
@@ -435,7 +466,14 @@ class ImageGenerationEngine:
                 "aspect_ratio": ratio,
                 "width": width,
                 "height": height,
-                "model": model_name,
+                "provider": actual_provider,
+                "model": actual_model,
+                "requested_provider": requested_provider,
+                "requested_model": requested_model,
+                "failover_used": failover_used,
+                "attempt_count": attempt_count,
+                "image_conditioned_edit": False,
+                "true_upscale": False,
                 "seed": actual_seed,
                 "workflow": workflow,
                 "is_knowledge_base": False,
@@ -457,18 +495,26 @@ class ImageGenerationEngine:
             aspect_ratio=ratio,
             width=width,
             height=height,
-            model=model_name,
+            model=actual_model,
             seed=actual_seed,
             workflow=workflow,
-            parent_image_id=parent_image_id,
+            parent_image_id=valid_parent_id,
             lineage_depth=lineage_depth,
             storage_path=storage_path,
             image_url=public_image_url,
             metadata_json={
+                "provider": actual_provider,
+                "actual_model": actual_model,
+                "requested_provider": requested_provider,
+                "requested_model": requested_model,
+                "failover_used": failover_used,
+                "attempt_count": attempt_count,
                 "intensity": intensity,
                 "pipeline": pipeline.value,
                 "negative_prompt": negative_prompt,
                 "file_size": file_size,
+                "image_conditioned_edit": False,
+                "true_upscale": False,
                 "created_at": datetime.utcnow().isoformat()
             }
         )
@@ -506,17 +552,22 @@ class ImageGenerationEngine:
             "aspect_ratio": ratio,
             "width": width,
             "height": height,
-            "model": model_name,
+            "model": actual_model,
+            "provider": actual_provider,
             "pipeline": pipeline.value,
             "seed": actual_seed,
             "workflow": workflow,
-            "parent_image_id": str(parent_image_id) if parent_image_id else None,
+            "parent_image_id": str(valid_parent_id) if valid_parent_id else None,
             "lineage_depth": lineage_depth,
             "file_size": file_size,
+            "failover_used": failover_used,
+            "attempt_count": attempt_count,
+            "image_conditioned_edit": False,
+            "true_upscale": False,
             "created_at": datetime.utcnow().isoformat()
         }
 
-    # ─── 5. Edit Existing Image ──────────────────────────────────────────────
+    # ─── 5. Edit Existing Image (Prompt-based Variation) ─────────────────────
     async def edit_image(
         self,
         parent_image_id: uuid.UUID,
@@ -524,19 +575,22 @@ class ImageGenerationEngine:
         conversation_id: Optional[uuid.UUID] = None,
         intensity: str = "medium"
     ) -> Dict[str, Any]:
-        """Edits an existing image preserving prior context and establishing edit lineage."""
+        """
+        Generates a prompt-based variation of an existing image preserving prior context and establishing edit lineage.
+        Note: This is prompt-based reinterpretation/variation, not true image-conditioned diffusion.
+        """
         parent = self.db.query(GeneratedImage).filter(
             GeneratedImage.id == parent_image_id,
             GeneratedImage.user_id == self.user_id
         ).first()
 
         if not parent:
-            # If parent image is not found, treat as targeted generation
+            # If parent image is not found or not owned by user, treat as targeted generation without parent
             return await self.generate_image(
                 prompt=edit_instruction,
                 conversation_id=conversation_id,
                 intensity=intensity,
-                workflow="EDIT_IMAGE"
+                workflow="PROMPT_VARIATION"
             )
 
         combined_prompt = self.build_edit_prompt(parent.prompt, edit_instruction)
@@ -546,7 +600,7 @@ class ImageGenerationEngine:
             aspect_ratio=parent.aspect_ratio,
             intensity=intensity,
             parent_image_id=parent.id,
-            workflow="EDIT_IMAGE"
+            workflow="PROMPT_VARIATION"
         )
 
     # ─── 6. Variations ───────────────────────────────────────────────────────
@@ -557,7 +611,7 @@ class ImageGenerationEngine:
         conversation_id: Optional[uuid.UUID] = None,
         intensity: str = "medium"
     ) -> List[Dict[str, Any]]:
-        """Generates multiple distinct variations of a target image."""
+        """Generates multiple distinct prompt-based variations of a target image."""
         parent = self.db.query(GeneratedImage).filter(
             GeneratedImage.id == parent_image_id,
             GeneratedImage.user_id == self.user_id
@@ -573,7 +627,7 @@ class ImageGenerationEngine:
                 conversation_id=conversation_id,
                 aspect_ratio=aspect_ratio,
                 intensity=intensity,
-                parent_image_id=parent_image_id if parent else None,
+                parent_image_id=parent.id if parent else None,
                 workflow="VARIATION",
                 seed=random.randint(100000, 9999999)
             )
@@ -581,28 +635,30 @@ class ImageGenerationEngine:
 
         return variations
 
-    # ─── 7. Upscale ──────────────────────────────────────────────────────────
+    # ─── 7. Upscale (High-Resolution Regeneration) ───────────────────────────
     async def upscale_image(
         self,
         parent_image_id: uuid.UUID,
         scale: int = 2,
         conversation_id: Optional[uuid.UUID] = None
     ) -> Dict[str, Any]:
-        """Generates higher fidelity upscaled version of an existing image."""
+        """
+        Generates a higher fidelity prompt-based regeneration of an existing image.
+        Note: This is high-resolution prompt-based regeneration, not true pixel super-resolution upscaling.
+        """
         parent = self.db.query(GeneratedImage).filter(
             GeneratedImage.id == parent_image_id,
             GeneratedImage.user_id == self.user_id
         ).first()
 
         if not parent:
-            raise ValueError("Target image for upscaling not found.")
+            raise ValueError("Target image for upscaling not found or not owned by user.")
 
-        # Upscale generation
         return await self.generate_image(
             prompt=f"{parent.prompt}, ultra-high resolution, crystalline fine details, 4k masterwork",
             conversation_id=conversation_id,
             aspect_ratio=parent.aspect_ratio,
             intensity="high",
             parent_image_id=parent.id,
-            workflow="UPSCALE"
+            workflow="HIGH_RES_REGENERATION"
         )

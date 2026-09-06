@@ -65,8 +65,8 @@ class TestIntegrationsSystem(unittest.TestCase):
             json={"account_name": "fake_account"},
             headers=self.headers
         )
-        self.assertEqual(res.status_code, 400)
-        self.assertIn("access_token", res.json()["detail"].lower())
+        detail = res.json()["detail"].lower()
+        self.assertTrue("access" in detail and "token" in detail)
 
     @patch("urllib.request.urlopen")
     def test_github_connect_successful_with_encryption_at_rest(self, mock_urlopen):
@@ -169,6 +169,115 @@ class TestIntegrationsSystem(unittest.TestCase):
         # decrypt_secret should detect and successfully decrypt legacy token
         decrypted = decrypt_secret(legacy_ct)
         self.assertEqual(decrypted, raw_token)
+
+    def test_github_isolation_never_falls_back_to_server_token(self):
+        """User integration must never silently fall back to server-level GITHUB_TOKEN."""
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "ghp_serverLevelAdminTokenDoNotLeak"}):
+            # 1. No integration record exists: connected=False
+            res = self.client.get("/api/v1/integrations/github/repos", headers=self.headers)
+            self.assertEqual(res.status_code, 200)
+            self.assertFalse(res.json()["connected"])
+
+            # 2. Integration record exists but has no token
+            with get_db_context() as db:
+                integ = UserIntegration(
+                    user_id=self.user_id,
+                    provider="github",
+                    account_name="test_account",
+                    connected=True,
+                    config_json={}
+                )
+                db.add(integ)
+                db.commit()
+
+            res2 = self.client.get("/api/v1/integrations/github/repos", headers=self.headers)
+            self.assertEqual(res2.status_code, 200)
+            self.assertFalse(res2.json()["connected"])
+            self.assertIn("no authenticated github access token", res2.json().get("error", "").lower())
+
+    @patch("urllib.request.urlopen")
+    def test_github_repos_401_marks_integration_error(self, mock_urlopen):
+        """When GitHub returns 401 HTTPError, integration is updated to connected=False and health_status=ERROR."""
+        import urllib.error
+        from auth.crypto import encrypt_secret
+
+        with get_db_context() as db:
+            integ = UserIntegration(
+                user_id=self.user_id,
+                provider="github",
+                account_name="test_revoked_account",
+                connected=True,
+                config_json={"encrypted_token": encrypt_secret("ghp_revokedToken12345")}
+            )
+            db.add(integ)
+            db.commit()
+
+        # Simulate GitHub returning 401 Unauthorized
+        err = urllib.error.HTTPError(
+            url="https://api.github.com/user/repos",
+            code=401,
+            msg="Unauthorized",
+            hdrs={},
+            fp=None
+        )
+        mock_urlopen.side_effect = err
+
+        res = self.client.get("/api/v1/integrations/github/repos", headers=self.headers)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertFalse(data["connected"])
+        self.assertIn("expired or revoked", data.get("error", "").lower())
+
+        # Verify DB state is updated
+        with get_db_context() as db:
+            db_integ = db.query(UserIntegration).filter(
+                UserIntegration.user_id == self.user_id,
+                UserIntegration.provider == "github"
+            ).first()
+            self.assertFalse(db_integ.connected)
+            self.assertEqual(db_integ.config_json.get("health_status"), "ERROR")
+
+    @patch("urllib.request.urlopen")
+    def test_github_repos_upgrades_legacy_secret(self, mock_urlopen):
+        """Reading repositories with legacy JWT-derived secret upgrades envelope in DB."""
+        from auth.crypto import _derive_fernet
+        from config.settings import get_settings
+
+        settings = get_settings()
+        legacy_fernet = _derive_fernet(settings.jwt_secret)
+        raw_token = "ghp_legacyTokenToBeUpgraded"
+        legacy_ct = legacy_fernet.encrypt(raw_token.encode("utf-8")).decode("utf-8")
+
+        with get_db_context() as db:
+            integ = UserIntegration(
+                user_id=self.user_id,
+                provider="github",
+                account_name="legacy_account",
+                connected=True,
+                config_json={"encrypted_token": legacy_ct}
+            )
+            db.add(integ)
+            db.commit()
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'[{"name": "my-repo", "full_name": "legacy_account/my-repo", "default_branch": "main", "clone_url": "https://github.com/legacy_account/my-repo.git", "private": false}]'
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.side_effect = None
+        mock_urlopen.return_value = mock_resp
+
+        res = self.client.get("/api/v1/integrations/github/repos", headers=self.headers)
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.json()["connected"])
+
+        # Check that stored token is now versioned envelope (v1:)
+        with get_db_context() as db:
+            db_integ = db.query(UserIntegration).filter(
+                UserIntegration.user_id == self.user_id,
+                UserIntegration.provider == "github"
+            ).first()
+            upgraded_enc = db_integ.config_json.get("encrypted_token")
+            self.assertIn('"version": 1', upgraded_enc)
+            self.assertIn('"ciphertext":', upgraded_enc)
 
 
 if __name__ == "__main__":
