@@ -75,7 +75,12 @@ class TestAnimeAIPlatform(unittest.TestCase):
     def test_05_chat_stream_inference(self):
         headers = {"Authorization": f"Bearer {self.token}"}
         payload = {"conversation_id": self.conversation_id, "message": "Verify login system diagnostics."}
-        response = self.client.post("/api/v1/chat/stream", json=payload, headers=headers)
+
+        async def fake_stream(*args, **kwargs):
+            yield {"token": "System diagnostics verified.", "provider": "mock"}
+
+        with unittest.mock.patch("llm.agent.Agent.run_stream", side_effect=fake_stream):
+            response = self.client.post("/api/v1/chat/stream", json=payload, headers=headers)
         
         # Verify streaming SSE content type response header
         self.assertEqual(response.status_code, 200)

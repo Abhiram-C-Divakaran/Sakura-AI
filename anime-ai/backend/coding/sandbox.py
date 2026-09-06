@@ -492,6 +492,8 @@ class SandboxManager:
             raise SandboxUnavailableError("Docker sandbox runtime was explicitly requested but Docker is not available.")
 
         if pref == "auto":
+            if env == "test":
+                return LocalRestrictedSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
             if cls.is_service_available():
                 return RemoteHttpSandboxRuntime(
                     workspace_root,
