@@ -6,8 +6,11 @@ import unittest
 from unittest.mock import patch, MagicMock, AsyncMock
 from fastapi.testclient import TestClient
 
+import tempfile
+
 os.environ["DATABASE_URL"] = "sqlite:///./test_anime_ai.db"
 os.environ["ENVIRONMENT"] = "test"
+os.environ.setdefault("SAKURA_WORKSPACE_ROOT", os.path.join(tempfile.gettempdir(), "sakura_workspaces"))
 
 from coding.sandbox_service import app, MAX_OUTPUT_BYTES
 from coding.sandbox import SandboxManager, SandboxUnavailableError, DockerSandboxRuntime, RemoteHttpSandboxRuntime

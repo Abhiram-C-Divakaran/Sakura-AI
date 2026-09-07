@@ -37,6 +37,7 @@ jobs:
       ENVIRONMENT: "test"
       SAKURA_EMBEDDED_WORKER: "false"
       SAKURA_EMBEDDED_SCHEDULER: "false"
+      SAKURA_WORKSPACE_ROOT: "/tmp/sakura_workspaces"
 
     steps:
       - name: Checkout Code

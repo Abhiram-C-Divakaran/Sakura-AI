@@ -1,6 +1,11 @@
 import os
+import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
+
+os.environ["ENVIRONMENT"] = "test"
+os.environ.setdefault("SAKURA_WORKSPACE_ROOT", os.path.join(tempfile.gettempdir(), "sakura_workspaces"))
+
 from fastapi.testclient import TestClient
 
 from coding.sandbox_service import app

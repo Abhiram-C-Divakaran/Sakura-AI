@@ -35,10 +35,23 @@ PIDS_LIMIT = int(os.getenv("SAKURA_SANDBOX_PIDS", "64"))
 CAPTURE_LIMIT_BYTES = int(os.getenv("SAKURA_CAPTURE_LIMIT_BYTES", str(512 * 1024)))      # 512 KiB
 HARD_OUTPUT_LIMIT_BYTES = int(os.getenv("SAKURA_HARD_OUTPUT_LIMIT_BYTES", str(5 * 1024 * 1024))) # 5 MiB
 MAX_OUTPUT_BYTES = CAPTURE_LIMIT_BYTES
-WORKSPACE_ROOT = os.path.realpath(os.path.abspath(os.getenv("SAKURA_WORKSPACE_ROOT", "/workspaces")))
+import tempfile
+
+default_ws_root = os.getenv("SAKURA_WORKSPACE_ROOT")
+if not default_ws_root:
+    if os.path.exists("/workspaces") and os.access("/workspaces", os.W_OK):
+        default_ws_root = "/workspaces"
+    elif os.name != "nt" and not os.access("/", os.W_OK):
+        default_ws_root = os.path.join(tempfile.gettempdir(), "sakura_workspaces")
+    else:
+        default_ws_root = "/workspaces"
+WORKSPACE_ROOT = os.path.realpath(os.path.abspath(default_ws_root))
 WORKSPACES_VOLUME = os.getenv("SAKURA_WORKSPACES_VOLUME", "")
 
-os.makedirs(WORKSPACE_ROOT, exist_ok=True)
+try:
+    os.makedirs(WORKSPACE_ROOT, exist_ok=True)
+except (PermissionError, OSError):
+    pass
 
 _readiness_cache: Dict[str, Any] = {"last_check": 0.0, "result": None}
 
