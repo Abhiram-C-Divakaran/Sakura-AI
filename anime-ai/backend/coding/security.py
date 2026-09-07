@@ -1,7 +1,8 @@
+from __future__ import annotations
 import os
 import sys
 import re
-from typing import List
+from typing import List, Optional, Dict, Any, Union, Set
 
 class SecurityException(Exception):
     """Raised when a path or command violates security policy."""
