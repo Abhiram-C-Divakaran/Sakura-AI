@@ -671,6 +671,11 @@ def retry_document_indexing(document_id: str, background_tasks: BackgroundTasks,
 
 def background_memory_extraction(user_id: Any, conversation_id: Any):
     """Worker task runs after stream completes to extract long-term preferences."""
+    import os
+    env = os.getenv("ENVIRONMENT", "").lower()
+    from config.settings import get_settings
+    if env in ["test", "testing"] or get_settings().environment in ["test", "testing"]:
+        return
     from database.db import get_db_context
     with get_db_context() as db:
         # Fetch last 6 messages of conversation
@@ -1011,13 +1016,26 @@ async def system_status_broadcast_loop():
         except Exception:
             pass
 
+_status_broadcast_task = None
+ 
 @router.on_event("startup")
 async def startup_event():
-    await ws_manager.initialize()
-    asyncio.create_task(system_status_broadcast_loop())
+    global _status_broadcast_task
+    from config.settings import get_settings
+    if get_settings().environment not in ["test", "testing"]:
+        await ws_manager.initialize()
+        _status_broadcast_task = asyncio.create_task(system_status_broadcast_loop())
 
 @router.on_event("shutdown")
 async def shutdown_event():
+    global _status_broadcast_task
+    if _status_broadcast_task:
+        _status_broadcast_task.cancel()
+        try:
+            await _status_broadcast_task
+        except asyncio.CancelledError:
+            pass
+        _status_broadcast_task = None
     await ws_manager.shutdown()
 
 @router.get("/system/status")

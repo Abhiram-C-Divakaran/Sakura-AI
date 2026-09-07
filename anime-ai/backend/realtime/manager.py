@@ -47,7 +47,10 @@ class RealtimeManager:
             self._pubsub_task = None
         if self._redis_client:
             try:
-                await self._redis_client.close()
+                if hasattr(self._redis_client, "aclose"):
+                    await self._redis_client.aclose()
+                else:
+                    await self._redis_client.close()
             except Exception:
                 pass
             self._redis_client = None
@@ -123,7 +126,10 @@ class RealtimeManager:
                 self._last_redis_fail = now
                 if client:
                     try:
-                        await client.close()
+                        if hasattr(client, "aclose"):
+                            await client.aclose()
+                        else:
+                            await client.close()
                     except Exception:
                         pass
                 self._redis_client = None
@@ -142,7 +148,10 @@ class RealtimeManager:
             self._redis_client = None
             if old_client:
                 try:
-                    await old_client.close()
+                    if hasattr(old_client, "aclose"):
+                        await old_client.aclose()
+                    else:
+                        await old_client.close()
                 except Exception:
                     pass
             return False

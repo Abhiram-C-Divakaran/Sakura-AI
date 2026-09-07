@@ -37,14 +37,22 @@ LEASE_DURATION_SECONDS = 60
 HEARTBEAT_INTERVAL_SECONDS = 15
 
 
+_last_sync_redis_fail = 0.0
+
 def get_sync_redis():
     """Gets a synchronous Redis client for queue operations."""
+    global _last_sync_redis_fail
+    import time
+    now = time.time()
+    if now - _last_sync_redis_fail < 5.0:
+        return None
     try:
         import redis
         client = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=0.2)
         client.ping()
         return client
     except Exception:
+        _last_sync_redis_fail = now
         return None
 
 

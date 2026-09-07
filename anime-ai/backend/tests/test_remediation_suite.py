@@ -92,21 +92,19 @@ class TestRemediationSuite(unittest.TestCase):
 
     def test_02_audio_transcription_truthful_503(self):
         """Audio transcription must return HTTP 503 if remote Whisper models are unavailable/unconfigured."""
+        from unittest.mock import patch
         headers = {"Authorization": f"Bearer {self.token_a}"}
         fake_audio = BytesIO(b"fake audio stream bytes header")
         
         # When remote providers fail or are invalid, endpoint must return 503 instead of mock text
-        response = self.client.post(
-            "/api/v1/audio/transcribe",
-            files={"file": ("test.webm", fake_audio, "audio/webm")},
-            headers=headers
-        )
-        # Should be 503 (or 200 if valid API key works, but never a mock fallback like 'Voice note captured')
-        if response.status_code == 200:
-            self.assertNotEqual(response.json().get("text"), "Voice note captured.")
-        else:
-            self.assertEqual(response.status_code, 503)
-            self.assertIn("unavailable", response.json()["detail"].lower())
+        with patch.dict(os.environ, {"GROQ_API_KEY": "", "OPENAI_API_KEY": ""}):
+            response = self.client.post(
+                "/api/v1/audio/transcribe",
+                files={"file": ("test.webm", fake_audio, "audio/webm")},
+                headers=headers
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("unavailable", response.json()["detail"].lower())
 
     def test_03_coding_agent_all_21_tools_present(self):
         """CodingAgent tool declaration must expose all 21 tools defined in CodingToolchain."""

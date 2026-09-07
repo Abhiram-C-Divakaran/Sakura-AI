@@ -1,9 +1,11 @@
 import unittest
+from unittest.mock import patch
 import os
 import sys
 
 # Force SQLite configuration for test environment before imports
 os.environ["DATABASE_URL"] = "sqlite:///./test_anime_ai.db"
+os.environ["ENVIRONMENT"] = "test"
 
 # Adjust import path to include backend root
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -79,15 +81,14 @@ class TestAnimeAIPlatform(unittest.TestCase):
         async def fake_stream(*args, **kwargs):
             yield {"token": "System diagnostics verified.", "provider": "mock"}
 
-        with unittest.mock.patch("llm.agent.Agent.run_stream", side_effect=fake_stream):
+        with patch("llm.agent.Agent.run_stream", side_effect=fake_stream):
             response = self.client.post("/api/v1/chat/stream", json=payload, headers=headers)
+            # Extract SSE stream content tokens while mock is active
+            sse_text = response.text
         
         # Verify streaming SSE content type response header
         self.assertEqual(response.status_code, 200)
         self.assertIn("text/event-stream", response.headers["content-type"])
-        
-        # Extract SSE stream content tokens
-        sse_text = response.text
         self.assertIn("data: ", sse_text)
         self.assertIn("token", sse_text)
 

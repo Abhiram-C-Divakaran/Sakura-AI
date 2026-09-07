@@ -83,6 +83,8 @@ jobs:
       - name: Run Backend Test Suite
         env:
           DATABASE_URL: "sqlite:///./ci_test.db"
+          PYTHONUNBUFFERED: "1"
+          SAKURA_SANDBOX_RUNTIME: "local_restricted"
         run: |
           python -m unittest discover -s tests -p "test_*.py" -v
 
