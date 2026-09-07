@@ -107,7 +107,7 @@ class TestSandboxService(unittest.TestCase):
 
     def test_production_sandbox_returns_remote_runtime_when_healthy(self):
         """When the executor service is operational in production, RemoteHttpSandboxRuntime is selected."""
-        with patch.dict(os.environ, {"ENVIRONMENT": "production"}):
+        with patch.dict(os.environ, {"ENVIRONMENT": "production", "SAKURA_SANDBOX_RUNTIME": "auto"}):
             with patch.object(SandboxManager, "is_service_available", return_value=True):
                 runtime = SandboxManager.get_runtime("/tmp/test_workspace")
                 self.assertIsInstance(runtime, RemoteHttpSandboxRuntime)
