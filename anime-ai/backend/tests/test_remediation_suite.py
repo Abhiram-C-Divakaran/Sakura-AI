@@ -19,6 +19,10 @@ from io import BytesIO
 # Adjust import path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+os.environ["ENVIRONMENT"] = "test"
+os.environ["SAKURA_EMBEDDED_WORKER"] = "false"
+os.environ["SAKURA_EMBEDDED_SCHEDULER"] = "false"
+
 from fastapi.testclient import TestClient
 from main import app
 from database.db import Base, engine, get_db_context

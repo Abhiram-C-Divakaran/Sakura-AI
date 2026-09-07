@@ -79,6 +79,10 @@ async def on_startup():
         if is_prod:
             raise RuntimeError(f"Critical production database initialization failed: {e}") from e
 
+    is_test = os.getenv("ENVIRONMENT", "").lower() in ["test", "testing"] or settings.environment in ["test", "testing"]
+    if is_test:
+        return
+
     embedded_scheduler = os.getenv("SAKURA_EMBEDDED_SCHEDULER", "false").lower() == "true"
     if embedded_scheduler:
         try:

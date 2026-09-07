@@ -85,6 +85,9 @@ jobs:
           DATABASE_URL: "sqlite:///./ci_test.db"
           PYTHONUNBUFFERED: "1"
           SAKURA_SANDBOX_RUNTIME: "local_restricted"
+          ENVIRONMENT: "test"
+          SAKURA_EMBEDDED_WORKER: "false"
+          SAKURA_EMBEDDED_SCHEDULER: "false"
         run: |
           python -m unittest discover -s tests -p "test_*.py" -v
 

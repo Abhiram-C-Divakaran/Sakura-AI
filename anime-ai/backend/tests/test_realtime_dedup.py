@@ -1,7 +1,12 @@
+import os
 import asyncio
 import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+os.environ["ENVIRONMENT"] = "test"
+os.environ["SAKURA_EMBEDDED_WORKER"] = "false"
+os.environ["SAKURA_EMBEDDED_SCHEDULER"] = "false"
 
 from realtime.manager import RealtimeManager
 

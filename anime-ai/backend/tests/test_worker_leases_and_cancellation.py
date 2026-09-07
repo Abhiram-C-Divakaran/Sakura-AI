@@ -10,6 +10,10 @@ import unittest
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+os.environ["ENVIRONMENT"] = "test"
+os.environ["SAKURA_EMBEDDED_WORKER"] = "false"
+os.environ["SAKURA_EMBEDDED_SCHEDULER"] = "false"
+
 from database.db import get_db_context
 from database.models import User, BackgroundTask, utc_now
 from tasks.worker import DurableTaskWorker, MAX_RETRIES, LEASE_DURATION_SECONDS

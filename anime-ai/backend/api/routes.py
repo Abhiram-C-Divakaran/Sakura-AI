@@ -996,6 +996,8 @@ def get_system_telemetry(user_id: str, user_uuid: uuid.UUID) -> dict:
 # System Status Broadcast Loop
 async def system_status_broadcast_loop():
     while True:
+        if os.getenv("ENVIRONMENT", "").lower() in ["test", "testing"]:
+            break
         try:
             await asyncio.sleep(1.0)
             for user_id in list(user_tokens_count.keys()):
@@ -1013,6 +1015,8 @@ async def system_status_broadcast_loop():
                     "data": telemetry
                 }
                 await ws_manager.send_to_user(user_id, status_payload)
+        except asyncio.CancelledError:
+            break
         except Exception:
             pass
 
@@ -1021,10 +1025,14 @@ _status_broadcast_task = None
 @router.on_event("startup")
 async def startup_event():
     global _status_broadcast_task
+    env_str = os.getenv("ENVIRONMENT", "").lower()
+    if env_str in ["test", "testing"]:
+        return
     from config.settings import get_settings
-    if get_settings().environment not in ["test", "testing"]:
-        await ws_manager.initialize()
-        _status_broadcast_task = asyncio.create_task(system_status_broadcast_loop())
+    if get_settings().environment in ["test", "testing"]:
+        return
+    await ws_manager.initialize()
+    _status_broadcast_task = asyncio.create_task(system_status_broadcast_loop())
 
 @router.on_event("shutdown")
 async def shutdown_event():

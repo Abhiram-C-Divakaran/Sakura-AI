@@ -15,6 +15,10 @@ from alembic.config import Config
 import sqlalchemy as sa
 from sqlalchemy.orm import Session, sessionmaker
 
+os.environ["ENVIRONMENT"] = "test"
+os.environ["SAKURA_EMBEDDED_WORKER"] = "false"
+os.environ["SAKURA_EMBEDDED_SCHEDULER"] = "false"
+
 from database.models import (
     Base, User, Document, DocumentChunk, Conversation, Message,
     MessageFeedback, ConversationShare, UserMemory, Character,

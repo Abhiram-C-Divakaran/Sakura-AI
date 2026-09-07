@@ -9,6 +9,11 @@ import shutil
 import tempfile
 import unittest
 import uuid
+
+os.environ["ENVIRONMENT"] = "test"
+os.environ["SAKURA_EMBEDDED_WORKER"] = "false"
+os.environ["SAKURA_EMBEDDED_SCHEDULER"] = "false"
+
 from coding.repository import WorkspaceManager
 from coding.executor import SandboxExecutor
 from coding.sandbox import LocalRestrictedSandboxRuntime, RemoteHttpSandboxRuntime

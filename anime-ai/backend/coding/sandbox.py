@@ -298,6 +298,15 @@ class LocalRestrictedSandboxRuntime(BaseSandboxRuntime):
         sanitized_env = WorkspaceSecurity.sanitize_environment()
 
         # 4. Launch subprocess
+        subprocess_kwargs = {
+            "cwd": run_cwd,
+            "env": sanitized_env,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE
+        }
+        if os.name != "nt":
+            subprocess_kwargs["start_new_session"] = True
+
         try:
             if isinstance(command, list):
                 clean_cmd = []
@@ -308,18 +317,12 @@ class LocalRestrictedSandboxRuntime(BaseSandboxRuntime):
                     clean_cmd.append(c_str)
                 proc = await asyncio.create_subprocess_exec(
                     *clean_cmd,
-                    cwd=run_cwd,
-                    env=sanitized_env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
+                    **subprocess_kwargs
                 )
             else:
                 proc = await asyncio.create_subprocess_shell(
                     command,
-                    cwd=run_cwd,
-                    env=sanitized_env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
+                    **subprocess_kwargs
                 )
 
             try:
@@ -384,7 +387,19 @@ class LocalRestrictedSandboxRuntime(BaseSandboxRuntime):
                 )
             else:
                 import signal
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
+                try:
+                    pgid = os.getpgid(pid)
+                    if pgid != os.getpgrp():
+                        os.killpg(pgid, signal.SIGKILL)
+                    else:
+                        os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except Exception:
+                        pass
         except Exception:
             pass
 

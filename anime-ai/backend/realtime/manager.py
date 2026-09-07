@@ -30,6 +30,8 @@ class RealtimeManager:
 
     async def initialize(self):
         """Initializes Redis connection and starts background pub/sub subscriber if available."""
+        if os.getenv("ENVIRONMENT", "").lower() in ["test", "testing"]:
+            return
         if self._running:
             return
         self._running = True

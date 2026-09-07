@@ -101,11 +101,18 @@ class WorkspaceSecurity:
         NEVER inherits os.environ and never passes host backend secrets.
         Baseline: PATH, HOME, LANG, LC_ALL, TERM, CI, NONINTERACTIVE, DEBIAN_FRONTEND, NODE_ENV.
         """
+        # Ensure python binary directory and system paths are in PATH
+        python_dir = os.path.dirname(sys.executable)
+        path_list = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+        if python_dir and python_dir not in path_list:
+            path_list.insert(0, python_dir)
+        path_str = os.pathsep.join(path_list)
+
         env = {
             "CI": "true",
             "NONINTERACTIVE": "1",
             "DEBIAN_FRONTEND": "noninteractive",
-            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "PATH": path_str,
             "HOME": "/tmp",
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
