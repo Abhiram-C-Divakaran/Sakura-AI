@@ -23,7 +23,10 @@ from tasks.task_manager import (
     execute_dataset_analysis,
     execute_web_research,
     execute_scheduled_task_job,
+    execute_document_index,
     emit_task_update,
+    TaskLeaseLostError,
+    assert_task_lease_owned,
 )
 from llm.router import LLMRouter
 
@@ -104,6 +107,7 @@ class DurableTaskWorker:
                     task.status = "Queued"
                     task.retry_count = current_retries + 1
                     task.worker_id = None
+                    task.execution_attempt_id = None
                     task.started_at = None
                     task.heartbeat_at = None
                     task.lease_expires_at = None
@@ -115,7 +119,8 @@ class DurableTaskWorker:
 
     def claim_next_task(self) -> Optional[BackgroundTask]:
         """
-        Atomically claims a queued task for this worker with lease and heartbeat timestamps.
+        Atomically claims a queued task for this worker with a unique execution_attempt_id fencing token,
+        lease expiration, and heartbeat timestamps.
         First checks Redis queue, then falls back to DB polling (using PostgreSQL FOR UPDATE SKIP LOCKED if available).
         """
         candidate_id_str: Optional[str] = None
@@ -130,6 +135,7 @@ class DurableTaskWorker:
 
         now = utc_now()
         lease_exp = now + timedelta(seconds=LEASE_DURATION_SECONDS)
+        attempt_id = uuid.uuid4()
 
         # 2. If Redis had a task ID, try to claim it atomically in DB
         if candidate_id_str:
@@ -142,6 +148,7 @@ class DurableTaskWorker:
                     ).update({
                         BackgroundTask.status: "Running",
                         BackgroundTask.worker_id: self.worker_id,
+                        BackgroundTask.execution_attempt_id: attempt_id,
                         BackgroundTask.started_at: now,
                         BackgroundTask.heartbeat_at: now,
                         BackgroundTask.lease_expires_at: lease_exp
@@ -163,6 +170,7 @@ class DurableTaskWorker:
                 if candidate:
                     candidate.status = "Running"
                     candidate.worker_id = self.worker_id
+                    candidate.execution_attempt_id = attempt_id
                     candidate.started_at = now
                     candidate.heartbeat_at = now
                     candidate.lease_expires_at = lease_exp
@@ -185,6 +193,7 @@ class DurableTaskWorker:
             ).update({
                 BackgroundTask.status: "Running",
                 BackgroundTask.worker_id: self.worker_id,
+                BackgroundTask.execution_attempt_id: attempt_id,
                 BackgroundTask.started_at: now,
                 BackgroundTask.heartbeat_at: now,
                 BackgroundTask.lease_expires_at: lease_exp
@@ -197,21 +206,36 @@ class DurableTaskWorker:
         return None
 
     async def execute_task(self, task: BackgroundTask):
-        """Dispatches claimed task to its respective execution handler with live heartbeat renewal."""
+        """Dispatches claimed task to its respective execution handler with live heartbeat renewal and fencing checks."""
         task_id = task.id
         user_id = task.user_id
         task_type = task.type
         payload = dict(task.payload or {})
+        attempt_id = task.execution_attempt_id or uuid.uuid4()
 
-        logger.info(f"Worker {self.worker_id} executing task {task_id} ({task_type}): '{task.title}'")
+        logger.info(f"Worker {self.worker_id} executing task {task_id} ({task_type}) [attempt={attempt_id}]: '{task.title}'")
 
-        # Check for immediate cancellation
+        # Check for immediate cancellation and ensure task lease is recorded in DB
         with get_db_context() as db:
             current = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
             if not current or current.cancel_requested or current.status == "Cancelled":
                 logger.info(f"Task {task_id} was cancelled before execution started.")
-                await update_task_state(task_id, "Cancelled", 100)
+                try:
+                    await update_task_state(task_id, "Cancelled", 100, worker_id=self.worker_id, execution_attempt_id=attempt_id)
+                except TaskLeaseLostError:
+                    pass
                 return
+
+            if current.worker_id != self.worker_id or current.execution_attempt_id != attempt_id:
+                now = utc_now()
+                lease_exp = now + timedelta(seconds=LEASE_DURATION_SECONDS)
+                current.status = "Running"
+                current.worker_id = self.worker_id
+                current.execution_attempt_id = attempt_id
+                current.started_at = current.started_at or now
+                current.heartbeat_at = now
+                current.lease_expires_at = lease_exp
+                db.commit()
 
         # Start periodic background heartbeat loop to keep lease active
         heartbeat_stop = asyncio.Event()
@@ -225,15 +249,23 @@ class DurableTaskWorker:
                     with get_db_context() as db:
                         hb_now = utc_now()
                         hb_lease = hb_now + timedelta(seconds=LEASE_DURATION_SECONDS)
-                        db.query(BackgroundTask).filter(
+                        rows = db.query(BackgroundTask).filter(
                             BackgroundTask.id == task_id,
                             BackgroundTask.worker_id == self.worker_id,
+                            BackgroundTask.execution_attempt_id == attempt_id,
                             BackgroundTask.status == "Running"
                         ).update({
                             BackgroundTask.heartbeat_at: hb_now,
                             BackgroundTask.lease_expires_at: hb_lease
                         })
                         db.commit()
+                        if rows == 0:
+                            logger.warning(
+                                f"Heartbeat failed: Worker {self.worker_id} lost ownership of task {task_id} "
+                                f"(token {attempt_id}). Stopping heartbeat loop."
+                            )
+                            heartbeat_stop.set()
+                            break
                 except asyncio.CancelledError:
                     break
                 except Exception as ex:
@@ -242,7 +274,7 @@ class DurableTaskWorker:
         hb_coro = asyncio.create_task(_heartbeat_loop())
 
         try:
-            await update_task_state(task_id, "Running", 10)
+            await update_task_state(task_id, "Running", 10, worker_id=self.worker_id, execution_attempt_id=attempt_id)
 
             if task_type == "code_analysis":
                 await execute_code_analysis(task_id, user_id, payload, self.router)
@@ -254,16 +286,27 @@ class DurableTaskWorker:
                 await execute_web_research(task_id, user_id, payload, self.router)
             elif task_type == "scheduled_run":
                 await execute_scheduled_task_job(task_id, user_id, payload, self.router)
+            elif task_type == "document_index":
+                await execute_document_index(task_id, user_id, payload, self.worker_id, attempt_id)
             else:
-                await update_task_state(task_id, "Failed", 100, error=f"Unknown task type: {task_type}")
+                await update_task_state(task_id, "Failed", 100, error=f"Unknown task type: {task_type}", worker_id=self.worker_id, execution_attempt_id=attempt_id)
 
             logger.info(f"Task {task_id} completed successfully.")
+        except TaskLeaseLostError as e:
+            logger.warning(f"Task {task_id} execution aborted: {e}. Worker {self.worker_id} no longer owns lease.")
+            return
         except asyncio.CancelledError:
             logger.info(f"Task {task_id} received cancellation signal.")
-            await update_task_state(task_id, "Cancelled", 100)
+            try:
+                await update_task_state(task_id, "Cancelled", 100, worker_id=self.worker_id, execution_attempt_id=attempt_id)
+            except TaskLeaseLostError:
+                pass
         except Exception as e:
             logger.error(f"Error executing task {task_id}: {e}", exc_info=True)
-            await update_task_state(task_id, "Failed", 100, error=str(e))
+            try:
+                await update_task_state(task_id, "Failed", 100, error=str(e), worker_id=self.worker_id, execution_attempt_id=attempt_id)
+            except TaskLeaseLostError:
+                pass
         finally:
             heartbeat_stop.set()
             hb_coro.cancel()

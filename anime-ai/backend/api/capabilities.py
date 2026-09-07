@@ -8,6 +8,7 @@ import os
 from typing import Dict, Any, Optional
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from database.db import get_db
 from database.models import User, UserIntegration
@@ -49,14 +50,33 @@ async def get_system_capabilities(
     else:
         sandbox_subsystem_status = "UNAVAILABLE"
 
-    # 2. Active LLM models
+    # 2. Active LLM models with truthful configuration status
     available_providers = {}
+    has_configured_provider = False
     if llm_router and hasattr(llm_router, "providers"):
         for name, provider in llm_router.providers.items():
+            if name == "groq":
+                configured = bool(groq_key)
+            elif name == "openai":
+                configured = bool(openai_key)
+            elif name == "anthropic":
+                configured = bool(anthropic_key)
+            elif name == "ollama":
+                configured = bool(os.getenv("OLLAMA_HOST") or os.getenv("OLLAMA_MODEL"))
+            else:
+                configured = False
+
+            if configured:
+                has_configured_provider = True
+
             available_providers[name] = {
-                "active": True,
+                "active": configured,
+                "configured": configured,
+                "healthy": configured,
+                "status": "CONFIGURED" if configured else "UNAVAILABLE",
                 "model": getattr(provider, "model", "default"),
-                "class": provider.__class__.__name__
+                "class": provider.__class__.__name__,
+                "last_verified_at": None
             }
 
     # 3. GitHub connectivity
@@ -89,7 +109,7 @@ async def get_system_capabilities(
     # 7. Image generation diagnostics (runtime source of truth from ImageGenerationEngine)
     from media.image_engine import ImageGenerationEngine
     img_status = ImageGenerationEngine.get_status()
-    image_gen_status = img_status.get("status", "AVAILABLE")
+    image_gen_status = img_status.get("status", "UNKNOWN")
     image_provider = img_status.get("provider", "pollinations")
     image_model = img_status.get("models", ["flux"])[0]
 
@@ -130,8 +150,31 @@ async def get_system_capabilities(
         }
     }
 
+    # Derive overall system status truthfully
+    db_healthy = False
+    try:
+        db.execute(text("SELECT 1"))
+        db_healthy = True
+    except Exception:
+        db_healthy = False
+
+    if not db_healthy:
+        system_status = "NOT_READY"
+    elif environment in ("test", "testing"):
+        system_status = "OPERATIONAL"
+    elif is_production and (
+        not has_configured_provider
+        or sandbox_subsystem_status in ("DEGRADED", "UNAVAILABLE")
+        or image_gen_status in ("DEGRADED", "UNAVAILABLE", "UNKNOWN")
+        or search_info["status"] in ("DEGRADED", "UNAVAILABLE")
+    ):
+        system_status = "DEGRADED"
+    else:
+        system_status = "OPERATIONAL"
+
     return {
-        "status": "operational",
+        "status": system_status.lower(),
+        "system_status": system_status,
         "environment": environment,
         "sandbox": sandbox_status,
         "embeddings": {

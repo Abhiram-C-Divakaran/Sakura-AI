@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useState, useMemo } from 'react';
 
-export type ThemeMode = 'pitch-black' | 'dark' | 'light' | 'blue';
+export type ThemeMode = 'pitch-black' | 'dark' | 'light';
 
 export interface ThemeMeta {
   id: ThemeMode;
@@ -9,7 +9,7 @@ export interface ThemeMeta {
   previewBg: string;
   previewBorder: string;
   previewAccent: string;
-  icon: 'moon' | 'sun' | 'sparkles' | 'droplet';
+  icon: 'sparkles' | 'moon' | 'sun';
 }
 
 export const THEME_LIST: ThemeMeta[] = [
@@ -18,17 +18,17 @@ export const THEME_LIST: ThemeMeta[] = [
     name: 'Pitch Black',
     description: 'Pure OLED black minimal aesthetic',
     previewBg: '#000000',
-    previewBorder: '#282828',
-    previewAccent: '#ff7597',
+    previewBorder: '#202020',
+    previewAccent: '#FF7597',
     icon: 'sparkles'
   },
   {
     id: 'dark',
     name: 'Dark Mode',
     description: 'Refined deep charcoal & slate tones',
-    previewBg: '#121318',
-    previewBorder: '#2b2e3c',
-    previewAccent: '#ff6584',
+    previewBg: '#111318',
+    previewBorder: '#262b3a',
+    previewAccent: '#FF7597',
     icon: 'moon'
   },
   {
@@ -37,17 +37,8 @@ export const THEME_LIST: ThemeMeta[] = [
     description: 'Crisp clean workspace with soft contrast',
     previewBg: '#f8fafc',
     previewBorder: '#cbd5e1',
-    previewAccent: '#e11d48',
+    previewAccent: '#FF7597',
     icon: 'sun'
-  },
-  {
-    id: 'blue',
-    name: 'Cyber Blue',
-    description: 'Deep midnight navy with electric blue glow',
-    previewBg: '#060b17',
-    previewBorder: '#1c2d56',
-    previewAccent: '#00f0ff',
-    icon: 'droplet'
   }
 ];
 
@@ -74,7 +65,7 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   useEffect(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY) as ThemeMode | null;
-      if (saved && (saved === 'pitch-black' || saved === 'dark' || saved === 'light' || saved === 'blue')) {
+      if (saved && (saved === 'pitch-black' || saved === 'dark' || saved === 'light')) {
         setThemeState(saved);
         applyThemeToDocument(saved);
       } else {
@@ -100,9 +91,8 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     if (metaThemeColor) {
       const themeColors: Record<ThemeMode, string> = {
         'pitch-black': '#000000',
-        'dark': '#121318',
-        'light': '#f8fafc',
-        'blue': '#060b17'
+        'dark': '#111318',
+        'light': '#f8fafc'
       };
       metaThemeColor.setAttribute('content', themeColors[mode]);
     }
@@ -119,7 +109,7 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   };
 
   const cycleTheme = () => {
-    const order: ThemeMode[] = ['pitch-black', 'dark', 'light', 'blue'];
+    const order: ThemeMode[] = ['pitch-black', 'dark', 'light'];
     const currentIndex = order.indexOf(theme);
     const nextTheme = order[(currentIndex + 1) % order.length];
     setTheme(nextTheme);

@@ -7,17 +7,46 @@ cancellation semantics, and real web research without artificial sleeps or fabri
 import os
 import uuid
 import asyncio
+import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
 
-from database.models import BackgroundTask, Document, DocumentChunk, utc_now
+from database.models import BackgroundTask, Document, DocumentChunk, DocumentIndexingStatus, utc_now
 from database.db import get_db_context
 from llm.router import LLMRouter
 from services.web_search import perform_web_search
 
+logger = logging.getLogger("sakura.tasks")
 
 ACTIVE_ASYNCIO_TASKS: Dict[str, asyncio.Task] = {}
+
+
+class TaskLeaseLostError(Exception):
+    """Raised when worker has lost lease ownership due to fencing token mismatch or expiration."""
+    pass
+
+
+def assert_task_lease_owned(
+    task_id: uuid.UUID,
+    worker_id: Optional[str] = None,
+    execution_attempt_id: Optional[uuid.UUID] = None
+) -> bool:
+    """Verifies that the given worker_id and attempt token currently own the task lease."""
+    if not worker_id or not execution_attempt_id:
+        return True
+    with get_db_context() as db:
+        task = db.query(BackgroundTask).filter(
+            BackgroundTask.id == task_id,
+            BackgroundTask.worker_id == worker_id,
+            BackgroundTask.execution_attempt_id == execution_attempt_id,
+            BackgroundTask.status.in_(["Starting", "Running"])
+        ).first()
+        if not task:
+            raise TaskLeaseLostError(
+                f"Task {task_id} lease lost: worker '{worker_id}' with token '{execution_attempt_id}' is no longer the active owner."
+            )
+        return True
 
 
 class TaskManager:
@@ -41,12 +70,20 @@ class TaskManager:
             db.commit()
             db.refresh(task)
 
-            # 1. Always enqueue to durable Redis task queue
+            # 1. Enqueue to durable Redis task queue with fallback logging
             try:
                 from tasks.worker import enqueue_task
-                enqueue_task(task.id)
+                enqueued = enqueue_task(task.id)
+                if not enqueued:
+                    logger.info(
+                        "Task %s stored authoritatively in DB; queue_transport=db_poll_fallback",
+                        task.id
+                    )
             except Exception as e:
-                logger.warning(f"Failed to enqueue task {task.id} to Redis: {e}")
+                logger.warning(
+                    "Failed to enqueue task %s to Redis: %s; queue_transport=db_poll_fallback",
+                    task.id, e
+                )
 
             # Embedded worker is opt-in only (default false everywhere)
             embedded_worker = os.getenv("SAKURA_EMBEDDED_WORKER", "false").lower() == "true"
@@ -217,12 +254,28 @@ async def update_task_state(
     progress: int,
     error: Optional[str] = None,
     result: Optional[str] = None,
-    result_metadata: Optional[dict] = None
+    result_metadata: Optional[dict] = None,
+    worker_id: Optional[str] = None,
+    execution_attempt_id: Optional[uuid.UUID] = None
 ) -> Optional[dict]:
-    """Updates task in database and broadcasts update. Protects terminal states and respects cancellation."""
+    """
+    Updates task in database and broadcasts update.
+    Protects terminal states, respects cancellation, and enforces compare-and-set execution fencing.
+    If execution_attempt_id is specified and does not match active record, raises TaskLeaseLostError.
+    """
     with get_db_context() as db:
-        task = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
+        query = db.query(BackgroundTask).filter(BackgroundTask.id == task_id)
+        if execution_attempt_id is not None:
+            query = query.filter(BackgroundTask.execution_attempt_id == execution_attempt_id)
+        if worker_id is not None:
+            query = query.filter(BackgroundTask.worker_id == worker_id)
+
+        task = query.first()
         if not task:
+            if execution_attempt_id is not None or worker_id is not None:
+                raise TaskLeaseLostError(
+                    f"Task {task_id} state update rejected: worker '{worker_id}' with attempt token '{execution_attempt_id}' has lost lease ownership."
+                )
             return None
 
         # Terminal state protection: Completed, Failed, and Cancelled cannot be overwritten by progress updates
@@ -284,6 +337,8 @@ async def run_task_execution(task_id: uuid.UUID, user_id: uuid.UUID):
             await execute_web_research(task_id, user_id, payload, router)
         elif task_type == "scheduled_run":
             await execute_scheduled_task_job(task_id, user_id, payload, router)
+        elif task_type == "document_index":
+            await execute_document_index(task_id, user_id, payload)
         else:
             await update_task_state(task_id, "Failed", 100, error=f"Unknown task type: {task_type}")
 
@@ -547,4 +602,183 @@ async def execute_scheduled_task_job(
                 run.duration_ms = duration_ms
                 db.commit()
         await update_task_state(task_id, "Failed", 100, error=str(e))
+
+
+async def execute_document_index(
+    task_id: uuid.UUID,
+    user_id: uuid.UUID,
+    payload: dict,
+    worker_id: Optional[str] = None,
+    execution_attempt_id: Optional[uuid.UUID] = None
+):
+    """
+    Durable Document Indexing Worker Handler:
+    1. Verify lease ownership via assert_task_lease_owned
+    2. Read file bytes from durable StorageBackend
+    3. Parse file text
+    4. Chunk content
+    5. Generate dense vector embeddings
+    6. Transactionally persist DocumentChunk records
+    7. Update Document.is_knowledge_base = True, Document.indexing_status = READY
+    8. Send realtime WebSocket updates across real phase transitions
+    """
+    doc_id_str = payload.get("document_id")
+    if not doc_id_str:
+        await update_task_state(task_id, "Failed", 100, error="Missing document_id in payload", worker_id=worker_id, execution_attempt_id=execution_attempt_id)
+        return
+
+    doc_uuid = uuid.UUID(doc_id_str)
+    from api.routes import ws_manager
+    from api.library import serialize_document
+    from rag.ingestion.parser import DocumentParser
+    from rag.embeddings.manager import EmbeddingManager
+    from services.storage import get_storage_backend
+
+    assert_task_lease_owned(task_id, worker_id, execution_attempt_id)
+
+    with get_db_context() as db:
+        doc = db.query(Document).filter(Document.id == doc_uuid, Document.user_id == user_id).first()
+        if not doc:
+            await update_task_state(task_id, "Failed", 100, error="Document not found", worker_id=worker_id, execution_attempt_id=execution_attempt_id)
+            return
+
+        doc.indexing_status = DocumentIndexingStatus.PARSING
+        doc.metadata_json = {**(doc.metadata_json or {}), "indexing_status": "Parsing", "status": "INDEXING"}
+        db.commit()
+        db.refresh(doc)
+        serialized_doc = serialize_document(doc)
+
+    await ws_manager.send_to_user(str(user_id), {
+        "type": "library_update",
+        "action": "updated",
+        "data": serialized_doc
+    })
+    await update_task_state(task_id, "Running", 20, worker_id=worker_id, execution_attempt_id=execution_attempt_id)
+
+    storage = get_storage_backend(doc.storage_backend)
+
+    # 1. Read file bytes from storage backend
+    try:
+        if doc.storage_key and storage.exists(doc.storage_key):
+            file_bytes = storage.get_bytes(doc.storage_key)
+        elif doc.storage_path and os.path.exists(doc.storage_path):
+            with open(doc.storage_path, "rb") as f:
+                file_bytes = f.read()
+        else:
+            raise FileNotFoundError(f"Document file not found in storage (key: {doc.storage_key}, path: {doc.storage_path})")
+
+        # Parse file text safely
+        import tempfile
+        ext = os.path.splitext(doc.filename)[1]
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        try:
+            parser = DocumentParser()
+            raw_text = parser.parse_file(tmp_path, doc.mime_type)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    except Exception as e:
+        logger.error(f"Failed to parse document {doc_uuid}: {e}", exc_info=True)
+        with get_db_context() as db:
+            d = db.query(Document).filter(Document.id == doc_uuid).first()
+            if d:
+                d.is_knowledge_base = False
+                d.indexing_status = DocumentIndexingStatus.FAILED
+                d.metadata_json = {**(d.metadata_json or {}), "indexing_status": "Failed", "status": "FAILED", "error": str(e)}
+                db.commit()
+                db.refresh(d)
+                serialized = serialize_document(d)
+        await ws_manager.send_to_user(str(user_id), {"type": "library_update", "action": "updated", "data": serialized})
+        await update_task_state(task_id, "Failed", 100, error=str(e), worker_id=worker_id, execution_attempt_id=execution_attempt_id)
+        return
+
+    # 2. Chunking phase
+    assert_task_lease_owned(task_id, worker_id, execution_attempt_id)
+    with get_db_context() as db:
+        d = db.query(Document).filter(Document.id == doc_uuid).first()
+        if d:
+            d.indexing_status = DocumentIndexingStatus.CHUNKING
+            d.metadata_json = {**(d.metadata_json or {}), "indexing_status": "Chunking"}
+            db.commit()
+            db.refresh(d)
+            serialized = serialize_document(d)
+    await ws_manager.send_to_user(str(user_id), {"type": "library_update", "action": "updated", "data": serialized})
+    await update_task_state(task_id, "Running", 45, worker_id=worker_id, execution_attempt_id=execution_attempt_id)
+
+    chunks = parser.get_chunks(raw_text)
+
+    # 3. Embedding phase
+    assert_task_lease_owned(task_id, worker_id, execution_attempt_id)
+    with get_db_context() as db:
+        d = db.query(Document).filter(Document.id == doc_uuid).first()
+        if d:
+            d.indexing_status = DocumentIndexingStatus.EMBEDDING
+            d.metadata_json = {**(d.metadata_json or {}), "indexing_status": "Embedding"}
+            db.commit()
+            db.refresh(d)
+            serialized = serialize_document(d)
+    await ws_manager.send_to_user(str(user_id), {"type": "library_update", "action": "updated", "data": serialized})
+    await update_task_state(task_id, "Running", 70, worker_id=worker_id, execution_attempt_id=execution_attempt_id)
+
+    embed_mgr = EmbeddingManager()
+    contents = [c["content"] for c in chunks]
+    embeddings = embed_mgr.get_embeddings(contents)
+
+    # 4. Final transactional chunk persistence
+    assert_task_lease_owned(task_id, worker_id, execution_attempt_id)
+    with get_db_context() as db:
+        d = db.query(Document).filter(Document.id == doc_uuid).first()
+        if not d:
+            raise FileNotFoundError("Document was deleted during indexing")
+
+        # Transactionally remove old chunks
+        db.query(DocumentChunk).filter(DocumentChunk.document_id == d.id).delete()
+
+        # Insert new chunks
+        for i, chunk in enumerate(chunks):
+            db_chunk = DocumentChunk(
+                document_id=d.id,
+                chunk_index=chunk["chunk_index"],
+                content=chunk["content"],
+                embedding=embeddings[i] if i < len(embeddings) else None,
+                metadata_json=chunk["metadata"]
+            )
+            db.add(db_chunk)
+
+        # Mark Document authoritative KB columns
+        d.is_knowledge_base = True
+        d.indexing_status = DocumentIndexingStatus.READY
+        d.metadata_json = {
+            **(d.metadata_json or {}),
+            "indexing_status": "Ready",
+            "status": "READY",
+            "is_knowledge_base": True,
+            "chunks": len(chunks),
+            "error": None
+        }
+        db.commit()
+        db.refresh(d)
+        final_serialized = serialize_document(d)
+
+    await ws_manager.send_to_user(str(user_id), {
+        "type": "library_update",
+        "action": "updated",
+        "data": final_serialized
+    })
+    await update_task_state(
+        task_id,
+        "Completed",
+        100,
+        result=f"Successfully indexed document '{d.filename}' ({len(chunks)} chunks).",
+        result_metadata={"chunks": len(chunks), "document_id": str(doc_uuid)},
+        worker_id=worker_id,
+        execution_attempt_id=execution_attempt_id
+    )
 

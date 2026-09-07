@@ -14,6 +14,7 @@ from typing import Optional, Dict, Any, List
 from zoneinfo import ZoneInfo
 from croniter import croniter
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from database.models import ScheduledTask, ScheduledTaskRun, User, utc_now
 from database.db import get_db_context
@@ -159,6 +160,11 @@ class TaskSchedulerService:
                     t.next_run_at = compute_next_run(t.schedule, t.timezone, now)
                 except Exception as e:
                     logger.error(f"Cannot compute initial next_run_at for task {t.id}: {e}")
+                    t.enabled = False
+                    meta = dict(t.metadata_json or {})
+                    meta["last_error"] = str(e)
+                    meta["error_reason"] = "invalid_schedule_or_timezone"
+                    t.metadata_json = meta
             if uninitialized:
                 db.commit()
 
@@ -174,6 +180,14 @@ class TaskSchedulerService:
                     next_run = compute_next_run(t.schedule, t.timezone, now)
                 except Exception as e:
                     logger.error(f"Cannot compute next run for task {t.id}: {e}")
+                    t.enabled = False
+                    meta = dict(t.metadata_json or {})
+                    meta["last_error"] = str(e)
+                    meta["error_reason"] = "invalid_schedule_or_timezone"
+                    t.metadata_json = meta
+                    db.commit()
+                    continue
+
                 # Idempotency pre-check: skip if run for this occurrence was already created
                 existing_run = db.query(ScheduledTaskRun).filter(
                     ScheduledTaskRun.task_id == t.id,
@@ -241,7 +255,7 @@ class TaskSchedulerService:
                     db.commit()
                     logger.info(f"Transactionally dispatched scheduled task {t.id} (Run: {run_id}, Job: {bg_task_id})")
 
-                except sa.exc.IntegrityError:
+                except IntegrityError:
                     db.rollback()
                     logger.info(f"Occurrence for task {t.id} at {occurrence_time} already claimed (idempotency enforced by DB). Skipping.")
                     continue

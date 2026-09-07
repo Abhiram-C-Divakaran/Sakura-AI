@@ -8,7 +8,7 @@ Core Capabilities:
    - UI: Modern dark-mode console / dashboard / software mockups
    - VECTOR: SVG / vector generation ONLY when explicitly requested by user
    - EDIT: Conversational multi-turn image editing with context preservation & lineage tracking
-   - UPSCALE: Real multi-stage resolution enhancement
+   - HIGH_RES_REGENERATION: High-detail prompt-based regeneration (not pixel super-resolution)
    - TEXT_TO_IMAGE: General high-fidelity raster generation
 2. QualityEvaluator & Bounded Retries (max 2 retries):
    - Health checks on image binary integrity, resolution, minimum payload size
@@ -23,6 +23,7 @@ import os
 import re
 import uuid
 import json
+import time
 import random
 import asyncio
 import urllib.request
@@ -33,9 +34,18 @@ from typing import Dict, Any, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from database.models import User, Document, GeneratedImage
+from services.storage import get_storage_backend, build_image_storage_key
 
 UPLOAD_DIR = "./uploaded_documents"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Upstream image health status cache
+_IMG_HEALTH_CACHE: Dict[str, Any] = {
+    "status": "CONFIGURED",
+    "last_check": 0.0,
+    "last_verified_at": None,
+    "failure_count": 0
+}
 
 # ─── Aspect Ratio Dimensions ──────────────────────────────────────────────────
 ASPECT_RATIO_MAP = {
@@ -159,11 +169,54 @@ class ImageGenerationEngine:
     def get_status(cls) -> Dict[str, Any]:
         """
         Returns truthful runtime status of the image generation engine.
-        Reflects actual Pollinations (Flux/Turbo) raster rendering and reports
-        image_conditioned_edit=False and true_upscale=False.
+        Reflects actual upstream provider connectivity with a 60s TTL cache.
+        Reports truthful capabilities: image_conditioned_edit=False and true_upscale=False.
         """
+        now = time.time()
+        # If cache is valid within 60 seconds, return cached status
+        if _IMG_HEALTH_CACHE["last_check"] > 0 and (now - _IMG_HEALTH_CACHE["last_check"] < 60.0):
+            return {
+                "status": _IMG_HEALTH_CACHE["status"],
+                "provider": "pollinations",
+                "models": ["flux", "turbo"],
+                "text_to_image": True,
+                "image_conditioned_edit": False,
+                "true_upscale": False,
+                "variations": True,
+                "prompt_variation": True,
+                "high_res_regeneration": True,
+                "health_verified_at": _IMG_HEALTH_CACHE["last_verified_at"]
+            }
+
+        # Perform actual lightweight upstream check
+        status = "CONFIGURED"
+        verified_at = None
+        try:
+            req = urllib.request.Request(
+                "https://image.pollinations.ai/prompt/ping?width=16&height=16&nologo=true",
+                headers={"User-Agent": "SakuraAI-HealthCheck/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if resp.status in (200, 301, 302):
+                    status = "AVAILABLE"
+                    verified_at = datetime.utcnow().isoformat()
+                    _IMG_HEALTH_CACHE["failure_count"] = 0
+                else:
+                    status = "DEGRADED"
+        except Exception:
+            _IMG_HEALTH_CACHE["failure_count"] += 1
+            if _IMG_HEALTH_CACHE["failure_count"] > 2:
+                status = "UNAVAILABLE"
+            else:
+                status = "DEGRADED"
+
+        _IMG_HEALTH_CACHE["status"] = status
+        _IMG_HEALTH_CACHE["last_check"] = now
+        if verified_at:
+            _IMG_HEALTH_CACHE["last_verified_at"] = verified_at
+
         return {
-            "status": "AVAILABLE",
+            "status": status,
             "provider": "pollinations",
             "models": ["flux", "turbo"],
             "text_to_image": True,
@@ -172,7 +225,7 @@ class ImageGenerationEngine:
             "variations": True,
             "prompt_variation": True,
             "high_res_regeneration": True,
-            "health_verified_at": datetime.utcnow().isoformat()
+            "health_verified_at": _IMG_HEALTH_CACHE["last_verified_at"]
         }
 
     # ─── 1. Aspect Ratio Inference ────────────────────────────────────────────
@@ -447,6 +500,14 @@ class ImageGenerationEngine:
         failover_used = (actual_model != "flux")
         attempt_count = successful_attempt
 
+        # Store in durable storage backend
+        storage = get_storage_backend()
+        storage_key = build_image_storage_key(str(self.user_id), str(image_id))
+        with open(storage_path, "rb") as f:
+            image_bytes = f.read()
+        storage.put(storage_key, image_bytes, content_type="image/png")
+        file_size = len(image_bytes)
+
         # 1. Register Document in Sakura Library
         doc = Document(
             id=image_id,
@@ -454,9 +515,14 @@ class ImageGenerationEngine:
             filename=filename,
             mime_type="image/png",
             storage_path=storage_path,
+            storage_backend=storage.backend_type,
+            storage_key=storage_key,
+            storage_size=file_size,
+            is_knowledge_base=False,
+            indexing_status="NOT_INDEXED",
             metadata_json={
                 "status": "READY",
-                "indexing_status": "Ready",
+                "indexing_status": "NOT_INDEXED",
                 "size": file_size,
                 "category": "images",
                 "source": "image_generation",
@@ -501,6 +567,9 @@ class ImageGenerationEngine:
             parent_image_id=valid_parent_id,
             lineage_depth=lineage_depth,
             storage_path=storage_path,
+            storage_backend=storage.backend_type,
+            storage_key=storage_key,
+            storage_size=file_size,
             image_url=public_image_url,
             metadata_json={
                 "provider": actual_provider,

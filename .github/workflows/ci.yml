@@ -119,3 +119,72 @@ jobs:
 
       - name: Production Build
         run: npm run build
+
+  sandbox-integration:
+    name: Docker Sandbox E2E Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build Sandbox Execution Container
+        run: |
+          docker build -t sakura-sandbox:latest -f anime-ai/sandbox/Dockerfile anime-ai/sandbox
+
+      - name: Build Sandbox Executor Service
+        run: |
+          docker build -t sakura-sandbox-executor:latest -f anime-ai/backend/Dockerfile.sandbox-executor anime-ai/backend
+
+      - name: Create Workspaces Volume and Start Executor
+        env:
+          POSTGRES_PASSWORD: "ci_secret_super_secret_pg_pwd"
+          JWT_SECRET: "ci_secret_super_secret_jwt_key_32c"
+          HOST_SENSITIVE_SECRET: "very_sensitive_host_secret_should_never_leak"
+          SAKURA_SANDBOX_SERVICE_TOKEN: "ci_test_sandbox_token_abc123"
+        run: |
+          docker volume create sakura_workspaces_vol
+          docker run -d --name sakura-sandbox-executor \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v sakura_workspaces_vol:/workspaces \
+            -e SAKURA_SANDBOX_SERVICE_TOKEN=ci_test_sandbox_token_abc123 \
+            -e SAKURA_SANDBOX_IMAGE=sakura-sandbox:latest \
+            -e SAKURA_WORKSPACES_VOLUME=sakura_workspaces_vol \
+            -e SAKURA_WORKSPACE_ROOT=/workspaces \
+            -e POSTGRES_PASSWORD="ci_secret_super_secret_pg_pwd" \
+            -e JWT_SECRET="ci_secret_super_secret_jwt_key_32c" \
+            -e HOST_SENSITIVE_SECRET="very_sensitive_host_secret_should_never_leak" \
+            -e ENVIRONMENT="production" \
+            -p 9000:9000 \
+            sakura-sandbox-executor:latest
+
+      - name: Wait for Executor Service Readiness
+        run: |
+          timeout 60 bash -c 'until curl -sf http://localhost:9000/health; do echo "Waiting for sandbox executor..."; sleep 2; done'
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: anime-ai/backend/requirements.txt
+
+      - name: Install Test Dependencies
+        working-directory: anime-ai/backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run Sandbox E2E Docker Integration Test
+        working-directory: anime-ai/backend
+        env:
+          SAKURA_SANDBOX_E2E: "1"
+          SAKURA_SANDBOX_URL: "http://localhost:9000"
+          SAKURA_SANDBOX_SERVICE_TOKEN: "ci_test_sandbox_token_abc123"
+          POSTGRES_PASSWORD: "ci_secret_super_secret_pg_pwd"
+          JWT_SECRET: "ci_secret_super_secret_jwt_key_32c"
+          HOST_SENSITIVE_SECRET: "very_sensitive_host_secret_should_never_leak"
+        run: |
+          python -m unittest tests/test_sandbox_e2e_docker.py -v
+

@@ -40,6 +40,17 @@ class User(Base):
     workspaces = relationship("RepositoryWorkspace", back_populates="user", cascade="all, delete-orphan")
 
 
+class DocumentIndexingStatus:
+    UPLOADED = "UPLOADED"
+    QUEUED = "QUEUED"
+    PARSING = "PARSING"
+    CHUNKING = "CHUNKING"
+    EMBEDDING = "EMBEDDING"
+    READY = "READY"
+    FAILED = "FAILED"
+    NOT_INDEXED = "NOT_INDEXED"
+
+
 class Document(Base):
     __tablename__ = "documents"
 
@@ -48,6 +59,9 @@ class Document(Base):
     filename = Column(String(255), nullable=False)
     mime_type = Column(String(100), nullable=False)
     storage_path = Column(String(510), nullable=False)
+    storage_backend = Column(String(50), default="local", nullable=False)
+    storage_key = Column(String(510), nullable=True, index=True)
+    storage_size = Column(Integer, nullable=True)
     metadata_json = Column(JSON, default=dict, name="metadata")
     is_knowledge_base = Column(Boolean, default=False, nullable=False, index=True)
     indexing_status = Column(String(50), default="UPLOADED", nullable=False, index=True)
@@ -183,6 +197,9 @@ class GeneratedImage(Base):
     lineage_depth = Column(Integer, default=0)
 
     storage_path = Column(String(510), nullable=False)
+    storage_backend = Column(String(50), default="local", nullable=False)
+    storage_key = Column(String(510), nullable=True, index=True)
+    storage_size = Column(Integer, nullable=True)
     image_url = Column(String(510), nullable=False)
     metadata_json = Column(JSON, default=dict, name="metadata")
     created_at = Column(DateTime(timezone=True), default=utc_now)
@@ -382,6 +399,15 @@ class ToolExecution(Base):
 
 # ─── Durable Background Tasks ──────────────────────────────────────────────
 
+class BackgroundTaskStatus:
+    QUEUED = "Queued"
+    STARTING = "Starting"
+    RUNNING = "Running"
+    COMPLETED = "Completed"
+    FAILED = "Failed"
+    CANCELLED = "Cancelled"
+
+
 class BackgroundTask(Base):
     __tablename__ = "background_tasks"
 
@@ -400,6 +426,7 @@ class BackgroundTask(Base):
     result_metadata = Column(JSON, default=dict)
     retry_count = Column(Integer, default=0)
     worker_id = Column(String(100), nullable=True)
+    execution_attempt_id = Column(UUID(as_uuid=True), nullable=True, index=True)
     lease_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
     heartbeat_at = Column(DateTime(timezone=True), nullable=True)
     cancel_requested = Column(Boolean, default=False, nullable=False)
@@ -422,6 +449,7 @@ class BackgroundTask(Base):
             "userId": str(self.user_id),
             "retryCount": self.retry_count,
             "workerId": self.worker_id,
+            "executionAttemptId": str(self.execution_attempt_id) if self.execution_attempt_id else None,
             "leaseExpiresAt": self.lease_expires_at.isoformat() if self.lease_expires_at else None,
             "cancelRequested": self.cancel_requested,
             "resultMetadata": self.result_metadata or {},

@@ -3,26 +3,25 @@ import shutil
 import uuid
 import json
 import asyncio
-import urllib.request
-import urllib.parse
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, BackgroundTasks, Query, Request
-from fastapi.responses import FileResponse, Response, JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query, Request
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, desc, asc
 from pydantic import BaseModel
 
 from database.db import get_db, get_db_context
-from database.models import User, Document, DocumentChunk
+from database.models import User, Document, DocumentChunk, DocumentIndexingStatus, GeneratedImage
 from auth.manager import AuthManager
-from rag.ingestion.parser import DocumentParser
-from rag.embeddings.manager import EmbeddingManager
+from services.storage import (
+    get_storage_backend,
+    build_document_storage_key,
+    build_image_storage_key,
+    assert_user_storage_key,
+)
 
 router = APIRouter(prefix="/library", tags=["library"])
 
-UPLOAD_DIR = "./uploaded_documents"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Helper to categorize MIME types & extensions
 def get_file_category(mime_type: str, filename: str) -> str:
@@ -37,104 +36,20 @@ def get_file_category(mime_type: str, filename: str) -> str:
         return "documents"
     return "other"
 
-# Background worker for RAG ingestion
-async def async_index_document(doc_id: uuid.UUID, user_id: uuid.UUID):
-    from api.routes import ws_manager
-    with get_db_context() as db:
-        doc = db.query(Document).filter(Document.id == doc_id).first()
-        if not doc:
-            return
-
-        try:
-            # Update status to Parsing
-            doc.metadata_json = {**doc.metadata_json, "indexing_status": "Parsing", "status": "INDEXING"}
-            db.commit()
-            await ws_manager.send_to_user(str(user_id), {
-                "type": "library_update",
-                "action": "updated",
-                "data": serialize_document(doc)
-            })
-            await asyncio.sleep(0.3)
-
-            # Parse file
-            parser = DocumentParser()
-            raw_text = parser.parse_file(doc.storage_path, doc.mime_type)
-
-            # Chunking
-            doc.metadata_json = {**doc.metadata_json, "indexing_status": "Chunking"}
-            db.commit()
-            await ws_manager.send_to_user(str(user_id), {
-                "type": "library_update",
-                "action": "updated",
-                "data": serialize_document(doc)
-            })
-            await asyncio.sleep(0.3)
-
-            chunks = parser.get_chunks(raw_text)
-
-            # Embedding
-            doc.metadata_json = {**doc.metadata_json, "indexing_status": "Embedding"}
-            db.commit()
-            await ws_manager.send_to_user(str(user_id), {
-                "type": "library_update",
-                "action": "updated",
-                "data": serialize_document(doc)
-            })
-            await asyncio.sleep(0.3)
-
-            embed_mgr = EmbeddingManager()
-            contents = [c["content"] for c in chunks]
-            embeddings = embed_mgr.get_embeddings(contents)
-
-            # Clean any old chunks first if re-indexing
-            db.query(DocumentChunk).filter(DocumentChunk.document_id == doc.id).delete()
-
-            for i, chunk in enumerate(chunks):
-                db_chunk = DocumentChunk(
-                    document_id=doc.id,
-                    chunk_index=chunk["chunk_index"],
-                    content=chunk["content"],
-                    embedding=embeddings[i],
-                    metadata_json=chunk["metadata"]
-                )
-                db.add(db_chunk)
-
-            # Ready
-            doc.metadata_json = {
-                **doc.metadata_json,
-                "indexing_status": "Ready",
-                "status": "READY",
-                "is_knowledge_base": True,
-                "chunks": len(chunks)
-            }
-            db.commit()
-            await ws_manager.send_to_user(str(user_id), {
-                "type": "library_update",
-                "action": "updated",
-                "data": serialize_document(doc)
-            })
-
-        except Exception as e:
-            # Failed
-            doc.metadata_json = {
-                **doc.metadata_json,
-                "indexing_status": "Failed",
-                "status": "FAILED",
-                "error": str(e)
-            }
-            db.commit()
-            await ws_manager.send_to_user(str(user_id), {
-                "type": "library_update",
-                "action": "updated",
-                "data": serialize_document(doc)
-            })
 
 def serialize_document(doc: Document) -> Dict[str, Any]:
+    """
+    Serializes Document reading canonical DB fields (Document.is_knowledge_base and Document.indexing_status)
+    as authoritative sources of truth.
+    """
     meta = doc.metadata_json or {}
     category = meta.get("category") or get_file_category(doc.mime_type, doc.filename)
-    status_val = meta.get("status") or meta.get("indexing_status") or "READY"
-    is_kb = meta.get("is_knowledge_base", meta.get("chunks", 0) > 0)
-    
+
+    # Real database fields are authoritative
+    is_kb = bool(doc.is_knowledge_base)
+    idx_status = doc.indexing_status or DocumentIndexingStatus.NOT_INDEXED
+    size_bytes = doc.storage_size if doc.storage_size is not None else meta.get("size", 0)
+
     return {
         "id": str(doc.id),
         "name": doc.filename,
@@ -142,16 +57,20 @@ def serialize_document(doc: Document) -> Dict[str, Any]:
         "mime_type": doc.mime_type,
         "category": category,
         "source": meta.get("source", "upload"),
-        "status": status_val,
-        "size_bytes": meta.get("size", 0),
-        "size": meta.get("size", 0),
+        "status": idx_status,
+        "indexing_status": idx_status,
+        "size_bytes": size_bytes,
+        "size": size_bytes,
         "is_knowledge_base": is_kb,
         "chunks": meta.get("chunks", 0),
-        "created_at": doc.created_at.isoformat() if doc.created_at else datetime.utcnow().isoformat(),
-        "modified_at": meta.get("modified_at", doc.created_at.isoformat() if doc.created_at else datetime.utcnow().isoformat()),
+        "created_at": doc.created_at.isoformat() if doc.created_at else datetime.now(timezone.utc).isoformat(),
+        "modified_at": meta.get("modified_at", doc.created_at.isoformat() if doc.created_at else datetime.now(timezone.utc).isoformat()),
         "error": meta.get("error", None),
+        "storage_backend": getattr(doc, "storage_backend", "local") or "local",
+        "storage_key": getattr(doc, "storage_key", None),
         "metadata": meta
     }
+
 
 # ─── Endpoints ─────────────────────────────────────────────────────────────
 
@@ -164,27 +83,21 @@ def list_library_files(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Returns the authenticated user's real stored files with search, category filtering, and sorting.
-    """
+    """Returns the authenticated user's real stored files with search, category filtering, and sorting."""
     query = db.query(Document).filter(Document.user_id == current_user.id)
 
-    # Search query
     if q and q.strip():
         search_term = f"%{q.strip()}%"
         query = query.filter(Document.filename.ilike(search_term))
 
-    # Fetch results
     docs = query.all()
 
-    # Category filter based on validated MIME type & extension
     if category and category.lower() != "all":
         cat_lower = category.lower()
         docs = [d for d in docs if (d.metadata_json or {}).get("category", get_file_category(d.mime_type, d.filename)) == cat_lower]
 
     serialized = [serialize_document(d) for d in docs]
 
-    # Sorting
     reverse = (order.lower() == "desc")
     if sort_by == "name":
         serialized.sort(key=lambda x: x["name"].lower(), reverse=reverse)
@@ -192,10 +105,11 @@ def list_library_files(
         serialized.sort(key=lambda x: x["size_bytes"], reverse=reverse)
     elif sort_by == "type":
         serialized.sort(key=lambda x: (x["category"], x["mime_type"]), reverse=reverse)
-    else:  # modified
+    else:
         serialized.sort(key=lambda x: x["modified_at"], reverse=reverse)
 
     return serialized
+
 
 @router.get("/files/{file_id}")
 def get_library_file(
@@ -215,13 +129,14 @@ def get_library_file(
 
     return serialize_document(doc)
 
+
 @router.get("/files/{file_id}/content")
 def get_library_file_content(
     file_id: str,
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Reads raw text / code / CSV content for in-browser preview."""
+    """Reads raw text / code / CSV content for in-browser preview from durable storage backend."""
     try:
         doc_uuid = uuid.UUID(file_id)
     except ValueError:
@@ -231,21 +146,34 @@ def get_library_file_content(
     if not doc:
         raise HTTPException(status_code=404, detail="File not found")
 
-    if not os.path.exists(doc.storage_path):
+    storage = get_storage_backend(getattr(doc, "storage_backend", "local"))
+    content_bytes = None
+
+    if doc.storage_key and storage.exists(doc.storage_key):
+        try:
+            content_bytes = storage.get_bytes(doc.storage_key)
+        except Exception:
+            pass
+
+    if content_bytes is None and doc.storage_path and os.path.exists(doc.storage_path):
+        try:
+            with open(doc.storage_path, "rb") as f:
+                content_bytes = f.read(500000)
+        except Exception:
+            pass
+
+    if content_bytes is None:
         raise HTTPException(status_code=404, detail="Physical file missing from storage")
 
     category = (doc.metadata_json or {}).get("category", get_file_category(doc.mime_type, doc.filename))
-    
-    # Read text content
     try:
-        with open(doc.storage_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read(500000)  # Max 500KB preview
+        content_text = content_bytes[:500000].decode("utf-8", errors="replace")
         return {
             "id": str(doc.id),
             "filename": doc.filename,
             "mime_type": doc.mime_type,
             "category": category,
-            "content": content,
+            "content": content_text,
             "is_text": True
         }
     except Exception as e:
@@ -258,6 +186,7 @@ def get_library_file_content(
             "is_text": False,
             "error": str(e)
         }
+
 
 def authenticate_user_from_req(token: Optional[str], req_headers: Any, db: Session) -> User:
     """Extracts and verifies user from query token or Authorization header."""
@@ -281,6 +210,7 @@ def authenticate_user_from_req(token: Optional[str], req_headers: Any, db: Sessi
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired authentication token")
 
+
 @router.get("/files/{file_id}/download")
 def download_library_file(
     file_id: str,
@@ -288,7 +218,7 @@ def download_library_file(
     token: Optional[str] = Query(None),
     db: Session = Depends(get_db)
 ):
-    """Streams physical file for download with strict ownership validation."""
+    """Streams physical file for download with strict ownership validation from StorageBackend."""
     try:
         doc_uuid = uuid.UUID(file_id)
     except ValueError:
@@ -298,24 +228,32 @@ def download_library_file(
 
     # 1. Check Document table owned by this user
     doc = db.query(Document).filter(Document.id == doc_uuid, Document.user_id == current_user.id).first()
-    if doc and os.path.exists(doc.storage_path):
-        return FileResponse(
-            path=doc.storage_path,
-            media_type=doc.mime_type or "application/octet-stream",
-            filename=doc.filename
-        )
+    if doc:
+        storage = get_storage_backend(getattr(doc, "storage_backend", "local"))
+        if doc.storage_key and storage.exists(doc.storage_key):
+            return storage.generate_download_response(doc.storage_key, doc.filename, doc.mime_type)
+        if doc.storage_path and os.path.exists(doc.storage_path):
+            return FileResponse(
+                path=doc.storage_path,
+                media_type=doc.mime_type or "application/octet-stream",
+                filename=doc.filename
+            )
 
     # 2. Check GeneratedImage table owned by this user
-    from database.models import GeneratedImage
     gen_img = db.query(GeneratedImage).filter(GeneratedImage.id == doc_uuid, GeneratedImage.user_id == current_user.id).first()
-    if gen_img and os.path.exists(gen_img.storage_path):
-        return FileResponse(
-            path=gen_img.storage_path,
-            media_type="image/png",
-            filename=f"image_{file_id[:8]}.png"
-        )
+    if gen_img:
+        storage = get_storage_backend(getattr(gen_img, "storage_backend", "local"))
+        if getattr(gen_img, "storage_key", None) and storage.exists(gen_img.storage_key):
+            return storage.generate_download_response(gen_img.storage_key, f"image_{file_id[:8]}.png", "image/png")
+        if gen_img.storage_path and os.path.exists(gen_img.storage_path):
+            return FileResponse(
+                path=gen_img.storage_path,
+                media_type="image/png",
+                filename=f"image_{file_id[:8]}.png"
+            )
 
     raise HTTPException(status_code=404, detail="File not found in storage or access denied")
+
 
 @router.get("/files/{file_id}/thumbnail")
 def get_library_file_thumbnail(
@@ -333,14 +271,26 @@ def get_library_file_thumbnail(
     current_user = authenticate_user_from_req(token, from_fastapi_req.headers, db)
 
     doc = db.query(Document).filter(Document.id == doc_uuid, Document.user_id == current_user.id).first()
-    if not doc or not os.path.exists(doc.storage_path):
-        raise HTTPException(status_code=404, detail="File not found or access denied")
+    if doc:
+        storage = get_storage_backend(getattr(doc, "storage_backend", "local"))
+        if doc.storage_key and storage.exists(doc.storage_key):
+            return storage.generate_download_response(doc.storage_key, doc.filename, doc.mime_type)
+        if doc.storage_path and os.path.exists(doc.storage_path):
+            return FileResponse(path=doc.storage_path, media_type=doc.mime_type)
 
-    return FileResponse(path=doc.storage_path, media_type=doc.mime_type)
+    gen_img = db.query(GeneratedImage).filter(GeneratedImage.id == doc_uuid, GeneratedImage.user_id == current_user.id).first()
+    if gen_img:
+        storage = get_storage_backend(getattr(gen_img, "storage_backend", "local"))
+        if getattr(gen_img, "storage_key", None) and storage.exists(gen_img.storage_key):
+            return storage.generate_download_response(gen_img.storage_key, f"image_{file_id[:8]}.png", "image/png")
+        if gen_img.storage_path and os.path.exists(gen_img.storage_path):
+            return FileResponse(path=gen_img.storage_path, media_type="image/png")
+
+    raise HTTPException(status_code=404, detail="File not found or access denied")
+
 
 @router.post("/upload")
 async def upload_library_file(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     auto_index: bool = Form(True),
     current_user: User = Depends(AuthManager.get_current_user),
@@ -364,14 +314,26 @@ async def upload_library_file(
 
     category = (doc.metadata_json or {}).get("category", "")
     if auto_index and category in ["documents", "code", "data"]:
-        background_tasks.add_task(async_index_document, doc.id, current_user.id)
+        from tasks.task_manager import TaskManager
+        TaskManager.create_task(
+            user_id=current_user.id,
+            task_type="document_index",
+            title=f"Index {doc.filename}",
+            payload={
+                "document_id": str(doc.id),
+                "requested_by_user_id": str(current_user.id),
+                "force_reindex": False
+            }
+        )
 
     return {"status": "success", "file": serialized}
+
 
 class CreateDocumentRequest(BaseModel):
     filename: str
     content: str
     category: Optional[str] = "documents"
+
 
 @router.post("/create-document")
 async def create_document(
@@ -379,28 +341,33 @@ async def create_document(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Creates a real text / code / markdown file from editor content."""
+    """Creates a real text / code / markdown file from editor content stored in StorageBackend."""
     clean_name = req.filename.strip()
     if not clean_name:
         raise HTTPException(status_code=400, detail="Filename cannot be empty")
 
     file_id = uuid.uuid4()
     ext = os.path.splitext(clean_name)[1] or ".txt"
-    storage_path = os.path.join(UPLOAD_DIR, f"{file_id}{ext}")
-
-    with open(storage_path, "w", encoding="utf-8") as f:
-        f.write(req.content)
-
-    file_size = os.path.getsize(storage_path)
     mime_type = "text/markdown" if ext == ".md" else ("text/x-python" if ext == ".py" else "text/plain")
     category = req.category or get_file_category(mime_type, clean_name)
+
+    storage = get_storage_backend()
+    storage_key = build_document_storage_key(current_user.id, file_id, clean_name)
+    content_bytes = req.content.encode("utf-8")
+    put_res = storage.put(storage_key, content_bytes, content_type=mime_type, user_id=current_user.id)
+    file_size = len(content_bytes)
 
     doc = Document(
         id=file_id,
         user_id=current_user.id,
         filename=clean_name,
         mime_type=mime_type,
-        storage_path=storage_path,
+        storage_path=put_res.get("storage_path") or storage_key,
+        storage_backend=put_res.get("storage_backend", storage.backend_type),
+        storage_key=storage_key,
+        storage_size=file_size,
+        is_knowledge_base=True,
+        indexing_status=DocumentIndexingStatus.READY,
         metadata_json={
             "status": "READY",
             "indexing_status": "Ready",
@@ -408,7 +375,7 @@ async def create_document(
             "category": category,
             "source": "ai_document",
             "is_knowledge_base": True,
-            "modified_at": datetime.utcnow().isoformat(),
+            "modified_at": datetime.now(timezone.utc).isoformat(),
             "chunks": 1,
             "error": None
         }
@@ -416,7 +383,6 @@ async def create_document(
     db.add(doc)
     db.commit()
 
-    # Index document chunk
     chunk = DocumentChunk(
         document_id=doc.id,
         chunk_index=0,
@@ -436,9 +402,11 @@ async def create_document(
 
     return {"status": "success", "file": serialized}
 
+
 class GenerateImageRequest(BaseModel):
     prompt: str
     filename: Optional[str] = None
+
 
 @router.post("/generate-image")
 async def generate_image_to_library(
@@ -462,8 +430,10 @@ async def generate_image_to_library(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
 
+
 class RenameFileRequest(BaseModel):
     name: str
+
 
 @router.patch("/files/{file_id}")
 async def rename_library_file(
@@ -489,7 +459,7 @@ async def rename_library_file(
     doc.filename = new_name
     doc.metadata_json = {
         **(doc.metadata_json or {}),
-        "modified_at": datetime.utcnow().isoformat()
+        "modified_at": datetime.now(timezone.utc).isoformat()
     }
     db.commit()
 
@@ -502,6 +472,7 @@ async def rename_library_file(
     })
 
     return {"status": "success", "file": serialized}
+
 
 @router.delete("/files/{file_id}")
 async def delete_library_file(
@@ -519,14 +490,16 @@ async def delete_library_file(
     if not doc:
         raise HTTPException(status_code=404, detail="File not found")
 
-    # Delete physical file
-    if os.path.exists(doc.storage_path):
+    # Delete physical file from storage backend
+    storage = get_storage_backend(getattr(doc, "storage_backend", "local"))
+    if doc.storage_key:
+        storage.delete(doc.storage_key)
+    if doc.storage_path and os.path.exists(doc.storage_path):
         try:
             os.remove(doc.storage_path)
         except Exception:
             pass
 
-    # Delete DB records
     db.delete(doc)
     db.commit()
 
@@ -539,14 +512,14 @@ async def delete_library_file(
 
     return {"status": "deleted", "id": file_id}
 
+
 @router.post("/files/{file_id}/index")
 async def add_file_to_knowledge_base(
     file_id: str,
-    background_tasks: BackgroundTasks,
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Indexes or re-indexes a library file for AI retrieval."""
+    """Indexes or re-indexes a library file for AI retrieval using durable worker queue."""
     try:
         doc_uuid = uuid.UUID(file_id)
     except ValueError:
@@ -556,16 +529,38 @@ async def add_file_to_knowledge_base(
     if not doc:
         raise HTTPException(status_code=404, detail="File not found")
 
+    doc.is_knowledge_base = False
+    doc.indexing_status = DocumentIndexingStatus.QUEUED
     doc.metadata_json = {
         **(doc.metadata_json or {}),
-        "status": "PROCESSING",
-        "indexing_status": "Uploaded",
+        "status": "QUEUED",
+        "indexing_status": "Queued",
         "error": None
     }
     db.commit()
 
-    background_tasks.add_task(async_index_document, doc.id, current_user.id)
+    from tasks.task_manager import TaskManager
+    TaskManager.create_task(
+        user_id=current_user.id,
+        task_type="document_index",
+        title=f"Index {doc.filename}",
+        payload={
+            "document_id": str(doc.id),
+            "requested_by_user_id": str(current_user.id),
+            "force_reindex": True
+        }
+    )
+
+    from api.routes import ws_manager
+    serialized = serialize_document(doc)
+    await ws_manager.send_to_user(str(current_user.id), {
+        "type": "library_update",
+        "action": "updated",
+        "data": serialized
+    })
+
     return {"status": "indexing_started", "id": file_id}
+
 
 @router.delete("/files/{file_id}/index")
 async def remove_file_from_knowledge_base(
@@ -584,13 +579,17 @@ async def remove_file_from_knowledge_base(
         raise HTTPException(status_code=404, detail="File not found")
 
     db.query(DocumentChunk).filter(DocumentChunk.document_id == doc.id).delete()
+    doc.is_knowledge_base = False
+    doc.indexing_status = DocumentIndexingStatus.NOT_INDEXED
     doc.metadata_json = {
         **(doc.metadata_json or {}),
         "is_knowledge_base": False,
         "chunks": 0,
-        "indexing_status": "Not indexed"
+        "indexing_status": "Not indexed",
+        "status": "READY"
     }
     db.commit()
+    db.refresh(doc)
 
     from api.routes import ws_manager
     serialized = serialize_document(doc)

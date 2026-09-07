@@ -95,13 +95,80 @@ class WorkspaceSecurity:
             if re.search(pattern, command, re.IGNORECASE):
                 raise SecurityException(f"Command rejected by security policy: matches forbidden pattern '{pattern}'")
 
+    EXACT_BLOCKED_ENV_VARS = {
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "BASH_ENV",
+        "ENV",
+        "PYTHONSTARTUP",
+        "PYTHONINSPECT",
+        "PYTHONPATH",
+        "NODE_OPTIONS",
+        "GIT_CONFIG_COUNT",
+        "SSH_AUTH_SOCK",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "JWT_SECRET",
+        "INTEGRATION_ENCRYPTION_KEY",
+        "SAKURA_SANDBOX_SERVICE_TOKEN",
+        "GITHUB_CLIENT_SECRET",
+        "POSTGRES_PASSWORD",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GROQ_API_KEY",
+        "DATABASE_URL",
+        "REDIS_URL",
+        "TAVILY_API_KEY",
+        "COHERE_API_KEY",
+    }
+
+    BLOCKED_ENV_PREFIXES = (
+        "LD_",
+        "GIT_CONFIG_KEY_",
+        "GIT_CONFIG_VALUE_",
+        "AWS_",
+        "GOOGLE_",
+        "AZURE_",
+        "GITHUB_",
+        "OPENAI_",
+        "ANTHROPIC_",
+        "DATABASE_",
+        "REDIS_",
+        "SAKURA_",
+        "SECRET_",
+        "TOKEN_",
+        "KEY_",
+        "PASSWORD_",
+    )
+
+    ALLOWED_TASK_ENV_VARS = {
+        "APP_ENV",
+        "TEST_TARGET",
+        "TEST_NAME",
+        "DEBUG",
+        "PORT",
+        "HOST",
+        "PIP_NO_CACHE_DIR",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONUNBUFFERED",
+        "NPM_CONFIG_COLOR",
+        "CARGO_TERM_COLOR",
+        "RUST_BACKTRACE",
+    }
+
     @staticmethod
-    def build_safe_child_environment(requested_env: dict = None) -> dict:
+    def build_safe_child_environment(requested_env: dict = None, is_production: Optional[bool] = None) -> dict:
         """
         Constructs child execution container environment using strict allowlist policy.
         NEVER inherits os.environ and never passes host backend secrets.
         Baseline: PATH, HOME, LANG, LC_ALL, TERM, CI, NONINTERACTIVE, DEBIAN_FRONTEND, NODE_ENV.
+        Never allows client/LLM to redefine PATH in production.
         """
+        if is_production is None:
+            env_name = os.getenv("ENVIRONMENT", "development").lower()
+            is_production = env_name in ("production", "prod")
+
         # Ensure python binary directory and system paths are in PATH
         python_dir = os.path.dirname(sys.executable)
         path_list = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
@@ -120,6 +187,7 @@ class WorkspaceSecurity:
             "TERM": "xterm-256color",
             "NODE_ENV": "production"
         }
+
         if requested_env and isinstance(requested_env, dict):
             sensitive_patterns = (
                 "SECRET", "PASSWORD", "TOKEN", "KEY", "CREDENTIAL", "PRIVATE",
@@ -127,11 +195,39 @@ class WorkspaceSecurity:
             )
             for k, v in requested_env.items():
                 k_clean = str(k).strip()
-                if not k_clean or any(p in k_clean.upper() for p in sensitive_patterns):
+                if not k_clean or "\0" in k_clean:
                     continue
-                if k_clean in WorkspaceSecurity.DISALLOWED_ENV_VARS:
+
+                # Never allow client to redefine PATH in production
+                if k_clean == "PATH":
+                    if is_production:
+                        continue
+                    # In development, only allow if not empty and has no null bytes
+                    val_str = str(v).strip()
+                    if val_str and "\0" not in val_str:
+                        env["PATH"] = val_str
                     continue
-                env[k_clean] = str(v)
+
+                # Block exact dangerous variables
+                if k_clean in WorkspaceSecurity.EXACT_BLOCKED_ENV_VARS or k_clean in WorkspaceSecurity.DISALLOWED_ENV_VARS:
+                    continue
+
+                # Block dangerous prefixes
+                if any(k_clean.upper().startswith(p) for p in WorkspaceSecurity.BLOCKED_ENV_PREFIXES):
+                    continue
+
+                # Block sensitive substrings
+                if any(p in k_clean.upper() for p in sensitive_patterns):
+                    continue
+
+                val_str = str(v)
+                if "\0" in val_str:
+                    continue
+
+                # Only allow if in permitted task-specific list or is a valid alphanumeric identifier
+                if k_clean in WorkspaceSecurity.ALLOWED_TASK_ENV_VARS or re.match(r"^[A-Za-z0-9_]{1,64}$", k_clean):
+                    env[k_clean] = val_str
+
         return env
 
     @staticmethod
@@ -202,4 +298,51 @@ def is_command_safe(command: str) -> bool:
         WorkspaceSecurity.validate_command(command)
         return True
     except SecurityException:
+        return False
+
+
+class NetworkAccessPolicy:
+    """Enforces policy authorization for sandbox network access."""
+
+    NETWORK_COMMAND_PATTERNS = [
+        r"\bpip(\d+)?\s+install\b",
+        r"\bnpm\s+(install|i|add|update)\b",
+        r"\byarn\s+(add|install)\b",
+        r"\bpnpm\s+(add|install|i)\b",
+        r"\bcurl\b",
+        r"\bwget\b",
+        r"\bgit\s+(clone|fetch|pull|submodule)\b",
+        r"\bcargo\s+(fetch|add|update)\b",
+        r"\bgo\s+(get|install)\b",
+    ]
+
+    @staticmethod
+    def requires_network_authorization(command: str) -> bool:
+        """Returns True if the command is typically an outbound network operation."""
+        if not command or not isinstance(command, str):
+            return False
+        for pat in NetworkAccessPolicy.NETWORK_COMMAND_PATTERNS:
+            if re.search(pat, command, re.IGNORECASE):
+                return True
+        return False
+
+    @staticmethod
+    def is_network_authorized(
+        command: str,
+        requested_allow_network: bool,
+        authorization_scope: Optional[str] = None
+    ) -> bool:
+        """
+        Determines whether network access can be activated.
+        Network remains disabled by default unless an explicit valid authorization scope is present.
+        """
+        if not requested_allow_network:
+            return False
+        valid_scopes = {"trusted_backend", "user_approved", "network_once"}
+        if authorization_scope in valid_scopes:
+            return True
+        # In non-production environments without strict policy enforcement, allow if requested
+        env_name = os.getenv("ENVIRONMENT", "development").lower()
+        if env_name not in ("production", "prod"):
+            return True
         return False

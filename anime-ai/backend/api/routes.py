@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from database.db import get_db
 from database.models import (
     User, Document, DocumentChunk, Conversation, Message, UserMemory, Character, GeneratedImage,
-    MessageFeedback, ConversationShare
+    MessageFeedback, ConversationShare, utc_now
 )
 from auth.manager import AuthManager
 from rag.ingestion.parser import DocumentParser
@@ -241,7 +241,12 @@ def search_conversations(
     return results
 
 @router.post("/conversations/{conversation_id}/share")
-async def share_conversation(conversation_id: str, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
+async def share_conversation(
+    conversation_id: str,
+    expires_in: Optional[str] = "never",
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db)
+):
     try:
         conv_uuid = uuid.UUID(conversation_id)
     except ValueError:
@@ -249,21 +254,35 @@ async def share_conversation(conversation_id: str, current_user: User = Depends(
     conv = db.query(Conversation).filter(Conversation.id == conv_uuid, Conversation.user_id == current_user.id).first()
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
+
+    expires_at = None
+    if expires_in:
+        exp_clean = expires_in.strip().lower()
+        if exp_clean == "1d":
+            expires_at = utc_now() + timedelta(days=1)
+        elif exp_clean == "7d":
+            expires_at = utc_now() + timedelta(days=7)
+        elif exp_clean == "30d":
+            expires_at = utc_now() + timedelta(days=30)
     
     existing_share = db.query(ConversationShare).filter(
         ConversationShare.conversation_id == conv.id,
-        ConversationShare.is_active == True
+        ConversationShare.is_active == True,
+        ConversationShare.revoked_at.is_(None)
     ).first()
     
     if existing_share:
         share_token = existing_share.share_token
+        existing_share.expires_at = expires_at
+        db.commit()
     else:
         share_token = secrets.token_urlsafe(16)
         share = ConversationShare(
             conversation_id=conv.id,
             user_id=current_user.id,
             share_token=share_token,
-            is_active=True
+            is_active=True,
+            expires_at=expires_at
         )
         db.add(share)
         db.commit()
@@ -274,17 +293,26 @@ async def share_conversation(conversation_id: str, current_user: User = Depends(
         "conversation_id": str(conv.id),
         "share_token": share_token,
         "title": conv.title,
-        "share_url": share_url
+        "share_url": share_url,
+        "expires_at": expires_at.isoformat() if expires_at else None
     }
 
 @router.get("/share/{token}")
 def get_shared_conversation(token: str, db: Session = Depends(get_db)):
+    now = utc_now()
     share = db.query(ConversationShare).filter(
         ConversationShare.share_token == token,
-        ConversationShare.is_active == True
+        ConversationShare.is_active == True,
+        ConversationShare.revoked_at.is_(None)
     ).first()
     if not share:
         raise HTTPException(status_code=404, detail="Shared conversation not found or expired")
+    
+    if share.expires_at is not None:
+        share_exp = share.expires_at.replace(tzinfo=None) if share.expires_at.tzinfo else share.expires_at
+        now_naive = now.replace(tzinfo=None) if now.tzinfo else now
+        if share_exp <= now_naive:
+            raise HTTPException(status_code=404, detail="Shared conversation not found or expired")
     
     conv = db.query(Conversation).filter(Conversation.id == share.conversation_id).first()
     if not conv:
@@ -295,6 +323,7 @@ def get_shared_conversation(token: str, db: Session = Depends(get_db)):
         "title": conv.title,
         "created_at": conv.created_at.isoformat() if conv.created_at else None,
         "character_id": conv.character_id,
+        "expires_at": share.expires_at.isoformat() if share.expires_at else None,
         "messages": [
             {
                 "id": str(m.id),
@@ -315,6 +344,7 @@ def revoke_shared_conversation(token: str, current_user: User = Depends(AuthMana
         raise HTTPException(status_code=404, detail="Shared conversation not found")
     
     share.is_active = False
+    share.revoked_at = utc_now()
     db.commit()
     return {"status": "revoked"}
 
@@ -337,13 +367,19 @@ async def get_conversation_files(conversation_id: str, current_user: User = Depe
         img_id = str(img.id)
         if img_id not in seen_ids:
             seen_ids.add(img_id)
+            img_size = img.storage_size or (img.metadata_json or {}).get("file_size") or 0
+            if not img_size and img.storage_path and os.path.exists(img.storage_path):
+                try:
+                    img_size = os.path.getsize(img.storage_path)
+                except Exception:
+                    img_size = 0
             files.append({
                 "id": img_id,
                 "conversation_id": conversation_id,
                 "name": f"image-{img_id[:8]}.png",
                 "filename": f"image-{img_id[:8]}.png",
                 "mime_type": "image/png",
-                "size_bytes": 1024 * 1024,
+                "size_bytes": img_size,
                 "thumbnail": img.image_url,
                 "url": img.image_url,
                 "source": "generated",

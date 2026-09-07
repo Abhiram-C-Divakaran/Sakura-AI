@@ -70,10 +70,10 @@
   --text-main:          #eaf0f8;
   --text-muted:         #9aa6bc;
   --text-dim:           #66728a;
-  --accent:             #ff6584;
+  --accent:             #ff7597;
   --accent-blue:        #60a5fa;
   --accent-cyan:        #22d3ee;
-  --accent-glow:        rgba(255, 101, 132, 0.25);
+  --accent-glow:        rgba(255, 117, 151, 0.25);
   --popover-bg:         #1a1e2b;
   --scrollbar-thumb:    #32394c;
   --scrollbar-track:    #111318;
@@ -112,10 +112,10 @@
   --text-main:          #0f172a;
   --text-muted:         #475569;
   --text-dim:           #94a3b8;
-  --accent:             #e11d48;
+  --accent:             #ff7597;
   --accent-blue:        #2563eb;
   --accent-cyan:        #0284c7;
-  --accent-glow:        rgba(225, 29, 72, 0.15);
+  --accent-glow:        rgba(255, 117, 151, 0.2);
   --popover-bg:         #ffffff;
   --scrollbar-thumb:    #cbd5e1;
   --scrollbar-track:    #f8fafc;
@@ -125,53 +125,11 @@
   --navy:       #f8fafc;
   --navy-2:     #f1f5f9;
   --cyan:       #0284c7;
-  --magenta:    #e11d48;
+  --magenta:    #ff7597;
   --violet:     #7c3aed;
   --amber:      #d97706;
   --cream:      #ffffff;
   --muted:      #475569;
-}
-
-[data-theme="blue"] {
-  --theme-id:           blue;
-  --bg-app:             #060b17;
-  --bg-sidebar:         #091022;
-  --bg-chat:            #060b17;
-  --bg-panel:           #0a1329;
-  --bg-surface:         #0e1b38;
-  --bg-card:            #122246;
-  --bg-card-hover:      #182c5b;
-  --bg-hover:           #132448;
-  --bg-active:          #1b3265;
-  --bg-composer:        #0c1730;
-  --bg-composer-inner:  #14244c;
-  --bg-user-bubble:     #122246;
-  --bg-ai-bubble:       #060b17;
-  --border-app:         #162850;
-  --border-card:        #223c76;
-  --border-subtle:      #111e3b;
-  --border-active:      #3157a8;
-  --text-main:          #f0f6fc;
-  --text-muted:         #8ea8cb;
-  --text-dim:           #527096;
-  --accent:             #00f0ff;
-  --accent-blue:        #38bdf8;
-  --accent-cyan:        #00f0ff;
-  --accent-glow:        rgba(0, 240, 255, 0.25);
-  --popover-bg:         #0c1730;
-  --scrollbar-thumb:    #1c3260;
-  --scrollbar-track:    #060b17;
-  --composer-input-bg:  #14244c;
-  --composer-border:    rgba(0, 240, 255, 0.15);
-
-  --navy:       #060b17;
-  --navy-2:     #091022;
-  --cyan:       #00f0ff;
-  --magenta:    #ff2d78;
-  --violet:     #38bdf8;
-  --amber:      #38bdf8;
-  --cream:      #f0f6fc;
-  --muted:      #8ea8cb;
 }
 
 /* ─── Base Reset ─── */
@@ -243,74 +201,7 @@
 .theme-accent       { color: var(--accent) !important; }
 .theme-accent-bg    { background-color: var(--accent) !important; }
 
-/* In Light theme, hide intense scanlines for pristine clarity */
-[data-theme="light"] .crt-overlay,
-[data-theme="light"] .scanline-roll,
-[data-theme="light"] .film-grain {
-  display: none !important;
-}
 
-/* ─── CRT Scanline Overlay ─── */
-.crt-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 9990;
-  pointer-events: none;
-  background:
-    repeating-linear-gradient(
-      0deg,
-      transparent,
-      transparent 2px,
-      rgba(0, 0, 0, 0.12) 2px,
-      rgba(0, 0, 0, 0.12) 4px
-    );
-}
-
-.crt-overlay::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(
-    90deg,
-    rgba(255, 0, 60, 0.02),
-    rgba(0, 255, 200, 0.02),
-    rgba(0, 60, 255, 0.02)
-  );
-  mix-blend-mode: screen;
-}
-
-.scanline-roll {
-  position: fixed;
-  left: 0;
-  top: 0;
-  width: 100%;
-  height: 180px;
-  background: linear-gradient(
-    to bottom,
-    transparent,
-    rgba(0, 245, 255, 0.025) 40%,
-    rgba(0, 245, 255, 0.04) 50%,
-    rgba(0, 245, 255, 0.025) 60%,
-    transparent
-  );
-  z-index: 9989;
-  pointer-events: none;
-  animation: scanroll 9s linear infinite;
-}
-
-.film-grain {
-  position: fixed;
-  inset: 0;
-  z-index: 9988;
-  pointer-events: none;
-  opacity: 0.04;
-  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-  background-size: 180px 180px;
-}
-
-.vhs-flicker {
-  animation: flicker 8s linear infinite;
-}
 
 /* ─── Glow Utilities ─── */
 .glow-cyan {
@@ -383,16 +274,6 @@
 }
 
 /* ─── Keyframes ─── */
-@keyframes flicker {
-  0%, 19.9%, 22%, 62.9%, 64%, 64.9%, 70%, 100% { opacity: 0.99; }
-  20%, 21.9%, 63%, 63.9%, 65%, 69.9%           { opacity: 0.5; }
-}
-
-@keyframes scanroll {
-  0%   { transform: translateY(-180px); }
-  100% { transform: translateY(100vh); }
-}
-
 @keyframes shimmer {
   0%   { background-position: -200% center; }
   100% { background-position:  200% center; }

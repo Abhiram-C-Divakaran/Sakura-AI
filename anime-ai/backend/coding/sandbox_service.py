@@ -319,6 +319,27 @@ async def readiness():
     return payload
 
 
+@app.post("/workspaces/{workspace_id}")
+async def provision_workspace(
+    workspace_id: str,
+    _auth: bool = Depends(verify_service_token)
+):
+    """Provisions an isolated workspace directory within WORKSPACE_ROOT."""
+    try:
+        val = uuid.UUID(workspace_id)
+        canonical_id = str(val)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid workspace UUID format")
+
+    ws_path = os.path.realpath(os.path.join(WORKSPACE_ROOT, canonical_id))
+    canonical_root = os.path.realpath(WORKSPACE_ROOT)
+    if os.path.commonpath([ws_path, canonical_root]) != canonical_root or ws_path == canonical_root:
+        raise HTTPException(status_code=400, detail="Workspace path escapes WORKSPACE_ROOT")
+
+    os.makedirs(ws_path, exist_ok=True)
+    return {"status": "ok", "workspace_id": canonical_id, "path": ws_path}
+
+
 @app.post("/execute")
 async def execute_command(
     req: ExecuteRequest,
@@ -494,7 +515,42 @@ async def execute_command(
 
     # PER-WORKSPACE ISOLATION: Mount ONLY this specific workspace to /workspace.
     # Never mount the parent /workspaces volume.
-    vol_mountpoint = get_volume_host_mountpoint(WORKSPACES_VOLUME) if WORKSPACES_VOLUME else None
+    workspaces_volume = os.getenv("SAKURA_WORKSPACES_VOLUME", WORKSPACES_VOLUME)
+    vol_mountpoint = get_volume_host_mountpoint(workspaces_volume) if workspaces_volume else None
+    if workspaces_volume and not vol_mountpoint:
+        # Configured volume cannot be inspected -> FAIL CLOSED
+        return {
+            "success": False,
+            "tool": req.tool_name,
+            "command": cmd_display,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"Volume resolution failure: Configured Docker workspaces volume '{workspaces_volume}' cannot be resolved on host.",
+            "duration_ms": int((time.time() - start_time) * 1000),
+            "timed_out": False,
+            "blocked": False,
+            "isolation_unavailable": True,
+            "output_truncated": False,
+            "output_limit_exceeded": False
+        }
+
+    if is_prod and not vol_mountpoint:
+        # In production, volume resolution is strictly required
+        return {
+            "success": False,
+            "tool": req.tool_name,
+            "command": cmd_display,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": "Volume resolution failure: Docker workspace volume resolution is required in production.",
+            "duration_ms": int((time.time() - start_time) * 1000),
+            "timed_out": False,
+            "blocked": False,
+            "isolation_unavailable": True,
+            "output_truncated": False,
+            "output_limit_exceeded": False
+        }
+
     if vol_mountpoint and canonical_ws_id:
         host_target = f"{vol_mountpoint}/{canonical_ws_id}"
     else:

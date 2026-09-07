@@ -35,7 +35,7 @@ export default function Login() {
     // Redirect if already authenticated
     const token = getAccessToken();
     if (token) {
-      router.push('/console');
+      router.push('/chat');
     }
   }, [router]);
 
@@ -95,7 +95,7 @@ export default function Login() {
 
       const authData = await authRes.json();
       setAccessToken(authData.access_token);
-      router.push('/console');
+      router.push('/chat');
     } catch (err: any) {
       setError(err.message || 'Authentication error.');
     } finally {

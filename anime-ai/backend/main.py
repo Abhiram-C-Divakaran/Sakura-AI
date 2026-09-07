@@ -109,6 +109,22 @@ def health_check():
     """Liveness probe: returns 200 if backend process is running."""
     return {"status": "online", "system": "Sakura AI Core", "version": "1.0.0"}
 
+def get_packaged_alembic_head() -> Optional[str]:
+    """Dynamically resolves the expected head migration revision from Alembic script directory."""
+    try:
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        ini_path = os.path.join(base_dir, "alembic.ini")
+        if os.path.exists(ini_path):
+            cfg = Config(ini_path)
+            script_dir = ScriptDirectory.from_config(cfg)
+            return script_dir.get_current_head()
+    except Exception as e:
+        print(f"Failed to dynamically resolve Alembic migration head: {e}")
+    return None
+
+
 @app.get("/readiness")
 async def readiness_check():
     """Readiness probe: validates primary database, schema tables, secrets, and Redis."""
@@ -118,8 +134,8 @@ async def readiness_check():
     redis_ok = False
     errors = []
 
-    # 1. DB connectivity and migration revision
-    EXPECTED_MIGRATION_HEAD = "c3e1a89f4b20"
+    # 1. DB connectivity and dynamic migration revision resolution
+    expected_migration_head = get_packaged_alembic_head()
     migration_ok = False
     try:
         with get_db_context() as db:
@@ -133,16 +149,18 @@ async def readiness_check():
                 missing = required_tables - existing_tables
                 errors.append(f"Missing required database tables: {missing}")
 
-            # Validate Alembic schema revision
+            # Validate Alembic schema revision dynamically
             if "alembic_version" in existing_tables:
                 res = db.execute(sa.text("SELECT version_num FROM alembic_version")).fetchone()
                 current_revision = res[0] if res else None
-                if current_revision == EXPECTED_MIGRATION_HEAD:
+                if expected_migration_head and current_revision == expected_migration_head:
+                    migration_ok = True
+                elif not is_prod and current_revision:
                     migration_ok = True
                 else:
                     if is_prod:
                         tables_ok = False
-                        errors.append("Database schema migration revision is incompatible.")
+                        errors.append(f"Database schema migration revision is incompatible (current: {current_revision}, expected: {expected_migration_head}).")
             elif is_prod:
                 tables_ok = False
                 errors.append("Missing alembic_version table in production.")
