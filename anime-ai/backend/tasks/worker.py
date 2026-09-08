@@ -27,6 +27,8 @@ from tasks.task_manager import (
     emit_task_update,
     TaskLeaseLostError,
     assert_task_lease_owned,
+    TaskExecutionContext,
+    _is_lease_expired,
 )
 from llm.router import LLMRouter
 
@@ -215,36 +217,45 @@ class DurableTaskWorker:
 
         logger.info(f"Worker {self.worker_id} executing task {task_id} ({task_type}) [attempt={attempt_id}]: '{task.title}'")
 
-        # Check for immediate cancellation and ensure task lease is recorded in DB
+        # P0.6: Fencing check — ONLY claim_next_task() is allowed to establish ownership.
+        # execute_task() MUST NOT overwrite ownership!
         with get_db_context() as db:
             current = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
-            if not current or current.cancel_requested or current.status == "Cancelled":
+            if not current:
+                raise TaskLeaseLostError(f"Task {task_id} does not exist in database.")
+            if current.cancel_requested or current.status == "Cancelled":
                 logger.info(f"Task {task_id} was cancelled before execution started.")
-                try:
-                    await update_task_state(task_id, "Cancelled", 100, worker_id=self.worker_id, execution_attempt_id=attempt_id)
-                except TaskLeaseLostError:
-                    pass
                 return
 
-            if current.worker_id != self.worker_id or current.execution_attempt_id != attempt_id:
-                now = utc_now()
-                lease_exp = now + timedelta(seconds=LEASE_DURATION_SECONDS)
-                current.status = "Running"
-                current.worker_id = self.worker_id
-                current.execution_attempt_id = attempt_id
-                current.started_at = current.started_at or now
-                current.heartbeat_at = now
-                current.lease_expires_at = lease_exp
-                db.commit()
+            now = utc_now()
+            if (
+                current.status != "Running"
+                or current.worker_id != self.worker_id
+                or current.execution_attempt_id != attempt_id
+                or _is_lease_expired(current.lease_expires_at, now)
+            ):
+                raise TaskLeaseLostError(
+                    f"Task {task_id} ownership check failed: expected running task owned by worker '{self.worker_id}' "
+                    f"with attempt '{attempt_id}' with unexpired lease. (Found worker='{current.worker_id}', "
+                    f"attempt='{current.execution_attempt_id}', status='{current.status}')"
+                )
 
-        # Start periodic background heartbeat loop to keep lease active
-        heartbeat_stop = asyncio.Event()
+        # P0.10: Wire heartbeat loss to execution cancellation
+        lease_lost_event = asyncio.Event()
+        ctx = TaskExecutionContext(
+            task_id=task_id,
+            worker_id=self.worker_id,
+            execution_attempt_id=attempt_id,
+            lease_lost_event=lease_lost_event
+        )
+
+        handler_task: Optional[asyncio.Task] = None
 
         async def _heartbeat_loop():
-            while not heartbeat_stop.is_set():
+            while not lease_lost_event.is_set():
                 try:
                     await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
-                    if heartbeat_stop.is_set():
+                    if lease_lost_event.is_set():
                         break
                     with get_db_context() as db:
                         hb_now = utc_now()
@@ -262,9 +273,11 @@ class DurableTaskWorker:
                         if rows == 0:
                             logger.warning(
                                 f"Heartbeat failed: Worker {self.worker_id} lost ownership of task {task_id} "
-                                f"(token {attempt_id}). Stopping heartbeat loop."
+                                f"(token {attempt_id}). Setting lease_lost_event and cancelling handler."
                             )
-                            heartbeat_stop.set()
+                            lease_lost_event.set()
+                            if handler_task and not handler_task.done():
+                                handler_task.cancel()
                             break
                 except asyncio.CancelledError:
                     break
@@ -273,42 +286,51 @@ class DurableTaskWorker:
 
         hb_coro = asyncio.create_task(_heartbeat_loop())
 
-        try:
-            await update_task_state(task_id, "Running", 10, worker_id=self.worker_id, execution_attempt_id=attempt_id)
+        async def _run_handler():
+            await update_task_state(task_id, "Running", 10, ctx=ctx)
 
             if task_type == "code_analysis":
-                await execute_code_analysis(task_id, user_id, payload, self.router)
+                await execute_code_analysis(task_id, user_id, payload, self.router, ctx=ctx)
             elif task_type == "doc_summary":
-                await execute_doc_summary(task_id, user_id, payload, self.router)
+                await execute_doc_summary(task_id, user_id, payload, self.router, ctx=ctx)
             elif task_type == "dataset_analysis":
-                await execute_dataset_analysis(task_id, user_id, payload, self.router)
+                await execute_dataset_analysis(task_id, user_id, payload, self.router, ctx=ctx)
             elif task_type == "web_research":
-                await execute_web_research(task_id, user_id, payload, self.router)
+                await execute_web_research(task_id, user_id, payload, self.router, ctx=ctx)
             elif task_type == "scheduled_run":
-                await execute_scheduled_task_job(task_id, user_id, payload, self.router)
+                await execute_scheduled_task_job(task_id, user_id, payload, self.router, ctx=ctx)
             elif task_type == "document_index":
-                await execute_document_index(task_id, user_id, payload, self.worker_id, attempt_id)
+                await execute_document_index(task_id, user_id, payload, self.worker_id, attempt_id, ctx=ctx)
             else:
-                await update_task_state(task_id, "Failed", 100, error=f"Unknown task type: {task_type}", worker_id=self.worker_id, execution_attempt_id=attempt_id)
+                await update_task_state(task_id, "Failed", 100, error=f"Unknown task type: {task_type}", ctx=ctx)
 
+        try:
+            handler_task = asyncio.create_task(_run_handler())
+            await handler_task
             logger.info(f"Task {task_id} completed successfully.")
         except TaskLeaseLostError as e:
             logger.warning(f"Task {task_id} execution aborted: {e}. Worker {self.worker_id} no longer owns lease.")
             return
         except asyncio.CancelledError:
-            logger.info(f"Task {task_id} received cancellation signal.")
+            if lease_lost_event.is_set():
+                logger.warning(f"Task {task_id} cancelled due to lease loss. Worker {self.worker_id} performing zero writes.")
+                return
+            logger.info(f"Task {task_id} received external cancellation signal.")
             try:
-                await update_task_state(task_id, "Cancelled", 100, worker_id=self.worker_id, execution_attempt_id=attempt_id)
+                await update_task_state(task_id, "Cancelled", 100, ctx=ctx)
             except TaskLeaseLostError:
                 pass
         except Exception as e:
+            if lease_lost_event.is_set():
+                logger.warning(f"Task {task_id} failed after lease lost: {e}. Worker {self.worker_id} performing zero writes.")
+                return
             logger.error(f"Error executing task {task_id}: {e}", exc_info=True)
             try:
-                await update_task_state(task_id, "Failed", 100, error=str(e), worker_id=self.worker_id, execution_attempt_id=attempt_id)
+                await update_task_state(task_id, "Failed", 100, error=str(e), ctx=ctx)
             except TaskLeaseLostError:
                 pass
         finally:
-            heartbeat_stop.set()
+            lease_lost_event.set()
             hb_coro.cancel()
             try:
                 await hb_coro

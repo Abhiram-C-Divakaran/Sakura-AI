@@ -5,6 +5,8 @@
  * authenticated fetch with automated Bearer headers and 401 session expiration handling.
  */
 
+import { apiUrl } from './api';
+
 const TOKEN_KEY = 'access_token';
 
 export function getAccessToken(): string {
@@ -39,6 +41,7 @@ export interface AuthFetchOptions extends RequestInit {
 /**
  * Standardized fetch wrapper that injects Authorization Bearer header
  * and redirects to login on 401 Unauthorized responses.
+ * All URLs are normalized through canonical apiUrl().
  */
 export async function authFetch(
   url: string,
@@ -51,7 +54,8 @@ export async function authFetch(
     headers.set('Authorization', `Bearer ${token}`);
   }
 
-  const response = await fetch(url, {
+  const targetUrl = apiUrl(url);
+  const response = await fetch(targetUrl, {
     ...options,
     headers
   });

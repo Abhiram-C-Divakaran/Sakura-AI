@@ -187,15 +187,15 @@ class TestSchedulerDurableQueue(unittest.IsolatedAsyncioTestCase):
 
         # Execute via worker
         worker = DurableTaskWorker(worker_id="test-manual-worker")
+        claimed = worker.claim_next_task()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.id, bg_id)
+
         mock_provider = AsyncMock()
         mock_provider.generate = AsyncMock(return_value="Manual run output completed.")
         
         with patch.object(worker.router, "get_provider", return_value=("mock_llm", mock_provider)):
-            task_to_run = None
-            with get_db_context() as db:
-                task_to_run = db.query(BackgroundTask).filter(BackgroundTask.id == bg_id).first()
-
-            await worker.execute_task(task_to_run)
+            await worker.execute_task(claimed)
 
         with get_db_context() as db:
             run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_id).first()

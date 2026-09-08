@@ -15,6 +15,7 @@ class LLMRouter:
 
     def __init__(self):
         self.providers: Dict[str, LLMProvider] = {}
+        self.provider_telemetry: Dict[str, Dict[str, Any]] = {}
         self._initialize_adapters()
 
     def _initialize_adapters(self):
@@ -94,11 +95,26 @@ class LLMRouter:
     ) -> tuple[str, str]:
         """Routes and calls the appropriate model for direct text generation."""
         allow_mocks = os.getenv("SAKURA_ALLOW_MOCKS", "false").lower() == "true"
+        provider_name = "unknown"
         try:
             provider_name, provider = self.get_provider(intent)
             response = await provider.generate(prompt, system_prompt, history, **kwargs)
+            from datetime import datetime, timezone
+            self.provider_telemetry[provider_name] = {
+                "last_verified_at": datetime.now(timezone.utc).isoformat(),
+                "healthy": True,
+                "status": "AVAILABLE"
+            }
             return provider_name, response
         except Exception as e:
+            if provider_name in self.providers:
+                from datetime import datetime, timezone
+                self.provider_telemetry[provider_name] = {
+                    "last_verified_at": self.provider_telemetry.get(provider_name, {}).get("last_verified_at"),
+                    "healthy": False,
+                    "status": "UNAVAILABLE",
+                    "error": str(e)
+                }
             if not allow_mocks:
                 raise RuntimeError(f"LLM Provider unavailable: {str(e)}")
             print(f"LLM Router Error: {e}. Falling back to test mock generator.")
@@ -115,11 +131,29 @@ class LLMRouter:
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Streams content tokens with transparent failure handling."""
         allow_mocks = os.getenv("SAKURA_ALLOW_MOCKS", "false").lower() == "true"
+        provider_name = "unknown"
         try:
             provider_name, provider = self.get_provider(intent)
+            first = True
             async for token in provider.stream(prompt, system_prompt, history, **kwargs):
+                if first:
+                    first = False
+                    from datetime import datetime, timezone
+                    self.provider_telemetry[provider_name] = {
+                        "last_verified_at": datetime.now(timezone.utc).isoformat(),
+                        "healthy": True,
+                        "status": "AVAILABLE"
+                    }
                 yield {"token": token, "provider": provider_name}
         except Exception as e:
+            if provider_name in self.providers:
+                from datetime import datetime, timezone
+                self.provider_telemetry[provider_name] = {
+                    "last_verified_at": self.provider_telemetry.get(provider_name, {}).get("last_verified_at"),
+                    "healthy": False,
+                    "status": "UNAVAILABLE",
+                    "error": str(e)
+                }
             if not allow_mocks:
                 raise RuntimeError(f"LLM Streaming failure: {str(e)}")
             print(f"LLM Router Streaming Error: {e}. Yielding fallback mock tokens for test environment.")

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { getAccessToken } from '../lib/auth';
+import { websocketUrl } from '../lib/api';
 
 export type RealtimeStatus = 'LIVE' | 'CONNECTING' | 'RECONNECTING' | 'DEGRADED' | 'OFFLINE';
 
@@ -42,9 +43,7 @@ export function useRealtime(options: UseRealtimeOptions = {}) {
       return next;
     });
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.host;
-    const wsUrl = `${protocol}//${host}/api/v1/ws?token=${token}`;
+    const wsUrl = websocketUrl(`/api/v1/ws?token=${encodeURIComponent(token)}`);
 
     try {
       const ws = new WebSocket(wsUrl);

@@ -64,17 +64,17 @@ def upgrade() -> None:
 
     # 4. Data Backfill: authoritative Knowledge Base state and storage keys
     # Backfill is_knowledge_base = True where metadata JSON has is_knowledge_base=true or chunks > 0
-    try:
+    if insp.has_table('documents'):
         is_postgres = bind.dialect.name == 'postgresql'
         if is_postgres:
-            # PostgreSQL json/jsonb query
+            # PostgreSQL json/jsonb query with defensive numeric regex conversion
             bind.execute(sa.text("""
                 UPDATE documents
                 SET is_knowledge_base = true,
                     indexing_status = 'READY'
                 WHERE (
                     metadata->>'is_knowledge_base' = 'true'
-                    OR (metadata->>'chunks')::int > 0
+                    OR (CASE WHEN metadata->>'chunks' ~ '^[0-9]+$' THEN (metadata->>'chunks')::int ELSE 0 END) > 0
                 )
                 AND is_knowledge_base = false
             """))
@@ -86,24 +86,24 @@ def upgrade() -> None:
             """))
         else:
             # SQLite / generic query
-            bind.execute(sa.text("""
-                UPDATE documents
-                SET is_knowledge_base = 1,
-                    indexing_status = 'READY'
-                WHERE (
-                    metadata LIKE '%"is_knowledge_base": true%'
-                    OR metadata LIKE '%"is_knowledge_base":true%'
-                )
-                AND (is_knowledge_base = 0 OR is_knowledge_base IS NULL)
-            """))
+            bind.execute(
+                sa.text("""
+                    UPDATE documents
+                    SET is_knowledge_base = 1,
+                        indexing_status = 'READY'
+                    WHERE (
+                        metadata LIKE :pattern1
+                        OR metadata LIKE :pattern2
+                    )
+                    AND (is_knowledge_base = 0 OR is_knowledge_base IS NULL)
+                """),
+                {"pattern1": '%"is_knowledge_base": true%', "pattern2": '%"is_knowledge_base":true%'}
+            )
             bind.execute(sa.text("""
                 UPDATE documents
                 SET storage_key = 'users/' || user_id || '/documents/' || id || '/' || filename
                 WHERE storage_key IS NULL
             """))
-    except Exception as e:
-        # Non-fatal backfill in environments without documents
-        pass
 
 
 def downgrade() -> None:

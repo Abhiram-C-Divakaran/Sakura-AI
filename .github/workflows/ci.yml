@@ -71,6 +71,25 @@ jobs:
         run: |
           python -m unittest tests/test_schema_parity.py -v
 
+      - name: Run PostgreSQL Scheduler Concurrency Test
+        env:
+          DATABASE_URL: "postgresql://sakura_ci:sakura_ci_password@localhost:5432/sakura_ci_db"
+          SAKURA_POSTGRES_TEST: "1"
+        run: |
+          python -m unittest tests/test_scheduler_resilience.py -v
+
+      - name: Run Storage Persistence Integration Test
+        env:
+          DATABASE_URL: "sqlite:///./ci_test.db"
+        run: |
+          python -m unittest tests/test_storage_persistence_integration.py -v
+
+      - name: Run Frontend API Routing Smoke Test
+        env:
+          DATABASE_URL: "sqlite:///./ci_test.db"
+        run: |
+          python -m unittest tests/test_frontend_api_routing.py -v
+
       - name: Validate Docker Compose Configuration
         working-directory: anime-ai
         env:
@@ -116,6 +135,9 @@ jobs:
 
       - name: TypeScript Check
         run: npm run typecheck
+
+      - name: Run ESLint
+        run: npm run lint
 
       - name: Production Build
         run: npm run build

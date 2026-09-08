@@ -25,6 +25,8 @@ export interface ConversationViewProps {
   feedbackState: Record<string, 'positive' | 'negative'>;
   onSelectPrompt: (prompt: string) => void;
   onImageLightbox?: (src: string, alt: string, meta?: any) => void;
+  externalAttachment?: any;
+  onClearExternalAttachment?: () => void;
 }
 
 export const ConversationView: React.FC<ConversationViewProps> = ({
@@ -39,7 +41,9 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
   onFeedback,
   feedbackState,
   onSelectPrompt,
-  onImageLightbox
+  onImageLightbox,
+  externalAttachment,
+  onClearExternalAttachment
 }) => {
   const chatEndRef = useRef<HTMLDivElement>(null);
 
@@ -181,6 +185,8 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
             onSendMessage={onSendMessage}
             isGenerating={loadingResponse}
             onStopGeneration={onStopGeneration}
+            externalAttachment={externalAttachment}
+            onClearExternalAttachment={onClearExternalAttachment}
           />
         </div>
       </div>

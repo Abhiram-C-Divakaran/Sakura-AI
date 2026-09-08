@@ -65,6 +65,7 @@ class Document(Base):
     metadata_json = Column(JSON, default=dict, name="metadata")
     is_knowledge_base = Column(Boolean, default=False, nullable=False, index=True)
     indexing_status = Column(String(50), default="UPLOADED", nullable=False, index=True)
+    index_generation = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime(timezone=True), default=utc_now)
 
     # Relationships
@@ -395,6 +396,21 @@ class ToolExecution(Base):
     created_at = Column(DateTime(timezone=True), default=utc_now)
 
     task = relationship("CodingTask", back_populates="executions")
+
+
+class SandboxNetworkAuthorization(Base):
+    __tablename__ = "sandbox_network_authorizations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("repository_workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    command_hash = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    consumed_at = Column(DateTime(timezone=True), nullable=True)
+
+    user = relationship("User")
+    workspace = relationship("RepositoryWorkspace")
 
 
 # ─── Durable Background Tasks ──────────────────────────────────────────────

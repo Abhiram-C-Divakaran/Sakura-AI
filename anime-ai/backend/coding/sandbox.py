@@ -63,7 +63,8 @@ class DockerSandboxRuntime(BaseSandboxRuntime):
         cwd_relative: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
         tool_name: str = "run_command",
-        allow_network: bool = False
+        allow_network: bool = False,
+        network_authorization_id: Optional[str] = None
     ) -> Dict[str, Any]:
         start_time = time.time()
         timeout = timeout_seconds or self.default_timeout_seconds
@@ -179,7 +180,8 @@ class RemoteHttpSandboxRuntime(BaseSandboxRuntime):
         cwd_relative: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
         tool_name: str = "run_command",
-        allow_network: bool = False
+        allow_network: bool = False,
+        network_authorization_id: Optional[str] = None
     ) -> Dict[str, Any]:
         timeout = timeout_seconds or self.default_timeout_seconds
         payload = {
@@ -189,6 +191,7 @@ class RemoteHttpSandboxRuntime(BaseSandboxRuntime):
             "workspace_path": self.workspace_root,
             "cwd_relative": cwd_relative,
             "allow_network": allow_network,
+            "network_authorization_id": network_authorization_id,
             "tool_name": tool_name
         }
         headers = {}
@@ -254,7 +257,8 @@ class LocalRestrictedSandboxRuntime(BaseSandboxRuntime):
         cwd_relative: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
         tool_name: str = "run_command",
-        allow_network: bool = False
+        allow_network: bool = False,
+        network_authorization_id: Optional[str] = None
     ) -> Dict[str, Any]:
         start_time = time.time()
         timeout = timeout_seconds or self.default_timeout_seconds

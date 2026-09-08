@@ -23,8 +23,9 @@ export interface AppShellProps {
 
 export const AppShell: React.FC<AppShellProps> = ({ currentUser, onLogout }) => {
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [rightPanelOpen, setRightPanelOpen] = useState(true);
+  const [rightPanelOpen, setRightPanelOpen] = useState(false);
   const [activeView, setActiveView] = useState<'chat' | 'library' | 'projects' | 'scheduled' | 'plugins'>('chat');
+  const [pendingAttachment, setPendingAttachment] = useState<any>(null);
   const [windowWidth, setWindowWidth] = useState(typeof window !== 'undefined' ? window.innerWidth : 1200);
 
   // Modals state
@@ -178,7 +179,12 @@ export const AppShell: React.FC<AppShellProps> = ({ currentUser, onLogout }) => 
                 streamingResponse={streamingResponse}
                 streamingProvider={streamingProvider}
                 loadingResponse={loadingResponse}
-                onSendMessage={sendMessage}
+                onSendMessage={(payload) => {
+                  sendMessage({
+                    ...payload,
+                    active_workspace_id: activeWorkspaceId
+                  });
+                }}
                 onStopGeneration={stopGeneration}
                 onCopyMessage={handleCopyMessage}
                 copiedIdx={copiedIdx}
@@ -189,16 +195,20 @@ export const AppShell: React.FC<AppShellProps> = ({ currentUser, onLogout }) => 
                     message: prompt,
                     intensity: 'medium',
                     tools: [],
-                    attachments: []
+                    attachments: [],
+                    active_workspace_id: activeWorkspaceId
                   });
                 }}
                 onImageLightbox={handleOpenLightbox}
+                externalAttachment={pendingAttachment}
+                onClearExternalAttachment={() => setPendingAttachment(null)}
               />
             )}
 
             {activeView === 'library' && (
               <LibraryView
                 onAttachToChat={(file) => {
+                  setPendingAttachment(file);
                   setActiveView('chat');
                 }}
                 onNavigateToChat={() => setActiveView('chat')}

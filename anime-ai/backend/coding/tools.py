@@ -174,9 +174,39 @@ class CodingToolchain:
 
     # ─── Command & Test Execution ───────────────────────────────────────────
 
-    async def run_command(self, command: str, cwd: Optional[str] = None, timeout: int = 60) -> Dict[str, Any]:
+    async def run_command(
+        self,
+        command: str,
+        cwd: Optional[str] = None,
+        timeout: int = 60,
+        allow_network: bool = False,
+        network_authorization_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Runs a safe shell command inside workspace."""
-        return await self.executor.run_command(command, cwd_relative=cwd, timeout_seconds=timeout, tool_name="run_command")
+        from coding.security import NetworkAccessPolicy
+        if NetworkAccessPolicy.requires_network_authorization(command) and not network_authorization_id:
+            return {
+                "success": False,
+                "tool": "run_command",
+                "command": command,
+                "confirmation_required": True,
+                "reason": "This command requires outbound network access.",
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "Outbound network authorization required. Please approve network access before running this command.",
+                "duration_ms": 0,
+                "timed_out": False,
+                "blocked": True
+            }
+
+        return await self.executor.run_command(
+            command,
+            cwd_relative=cwd,
+            timeout_seconds=timeout,
+            tool_name="run_command",
+            allow_network=allow_network or bool(network_authorization_id),
+            network_authorization_id=network_authorization_id
+        )
 
     async def run_tests(self, command: str = "npm test", timeout: int = 120) -> Dict[str, Any]:
         """Runs test command (e.g. pytest, npm test, cargo test)."""

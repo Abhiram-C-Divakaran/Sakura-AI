@@ -64,6 +64,35 @@ def assert_user_storage_key(user_id: uuid.UUID, storage_key: str) -> None:
         )
 
 
+def resolve_legacy_local_path(storage_path: str, allowed_root: Optional[str] = None) -> str:
+    """
+    Safely resolves legacy storage paths with strict traversal containment.
+    Verifies path exists within allowed_root (defaults to SAKURA_STORAGE_ROOT or ./uploaded_documents).
+    Rejects null bytes, symlink escapes, drive escapes, and parent traversals.
+    """
+    if not storage_path or not isinstance(storage_path, str):
+        raise StorageSecurityError("Invalid legacy storage path.")
+
+    if "\0" in storage_path:
+        raise StorageSecurityError(f"Null byte detected in legacy storage path: '{storage_path}'")
+
+    root = allowed_root or os.getenv("SAKURA_STORAGE_ROOT", "./uploaded_documents")
+    canonical_root = os.path.realpath(os.path.abspath(root))
+    canonical_target = os.path.realpath(os.path.abspath(storage_path))
+
+    try:
+        common = os.path.commonpath([canonical_root, canonical_target])
+    except ValueError:
+        raise StorageSecurityError(f"Path traversal detected: '{storage_path}' escapes storage drive boundary.")
+
+    if common != canonical_root or (canonical_target != canonical_root and not canonical_target.startswith(canonical_root + os.sep)):
+        raise StorageSecurityError(
+            f"Storage path traversal detected: legacy path '{storage_path}' escapes allowed root '{canonical_root}'"
+        )
+
+    return canonical_target
+
+
 class StorageBackend(ABC):
     """Abstract base class defining the durable storage contract."""
 
@@ -348,20 +377,31 @@ class S3CompatibleStorage(StorageBackend):
             extra_args["ContentType"] = content_type
 
         if isinstance(data, (bytes, bytearray)):
-            body = data
+            stream = io.BytesIO(data)
             size = len(data)
         elif hasattr(data, "read"):
-            body = data.read()
-            size = len(body)
+            stream = data
+            # Determine size incrementally if possible
+            if hasattr(data, "seek") and hasattr(data, "tell"):
+                curr = data.tell()
+                data.seek(0, io.SEEK_END)
+                size = data.tell() - curr
+                data.seek(curr)
+            else:
+                size = None
         else:
             raise ValueError(f"Unsupported data type for S3 storage put: {type(data)}")
 
-        client.put_object(
+        # Stream directly without buffering full object in RAM
+        client.upload_fileobj(
+            Fileobj=stream,
             Bucket=self.bucket_name,
             Key=norm_key,
-            Body=body,
-            **extra_args
+            ExtraArgs=extra_args
         )
+
+        if size is None:
+            size = self.get_size(norm_key)
 
         return {
             "storage_backend": self.backend_type,
@@ -429,12 +469,25 @@ class S3CompatibleStorage(StorageBackend):
         filename: str,
         mime_type: Optional[str] = None
     ) -> Response:
-        data = self.get_bytes(storage_key)
-        return Response(
-            content=data,
-            media_type=mime_type or "application/octet-stream",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-        )
+        """Streams stored object in bounded chunks to avoid buffering large files in RAM."""
+        from starlette.responses import StreamingResponse
+        client = self._get_client()
+        norm_key = storage_key.replace("\\", "/").lstrip("/")
+        try:
+            s3_obj = client.get_object(Bucket=self.bucket_name, Key=norm_key)
+            body = s3_obj["Body"]
+
+            def chunk_generator():
+                for chunk in body.iter_chunks(chunk_size=64 * 1024):
+                    yield chunk
+
+            return StreamingResponse(
+                chunk_generator(),
+                media_type=mime_type or s3_obj.get("ContentType", "application/octet-stream"),
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+            )
+        except Exception as e:
+            raise StorageObjectNotFoundError(f"Object '{norm_key}' download error: {e}")
 
     def generate_signed_url(self, storage_key: str, expires_in: int = 3600) -> Optional[str]:
         client = self._get_client()
@@ -460,3 +513,83 @@ def get_storage_backend(backend_type: Optional[str] = None) -> StorageBackend:
     if chosen == "s3":
         return S3CompatibleStorage()
     return LocalFilesystemStorage()
+
+
+def check_storage_readiness(is_production: Optional[bool] = None) -> Dict[str, Any]:
+    """
+    Validates storage backend readiness for /readiness probe without leaking credentials.
+    In production:
+    - S3: verifies authentication & head_bucket probe within bounded timeout.
+    - Local: verifies root directory exists, is writable, and passes durable non-ephemeral policy.
+    """
+    if is_production is None:
+        env = os.getenv("ENVIRONMENT", "development").lower()
+        is_production = env in ("production", "prod")
+
+    backend_type = (os.getenv("SAKURA_STORAGE_BACKEND") or "local").strip().lower()
+    if backend_type == "s3":
+        bucket = os.getenv("SAKURA_STORAGE_BUCKET") or "sakura-library"
+        endpoint = os.getenv("SAKURA_STORAGE_ENDPOINT")
+        access_key = os.getenv("SAKURA_STORAGE_ACCESS_KEY")
+        secret_key = os.getenv("SAKURA_STORAGE_SECRET_KEY")
+
+        configured = bool(bucket and (access_key or not is_production))
+        storage = S3CompatibleStorage(bucket_name=bucket, endpoint_url=endpoint)
+        try:
+            client = storage._get_client()
+            client.head_bucket(Bucket=bucket)
+            return {
+                "backend": "s3",
+                "configured": True,
+                "healthy": True,
+                "status": "OPERATIONAL",
+                "bucket": bucket,
+                "reason": None
+            }
+        except Exception as e:
+            raw_err = str(e)
+            if access_key and access_key in raw_err:
+                raw_err = raw_err.replace(access_key, "[REDACTED]")
+            if secret_key and secret_key in raw_err:
+                raw_err = raw_err.replace(secret_key, "[REDACTED]")
+            return {
+                "backend": "s3",
+                "configured": configured,
+                "healthy": not is_production if not configured else False,
+                "status": "DEGRADED" if not is_production else "UNAVAILABLE",
+                "bucket": bucket,
+                "reason": f"S3 probe failed: {raw_err}"
+            }
+    else:
+        root_dir = os.path.realpath(os.path.abspath(os.getenv("SAKURA_STORAGE_ROOT", "./uploaded_documents")))
+        root_exists = os.path.exists(root_dir)
+        writable = os.access(root_dir, os.W_OK) if root_exists else False
+        if not root_exists:
+            try:
+                os.makedirs(root_dir, exist_ok=True)
+                writable = os.access(root_dir, os.W_OK)
+                root_exists = True
+            except Exception:
+                writable = False
+
+        # Production policy: in production, local storage must use a dedicated durable mount point (not ./uploaded_documents)
+        is_ephemeral = root_dir.endswith("uploaded_documents") or not os.path.isabs(os.getenv("SAKURA_STORAGE_ROOT", "./uploaded_documents"))
+        if is_production and is_ephemeral:
+            return {
+                "backend": "local",
+                "configured": True,
+                "healthy": False,
+                "status": "UNAVAILABLE",
+                "root_dir": root_dir,
+                "reason": "Production local storage requires durable non-ephemeral root directory (/data/library)."
+            }
+
+        healthy = root_exists and writable
+        return {
+            "backend": "local",
+            "configured": True,
+            "healthy": healthy,
+            "status": "OPERATIONAL" if healthy else "UNAVAILABLE",
+            "root_dir": root_dir,
+            "reason": None if healthy else "Storage root directory is not writable"
+        }

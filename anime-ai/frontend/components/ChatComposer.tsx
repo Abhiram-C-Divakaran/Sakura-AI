@@ -17,6 +17,7 @@ export interface ChatSubmitPayload {
     mime_type?: string;
     content?: string;
   }[];
+  active_workspace_id?: string | null;
 }
 
 interface ChatComposerProps {

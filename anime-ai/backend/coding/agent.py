@@ -399,7 +399,12 @@ class CodingAgent:
                 if new_path not in self.modified_files:
                     self.modified_files.append(new_path)
         elif tool_name == "run_command":
-            res = await self.toolchain.run_command(args.get("command", ""), args.get("cwd"))
+            res = await self.toolchain.run_command(
+                command=args.get("command", ""),
+                cwd=args.get("cwd"),
+                allow_network=args.get("allow_network", False),
+                network_authorization_id=args.get("network_authorization_id")
+            )
         elif tool_name == "run_tests":
             res = await self.toolchain.run_tests(args.get("command", "npm test"))
             self.tests_run.append(res)

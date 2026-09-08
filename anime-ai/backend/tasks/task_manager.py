@@ -8,7 +8,7 @@ import os
 import uuid
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,9 @@ from database.models import BackgroundTask, Document, DocumentChunk, DocumentInd
 from database.db import get_db_context
 from llm.router import LLMRouter
 from services.web_search import perform_web_search
+
+from dataclasses import dataclass
+from services.storage import resolve_legacy_local_path
 
 logger = logging.getLogger("sakura.tasks")
 
@@ -27,26 +30,64 @@ class TaskLeaseLostError(Exception):
     pass
 
 
+def _is_lease_expired(lease_expires_at: Optional[datetime], now: datetime) -> bool:
+    if not lease_expires_at:
+        return False
+    exp = lease_expires_at.replace(tzinfo=timezone.utc) if lease_expires_at.tzinfo is None else lease_expires_at
+    n = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
+    return exp < n
+
+
+@dataclass(frozen=True)
+class TaskExecutionContext:
+    task_id: uuid.UUID
+    worker_id: str
+    execution_attempt_id: uuid.UUID
+    lease_lost_event: Optional[asyncio.Event] = None
+
+    def assert_owned(self) -> bool:
+        """
+        Validates that this worker and attempt token currently hold an active, unexpired lease.
+        If lease_lost_event is set, or if database state has diverged/expired, raises TaskLeaseLostError.
+        """
+        if self.lease_lost_event and self.lease_lost_event.is_set():
+            raise TaskLeaseLostError(
+                f"Task {self.task_id} lease lost event was signaled for worker '{self.worker_id}'."
+            )
+
+        with get_db_context() as db:
+            now = utc_now()
+            task = db.query(BackgroundTask).filter(
+                BackgroundTask.id == self.task_id,
+                BackgroundTask.worker_id == self.worker_id,
+                BackgroundTask.execution_attempt_id == self.execution_attempt_id,
+                BackgroundTask.status.in_(["Starting", "Running"])
+            ).first()
+            if not task:
+                raise TaskLeaseLostError(
+                    f"Task {self.task_id} lease lost: worker '{self.worker_id}' with token '{self.execution_attempt_id}' is no longer the active owner."
+                )
+            if _is_lease_expired(task.lease_expires_at, now):
+                raise TaskLeaseLostError(
+                    f"Task {self.task_id} lease expired at {task.lease_expires_at} (current time {now})."
+                )
+            return True
+
+
 def assert_task_lease_owned(
     task_id: uuid.UUID,
     worker_id: Optional[str] = None,
-    execution_attempt_id: Optional[uuid.UUID] = None
+    execution_attempt_id: Optional[uuid.UUID] = None,
+    lease_lost_event: Optional[asyncio.Event] = None
 ) -> bool:
     """Verifies that the given worker_id and attempt token currently own the task lease."""
-    if not worker_id or not execution_attempt_id:
-        return True
-    with get_db_context() as db:
-        task = db.query(BackgroundTask).filter(
-            BackgroundTask.id == task_id,
-            BackgroundTask.worker_id == worker_id,
-            BackgroundTask.execution_attempt_id == execution_attempt_id,
-            BackgroundTask.status.in_(["Starting", "Running"])
-        ).first()
-        if not task:
-            raise TaskLeaseLostError(
-                f"Task {task_id} lease lost: worker '{worker_id}' with token '{execution_attempt_id}' is no longer the active owner."
-            )
-        return True
+    ctx = TaskExecutionContext(
+        task_id=task_id,
+        worker_id=worker_id,
+        execution_attempt_id=execution_attempt_id,
+        lease_lost_event=lease_lost_event
+    )
+    return ctx.assert_owned()
 
 
 class TaskManager:
@@ -256,13 +297,19 @@ async def update_task_state(
     result: Optional[str] = None,
     result_metadata: Optional[dict] = None,
     worker_id: Optional[str] = None,
-    execution_attempt_id: Optional[uuid.UUID] = None
+    execution_attempt_id: Optional[uuid.UUID] = None,
+    ctx: Optional[TaskExecutionContext] = None
 ) -> Optional[dict]:
     """
     Updates task in database and broadcasts update.
     Protects terminal states, respects cancellation, and enforces compare-and-set execution fencing.
     If execution_attempt_id is specified and does not match active record, raises TaskLeaseLostError.
     """
+    if ctx is not None:
+        ctx.assert_owned()
+        worker_id = worker_id or ctx.worker_id
+        execution_attempt_id = execution_attempt_id or ctx.execution_attempt_id
+
     with get_db_context() as db:
         query = db.query(BackgroundTask).filter(BackgroundTask.id == task_id)
         if execution_attempt_id is not None:
@@ -277,6 +324,10 @@ async def update_task_state(
                     f"Task {task_id} state update rejected: worker '{worker_id}' with attempt token '{execution_attempt_id}' has lost lease ownership."
                 )
             return None
+
+        now = utc_now()
+        if (worker_id or execution_attempt_id) and _is_lease_expired(task.lease_expires_at, now):
+            raise TaskLeaseLostError(f"Task {task_id} lease expired at {task.lease_expires_at}.")
 
         # Terminal state protection: Completed, Failed, and Cancelled cannot be overwritten by progress updates
         if task.status in ["Cancelled", "Failed", "Completed"] and status not in ["Queued"]:
@@ -351,67 +402,115 @@ async def run_task_execution(task_id: uuid.UUID, user_id: uuid.UUID):
             del ACTIVE_ASYNCIO_TASKS[task_id_str]
 
 
-async def execute_code_analysis(task_id: uuid.UUID, user_id: uuid.UUID, payload: dict, router: LLMRouter):
+async def execute_code_analysis(
+    task_id: uuid.UUID,
+    user_id: uuid.UUID,
+    payload: dict,
+    router: LLMRouter,
+    ctx: Optional[TaskExecutionContext] = None
+):
+    if ctx:
+        ctx.assert_owned()
+
     code = payload.get("code", "")
     instruction = payload.get("task", "explain")
 
-    await update_task_state(task_id, "Running", 25)
+    await update_task_state(task_id, "Running", 25, ctx=ctx)
     prompt = (
         f"Please analyze this code and provide a comprehensive code review:\n"
         f"Instruction: {instruction}\n"
         f"Code:\n```\n{code}\n```"
     )
-    await update_task_state(task_id, "Running", 60)
+    if ctx:
+        ctx.assert_owned()
+
+    await update_task_state(task_id, "Running", 60, ctx=ctx)
+    if ctx:
+        ctx.assert_owned()
+
     _, response = await router.generate(
         prompt=prompt,
         system_prompt="You are a senior software architect and code reviewer."
     )
-    await update_task_state(task_id, "Completed", 100, result=response)
+    if ctx:
+        ctx.assert_owned()
+
+    await update_task_state(task_id, "Completed", 100, result=response, ctx=ctx)
 
 
-async def execute_doc_summary(task_id: uuid.UUID, user_id: uuid.UUID, payload: dict, router: LLMRouter):
+async def execute_doc_summary(
+    task_id: uuid.UUID,
+    user_id: uuid.UUID,
+    payload: dict,
+    router: LLMRouter,
+    ctx: Optional[TaskExecutionContext] = None
+):
+    if ctx:
+        ctx.assert_owned()
+
     doc_id_str = payload.get("document_id")
     if not doc_id_str:
-        await update_task_state(task_id, "Failed", 100, error="Missing document_id in task payload")
+        await update_task_state(task_id, "Failed", 100, error="Missing document_id in task payload", ctx=ctx)
         return
 
     try:
         doc_u = uuid.UUID(doc_id_str)
     except ValueError:
-        await update_task_state(task_id, "Failed", 100, error="Invalid document identifier")
+        await update_task_state(task_id, "Failed", 100, error="Invalid document identifier", ctx=ctx)
         return
 
-    await update_task_state(task_id, "Running", 20)
+    await update_task_state(task_id, "Running", 20, ctx=ctx)
+    if ctx:
+        ctx.assert_owned()
+
     with get_db_context() as db:
         doc = db.query(Document).filter(Document.id == doc_u, Document.user_id == user_id).first()
         if not doc:
-            await update_task_state(task_id, "Failed", 100, error="Document not found or access denied")
+            await update_task_state(task_id, "Failed", 100, error="Document not found or access denied", ctx=ctx)
             return
 
         chunks = db.query(DocumentChunk).filter(
             DocumentChunk.document_id == doc.id
         ).order_by(DocumentChunk.chunk_index.asc()).all()
         if not chunks:
-            await update_task_state(task_id, "Failed", 100, error="No text content indexed for this document")
+            await update_task_state(task_id, "Failed", 100, error="No text content indexed for this document", ctx=ctx)
             return
         combined_text = "\n\n".join(c.content for c in chunks[:10])
 
-    await update_task_state(task_id, "Running", 60)
+    if ctx:
+        ctx.assert_owned()
+
+    await update_task_state(task_id, "Running", 60, ctx=ctx)
+    if ctx:
+        ctx.assert_owned()
+
     prompt = f"Please provide an accurate, high-density summary of the following document:\n\n{combined_text}"
     _, response = await router.generate(
         prompt=prompt,
         system_prompt="You are an analytical document summarizer."
     )
-    await update_task_state(task_id, "Completed", 100, result=response)
+    if ctx:
+        ctx.assert_owned()
+
+    await update_task_state(task_id, "Completed", 100, result=response, ctx=ctx)
 
 
-async def execute_dataset_analysis(task_id: uuid.UUID, user_id: uuid.UUID, payload: dict, router: LLMRouter):
+async def execute_dataset_analysis(
+    task_id: uuid.UUID,
+    user_id: uuid.UUID,
+    payload: dict,
+    router: LLMRouter,
+    ctx: Optional[TaskExecutionContext] = None
+):
+    if ctx:
+        ctx.assert_owned()
+
     dataset_text = payload.get("dataset_text", "")
     if not dataset_text.strip():
-        await update_task_state(task_id, "Failed", 100, error="Empty dataset provided")
+        await update_task_state(task_id, "Failed", 100, error="Empty dataset provided", ctx=ctx)
         return
 
-    await update_task_state(task_id, "Running", 30)
+    await update_task_state(task_id, "Running", 30, ctx=ctx)
     lines = [l for l in dataset_text.strip().split("\n") if l.strip()]
     num_rows = len(lines)
     header = lines[0] if lines else ""
@@ -419,7 +518,13 @@ async def execute_dataset_analysis(task_id: uuid.UUID, user_id: uuid.UUID, paylo
 
     stats_summary = f"Dataset Metrics:\n- Total Rows: {num_rows}\n- Columns: {num_cols}\n- Header: {header}"
 
-    await update_task_state(task_id, "Running", 70)
+    if ctx:
+        ctx.assert_owned()
+
+    await update_task_state(task_id, "Running", 70, ctx=ctx)
+    if ctx:
+        ctx.assert_owned()
+
     prompt = (
         f"Perform an analytical review of this dataset sample:\n"
         f"{stats_summary}\n"
@@ -429,11 +534,20 @@ async def execute_dataset_analysis(task_id: uuid.UUID, user_id: uuid.UUID, paylo
         prompt=prompt,
         system_prompt="You are a data scientist analyzing tabular datasets."
     )
+    if ctx:
+        ctx.assert_owned()
+
     full_result = f"{stats_summary}\n\nAnalysis:\n{response}"
-    await update_task_state(task_id, "Completed", 100, result=full_result)
+    await update_task_state(task_id, "Completed", 100, result=full_result, ctx=ctx)
 
 
-async def execute_web_research(task_id: uuid.UUID, user_id: uuid.UUID, payload: dict, router: LLMRouter):
+async def execute_web_research(
+    task_id: uuid.UUID,
+    user_id: uuid.UUID,
+    payload: dict,
+    router: LLMRouter,
+    ctx: Optional[TaskExecutionContext] = None
+):
     """
     Executes real web research:
     1. Runs real web search via Tavily / DuckDuckGo fallback.
@@ -441,15 +555,23 @@ async def execute_web_research(task_id: uuid.UUID, user_id: uuid.UUID, payload: 
     3. Synthesizes findings using LLM.
     4. Stores result and source URLs truthfully. If search is unavailable, fails truthfully.
     """
+    if ctx:
+        ctx.assert_owned()
+
     query = payload.get("query", "").strip()
     if not query:
-        await update_task_state(task_id, "Failed", 100, error="Empty query provided for web research")
+        await update_task_state(task_id, "Failed", 100, error="Empty query provided for web research", ctx=ctx)
         return
 
-    await update_task_state(task_id, "Running", 25)
+    await update_task_state(task_id, "Running", 25, ctx=ctx)
+    if ctx:
+        ctx.assert_owned()
 
     # 1. Real web search
     search_data = await perform_web_search(query, max_results=6)
+    if ctx:
+        ctx.assert_owned()
+
     results = search_data.get("results", [])
 
     if not search_data.get("success") or not results:
@@ -459,11 +581,14 @@ async def execute_web_research(task_id: uuid.UUID, user_id: uuid.UUID, payload: 
             "Failed",
             100,
             error=f"Web search unavailable: {error_msg}. Cannot synthesize ungrounded research.",
-            result_metadata={"query": query, "provider": search_data.get("provider")}
+            result_metadata={"query": query, "provider": search_data.get("provider")},
+            ctx=ctx
         )
         return
 
-    await update_task_state(task_id, "Running", 65)
+    await update_task_state(task_id, "Running", 65, ctx=ctx)
+    if ctx:
+        ctx.assert_owned()
 
     # 2. Structured source compilation
     sources_text = "\n\n".join([
@@ -484,6 +609,8 @@ async def execute_web_research(task_id: uuid.UUID, user_id: uuid.UUID, payload: 
         prompt=prompt,
         system_prompt="You are an expert research analyst providing cited, factual intelligence."
     )
+    if ctx:
+        ctx.assert_owned()
 
     metadata = {
         "query": query,
@@ -499,7 +626,8 @@ async def execute_web_research(task_id: uuid.UUID, user_id: uuid.UUID, payload: 
         "Completed",
         100,
         result=response,
-        result_metadata=metadata
+        result_metadata=metadata,
+        ctx=ctx
     )
 
 
@@ -507,31 +635,35 @@ async def execute_scheduled_task_job(
     task_id: uuid.UUID,
     user_id: uuid.UUID,
     payload: dict,
-    router: LLMRouter
+    router: LLMRouter,
+    ctx: Optional[TaskExecutionContext] = None
 ):
     """Executes a durable scheduled task run within the background worker pipeline."""
     import time
     from database.models import ScheduledTask, ScheduledTaskRun
     start_time = time.time()
 
+    if ctx:
+        ctx.assert_owned()
+
     scheduled_task_id_str = payload.get("scheduled_task_id")
     run_id_str = payload.get("run_id")
     if not scheduled_task_id_str or not run_id_str:
-        await update_task_state(task_id, "Failed", 100, error="Missing scheduled_task_id or run_id in payload.")
+        await update_task_state(task_id, "Failed", 100, error="Missing scheduled_task_id or run_id in payload.", ctx=ctx)
         return
 
     try:
         st_uuid = uuid.UUID(scheduled_task_id_str)
         run_uuid = uuid.UUID(run_id_str)
     except ValueError:
-        await update_task_state(task_id, "Failed", 100, error="Invalid UUID for scheduled_task_id or run_id.")
+        await update_task_state(task_id, "Failed", 100, error="Invalid UUID for scheduled_task_id or run_id.", ctx=ctx)
         return
 
     with get_db_context() as db:
         st = db.query(ScheduledTask).filter(ScheduledTask.id == st_uuid).first()
         run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
         if not st or not run:
-            await update_task_state(task_id, "Failed", 100, error="Scheduled task or run record not found.")
+            await update_task_state(task_id, "Failed", 100, error="Scheduled task or run record not found.", ctx=ctx)
             return
 
         run.status = "RUNNING"
@@ -539,7 +671,10 @@ async def execute_scheduled_task_job(
         db.commit()
         prompt_text = st.prompt
 
-    await update_task_state(task_id, "Running", 25)
+    await update_task_state(task_id, "Running", 25, ctx=ctx)
+
+    if ctx:
+        ctx.assert_owned()
 
     # Check cancellation before expensive LLM generation
     with get_db_context() as db:
@@ -552,7 +687,7 @@ async def execute_scheduled_task_job(
                     r.error = "Execution cancelled by user."
                     r.completed_at = utc_now()
                     db2.commit()
-            await update_task_state(task_id, "Cancelled", 100)
+            await update_task_state(task_id, "Cancelled", 100, ctx=ctx)
             return
 
     try:
@@ -569,6 +704,9 @@ async def execute_scheduled_task_job(
         )
         duration_ms = int((time.time() - start_time) * 1000)
 
+        if ctx:
+            ctx.assert_owned()
+
         # Check cancellation before final persistence
         with get_db_context() as db:
             curr = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
@@ -579,7 +717,7 @@ async def execute_scheduled_task_job(
                     r.error = "Execution cancelled by user."
                     r.completed_at = utc_now()
                     db.commit()
-                await update_task_state(task_id, "Cancelled", 100)
+                await update_task_state(task_id, "Cancelled", 100, ctx=ctx)
                 return
 
             run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
@@ -590,7 +728,7 @@ async def execute_scheduled_task_job(
                 run.duration_ms = duration_ms
                 db.commit()
 
-        await update_task_state(task_id, "Completed", 100, result=response_text)
+        await update_task_state(task_id, "Completed", 100, result=response_text, ctx=ctx)
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
         with get_db_context() as db:
@@ -601,7 +739,7 @@ async def execute_scheduled_task_job(
                 run.completed_at = utc_now()
                 run.duration_ms = duration_ms
                 db.commit()
-        await update_task_state(task_id, "Failed", 100, error=str(e))
+        await update_task_state(task_id, "Failed", 100, error=str(e), ctx=ctx)
 
 
 async def execute_document_index(
@@ -609,22 +747,35 @@ async def execute_document_index(
     user_id: uuid.UUID,
     payload: dict,
     worker_id: Optional[str] = None,
-    execution_attempt_id: Optional[uuid.UUID] = None
+    execution_attempt_id: Optional[uuid.UUID] = None,
+    ctx: Optional[TaskExecutionContext] = None
 ):
     """
     Durable Document Indexing Worker Handler:
-    1. Verify lease ownership via assert_task_lease_owned
-    2. Read file bytes from durable StorageBackend
-    3. Parse file text
-    4. Chunk content
-    5. Generate dense vector embeddings
-    6. Transactionally persist DocumentChunk records
-    7. Update Document.is_knowledge_base = True, Document.indexing_status = READY
-    8. Send realtime WebSocket updates across real phase transitions
+    1. Verify lease ownership via ctx.assert_owned()
+    2. Check Document.index_generation to prevent index/remove races
+    3. Read file bytes from durable StorageBackend
+    4. Parse file text
+    5. Chunk content
+    6. Generate dense vector embeddings
+    7. Transactionally persist DocumentChunk records if generation is still valid
+    8. Update Document.is_knowledge_base = True, Document.indexing_status = READY
+    9. Send realtime WebSocket updates across real phase transitions
     """
+    if ctx is None and (worker_id or execution_attempt_id):
+        ctx = TaskExecutionContext(
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_attempt_id=execution_attempt_id
+        )
+
+    if ctx:
+        ctx.assert_owned()
+
     doc_id_str = payload.get("document_id")
+    expected_gen = payload.get("index_generation")
     if not doc_id_str:
-        await update_task_state(task_id, "Failed", 100, error="Missing document_id in payload", worker_id=worker_id, execution_attempt_id=execution_attempt_id)
+        await update_task_state(task_id, "Failed", 100, error="Missing document_id in payload", ctx=ctx)
         return
 
     doc_uuid = uuid.UUID(doc_id_str)
@@ -634,13 +785,18 @@ async def execute_document_index(
     from rag.embeddings.manager import EmbeddingManager
     from services.storage import get_storage_backend
 
-    assert_task_lease_owned(task_id, worker_id, execution_attempt_id)
-
     with get_db_context() as db:
         doc = db.query(Document).filter(Document.id == doc_uuid, Document.user_id == user_id).first()
         if not doc:
-            await update_task_state(task_id, "Failed", 100, error="Document not found", worker_id=worker_id, execution_attempt_id=execution_attempt_id)
+            await update_task_state(task_id, "Failed", 100, error="Document not found", ctx=ctx)
             return
+
+        # P0.12: Verify generation hasn't been superseded or document removed from KB
+        doc_gen = getattr(doc, "index_generation", 0)
+        if expected_gen is not None and doc_gen != expected_gen:
+            raise TaskLeaseLostError(f"Document {doc_uuid} generation mismatch (expected {expected_gen}, found {doc_gen}). Task aborted.")
+        if not doc.is_knowledge_base and doc.indexing_status == DocumentIndexingStatus.NOT_INDEXED:
+            raise TaskLeaseLostError(f"Document {doc_uuid} was removed from knowledge base. Task aborted.")
 
         doc.indexing_status = DocumentIndexingStatus.PARSING
         doc.metadata_json = {**(doc.metadata_json or {}), "indexing_status": "Parsing", "status": "INDEXING"}
@@ -653,17 +809,24 @@ async def execute_document_index(
         "action": "updated",
         "data": serialized_doc
     })
-    await update_task_state(task_id, "Running", 20, worker_id=worker_id, execution_attempt_id=execution_attempt_id)
+    await update_task_state(task_id, "Running", 20, ctx=ctx)
 
     storage = get_storage_backend(doc.storage_backend)
+
+    if ctx:
+        ctx.assert_owned()
 
     # 1. Read file bytes from storage backend
     try:
         if doc.storage_key and storage.exists(doc.storage_key):
             file_bytes = storage.get_bytes(doc.storage_key)
-        elif doc.storage_path and os.path.exists(doc.storage_path):
-            with open(doc.storage_path, "rb") as f:
-                file_bytes = f.read()
+        elif doc.storage_path:
+            safe_path = resolve_legacy_local_path(doc.storage_path)
+            if os.path.exists(safe_path):
+                with open(safe_path, "rb") as f:
+                    file_bytes = f.read()
+            else:
+                raise FileNotFoundError(f"Document file not found at legacy path: {safe_path}")
         else:
             raise FileNotFoundError(f"Document file not found in storage (key: {doc.storage_key}, path: {doc.storage_path})")
 
@@ -696,47 +859,71 @@ async def execute_document_index(
                 db.refresh(d)
                 serialized = serialize_document(d)
         await ws_manager.send_to_user(str(user_id), {"type": "library_update", "action": "updated", "data": serialized})
-        await update_task_state(task_id, "Failed", 100, error=str(e), worker_id=worker_id, execution_attempt_id=execution_attempt_id)
+        await update_task_state(task_id, "Failed", 100, error=str(e), ctx=ctx)
         return
 
     # 2. Chunking phase
-    assert_task_lease_owned(task_id, worker_id, execution_attempt_id)
+    if ctx:
+        ctx.assert_owned()
+
     with get_db_context() as db:
         d = db.query(Document).filter(Document.id == doc_uuid).first()
         if d:
+            doc_gen = getattr(d, "index_generation", 0)
+            if expected_gen is not None and doc_gen != expected_gen:
+                raise TaskLeaseLostError(f"Document {doc_uuid} generation superseded during chunking ({doc_gen} != {expected_gen}).")
+            if not d.is_knowledge_base and d.indexing_status == DocumentIndexingStatus.NOT_INDEXED:
+                raise TaskLeaseLostError(f"Document {doc_uuid} removed from KB during chunking.")
+
             d.indexing_status = DocumentIndexingStatus.CHUNKING
             d.metadata_json = {**(d.metadata_json or {}), "indexing_status": "Chunking"}
             db.commit()
             db.refresh(d)
             serialized = serialize_document(d)
     await ws_manager.send_to_user(str(user_id), {"type": "library_update", "action": "updated", "data": serialized})
-    await update_task_state(task_id, "Running", 45, worker_id=worker_id, execution_attempt_id=execution_attempt_id)
+    await update_task_state(task_id, "Running", 45, ctx=ctx)
 
     chunks = parser.get_chunks(raw_text)
 
     # 3. Embedding phase
-    assert_task_lease_owned(task_id, worker_id, execution_attempt_id)
+    if ctx:
+        ctx.assert_owned()
+
     with get_db_context() as db:
         d = db.query(Document).filter(Document.id == doc_uuid).first()
         if d:
+            doc_gen = getattr(d, "index_generation", 0)
+            if expected_gen is not None and doc_gen != expected_gen:
+                raise TaskLeaseLostError(f"Document {doc_uuid} generation superseded during embedding ({doc_gen} != {expected_gen}).")
+            if not d.is_knowledge_base and d.indexing_status == DocumentIndexingStatus.NOT_INDEXED:
+                raise TaskLeaseLostError(f"Document {doc_uuid} removed from KB during embedding.")
+
             d.indexing_status = DocumentIndexingStatus.EMBEDDING
             d.metadata_json = {**(d.metadata_json or {}), "indexing_status": "Embedding"}
             db.commit()
             db.refresh(d)
             serialized = serialize_document(d)
     await ws_manager.send_to_user(str(user_id), {"type": "library_update", "action": "updated", "data": serialized})
-    await update_task_state(task_id, "Running", 70, worker_id=worker_id, execution_attempt_id=execution_attempt_id)
+    await update_task_state(task_id, "Running", 70, ctx=ctx)
 
     embed_mgr = EmbeddingManager()
     contents = [c["content"] for c in chunks]
     embeddings = embed_mgr.get_embeddings(contents)
 
     # 4. Final transactional chunk persistence
-    assert_task_lease_owned(task_id, worker_id, execution_attempt_id)
+    if ctx:
+        ctx.assert_owned()
+
     with get_db_context() as db:
         d = db.query(Document).filter(Document.id == doc_uuid).first()
         if not d:
             raise FileNotFoundError("Document was deleted during indexing")
+
+        doc_gen = getattr(d, "index_generation", 0)
+        if expected_gen is not None and doc_gen != expected_gen:
+            raise TaskLeaseLostError(f"Document {doc_uuid} generation superseded before commit ({doc_gen} != {expected_gen}). Zero chunks committed.")
+        if not d.is_knowledge_base and d.indexing_status == DocumentIndexingStatus.NOT_INDEXED:
+            raise TaskLeaseLostError(f"Document {doc_uuid} removed from KB before commit. Zero chunks committed.")
 
         # Transactionally remove old chunks
         db.query(DocumentChunk).filter(DocumentChunk.document_id == d.id).delete()
@@ -778,7 +965,6 @@ async def execute_document_index(
         100,
         result=f"Successfully indexed document '{d.filename}' ({len(chunks)} chunks).",
         result_metadata={"chunks": len(chunks), "document_id": str(doc_uuid)},
-        worker_id=worker_id,
-        execution_attempt_id=execution_attempt_id
+        ctx=ctx
     )
 

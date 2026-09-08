@@ -552,127 +552,36 @@ def delete_memory(memory_id: str, current_user: User = Depends(AuthManager.get_c
 
 # ─── Documents / RAG Endpoints ───────────────────────────────────────────────
 
-UPLOAD_DIR = "./uploaded_documents"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# Async document ingestion worker
-async def async_ingest_document(doc_id: uuid.UUID, user_id: uuid.UUID):
-    from database.db import get_db_context
-    with get_db_context() as db:
-        doc = db.query(Document).filter(Document.id == doc_id).first()
-        if not doc:
-            return
-            
-        try:
-            # 1. Parsing
-            doc.metadata_json = {**doc.metadata_json, "indexing_status": "Parsing"}
-            db.commit()
-            await ws_manager.send_to_user(str(user_id), {"type": "document_status", "document_id": str(doc.id), "status": "Parsing"})
-            await asyncio.sleep(0.5)
-
-            # Parse file
-            parser = DocumentParser()
-            raw_text = parser.parse_file(doc.storage_path, doc.mime_type)
-            
-            # 2. Chunking
-            doc.metadata_json = {**doc.metadata_json, "indexing_status": "Chunking"}
-            db.commit()
-            await ws_manager.send_to_user(str(user_id), {"type": "document_status", "document_id": str(doc.id), "status": "Chunking"})
-            await asyncio.sleep(0.5)
-
-            chunks = parser.get_chunks(raw_text)
-
-            # 3. Embedding
-            doc.metadata_json = {**doc.metadata_json, "indexing_status": "Embedding"}
-            db.commit()
-            await ws_manager.send_to_user(str(user_id), {"type": "document_status", "document_id": str(doc.id), "status": "Embedding"})
-            await asyncio.sleep(0.5)
-
-            embed_mgr = EmbeddingManager()
-            contents = [c["content"] for c in chunks]
-            embeddings = embed_mgr.get_embeddings(contents)
-
-            # 4. Indexing
-            doc.metadata_json = {**doc.metadata_json, "indexing_status": "Indexing"}
-            db.commit()
-            await ws_manager.send_to_user(str(user_id), {"type": "document_status", "document_id": str(doc.id), "status": "Indexing"})
-            await asyncio.sleep(0.5)
-
-            for i, chunk in enumerate(chunks):
-                db_chunk = DocumentChunk(
-                    document_id=doc.id,
-                    chunk_index=chunk["chunk_index"],
-                    content=chunk["content"],
-                    embedding=embeddings[i],
-                    metadata_json=chunk["metadata"]
-                )
-                db.add(db_chunk)
-
-            # 5. Ready
-            doc.metadata_json = {
-                **doc.metadata_json,
-                "indexing_status": "Ready",
-                "chunks": len(chunks)
-            }
-            db.commit()
-            await ws_manager.send_to_user(str(user_id), {"type": "document_status", "document_id": str(doc.id), "status": "Ready", "chunks": len(chunks)})
-
-        except Exception as e:
-            # 6. Failed
-            doc.metadata_json = {
-                **doc.metadata_json,
-                "indexing_status": "Failed",
-                "error": str(e)
-            }
-            db.commit()
-            await ws_manager.send_to_user(str(user_id), {"type": "document_status", "document_id": str(doc.id), "status": "Failed", "error": str(e)})
-
 @router.post("/documents/upload")
 async def upload_document(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    from services.upload import save_uploaded_file
-    doc = await save_uploaded_file(
+    """Uploads document to durable StorageBackend and enqueues durable document_index worker task."""
+    import services.documents as docs_svc
+    doc = await docs_svc.upload_document(
         file=file,
         user_id=current_user.id,
         db=db,
         auto_index=True
     )
-    # Enqueue background ingestion
-    background_tasks.add_task(async_ingest_document, doc.id, current_user.id)
     return {"status": "success", "document_id": str(doc.id)}
 
 @router.get("/documents", response_model=List[Dict[str, Any]])
 def list_documents(current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
+    import services.documents as docs_svc
     docs = db.query(Document).filter(Document.user_id == current_user.id).all()
-    return [
-        {
-            "id": str(d.id),
-            "filename": d.filename,
-            "mime_type": d.mime_type,
-            "created_at": d.created_at.isoformat(),
-            "metadata": d.metadata_json or {}
-        } for d in docs
-    ]
+    return [docs_svc.serialize_document(d) for d in docs]
 
 @router.delete("/documents/{document_id}")
 def delete_document(document_id: str, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
-    doc = db.query(Document).filter(Document.id == uuid.UUID(document_id), Document.user_id == current_user.id).first()
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    # delete file from disk
-    if os.path.exists(doc.storage_path):
-        try:
-            os.remove(doc.storage_path)
-        except Exception:
-            pass
-            
-    db.delete(doc)
-    db.commit()
+    import services.documents as docs_svc
+    try:
+        doc_uuid = uuid.UUID(document_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid document ID format")
+    docs_svc.delete_document(doc_uuid, current_user.id, db)
     return {"status": "deleted"}
 
 class RenameRequest(BaseModel):
@@ -684,23 +593,22 @@ def rename_document(document_id: str, req: RenameRequest, current_user: User = D
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     
-    doc.filename = req.filename
+    clean_name = req.filename.strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Filename cannot be empty")
+    doc.filename = clean_name
     db.commit()
     return {"status": "success", "filename": doc.filename}
 
 @router.post("/documents/{document_id}/retry")
-def retry_document_indexing(document_id: str, background_tasks: BackgroundTasks, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
-    doc = db.query(Document).filter(Document.id == uuid.UUID(document_id), Document.user_id == current_user.id).first()
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-        
-    # Reset status
-    doc.metadata_json = {**doc.metadata_json, "indexing_status": "Uploaded", "error": None}
-    db.commit()
-    
-    # Enqueue background ingestion
-    background_tasks.add_task(async_ingest_document, doc.id, current_user.id)
-    return {"status": "retry_queued"}
+def retry_document_indexing(document_id: str, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
+    import services.documents as docs_svc
+    try:
+        doc_uuid = uuid.UUID(document_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid document ID format")
+    task = docs_svc.retry_indexing(doc_uuid, current_user.id, db)
+    return {"status": "retry_queued", "task_id": str(task.id)}
 
 
 # ─── Async Background Memory Extraction ─────────────────────────────────────
@@ -847,29 +755,33 @@ async def chat_stream(
                 target_uuid = uuid.UUID(str(explicit_ws_id))
                 ws = next((w for w in user_workspaces if w.id == target_uuid), None)
             except ValueError:
-                pass
+                ws = None
+            if not ws:
+                async def not_found_generator():
+                    yield f"data: {json.dumps({'token': f'Specified workspace `{explicit_ws_id}` was not found or access is denied.', 'provider': 'sakura_code'})}\n\n"
+                return StreamingResponse(not_found_generator(), media_type="text/event-stream")
+        else:
+            # 2. Active project workspace match
+            if not ws and active_project:
+                matched_workspaces = [w for w in user_workspaces if active_project.name.lower() in w.name.lower()]
+                if len(matched_workspaces) == 1:
+                    ws = matched_workspaces[0]
 
-        # 2. Active project workspace match
-        if not ws and active_project:
-            matched_workspaces = [w for w in user_workspaces if active_project.name.lower() in w.name.lower()]
-            if len(matched_workspaces) == 1:
-                ws = matched_workspaces[0]
+            # 3. Exactly one unambiguous workspace for user
+            if not ws and len(user_workspaces) == 1:
+                ws = user_workspaces[0]
 
-        # 3. Exactly one unambiguous workspace for user
-        if not ws and len(user_workspaces) == 1:
-            ws = user_workspaces[0]
-
-        # 4. Multiple candidate workspaces with no selection -> ask which repository
-        if not ws and len(user_workspaces) > 1 and (is_code_command or has_coding_tool or "repo" in req.message.lower() or "repository" in req.message.lower()):
-            ws_options = "\n".join(f"- **{w.name}** (`{w.id}`)" for w in user_workspaces)
-            clarification_msg = (
-                f"You have {len(user_workspaces)} repository workspaces available:\n\n"
-                f"{ws_options}\n\n"
-                f"Please specify which workspace you would like Sakura Code to target."
-            )
-            async def disambiguation_generator():
-                yield f"data: {json.dumps({'token': clarification_msg, 'provider': 'sakura_code'})}\n\n"
-            return StreamingResponse(disambiguation_generator(), media_type="text/event-stream")
+            # 4. Multiple candidate workspaces with no selection -> ask which repository
+            if not ws and len(user_workspaces) > 1 and (is_code_command or has_coding_tool or "repo" in req.message.lower() or "repository" in req.message.lower()):
+                ws_options = "\n".join(f"- **{w.name}** (`{w.id}`)" for w in user_workspaces)
+                clarification_msg = (
+                    f"You have {len(user_workspaces)} repository workspaces available:\n\n"
+                    f"{ws_options}\n\n"
+                    f"Please specify which workspace you would like Sakura Code to target."
+                )
+                async def disambiguation_generator():
+                    yield f"data: {json.dumps({'token': clarification_msg, 'provider': 'sakura_code'})}\n\n"
+                return StreamingResponse(disambiguation_generator(), media_type="text/event-stream")
 
         if ws:
             coding_agent = CodingAgent(

@@ -144,6 +144,7 @@ class ExecuteRequest(BaseModel):
     cwd_relative: Optional[str] = None
     environment: Optional[Dict[str, str]] = None
     allow_network: bool = False
+    network_authorization_id: Optional[str] = None
     read_only: bool = False
     tool_name: str = "run_command"
 
@@ -487,7 +488,40 @@ async def execute_command(
                 "output_limit_exceeded": False
             }
 
-    # 4. Check docker daemon availability
+    # 4. Validate network authorization policy
+    network_flag = "none"
+    if req.allow_network:
+        is_authorized = False
+        if req.network_authorization_id:
+            from database.db import get_db_context
+            from coding.security import NetworkAccessPolicy
+            with get_db_context() as db:
+                is_authorized = NetworkAccessPolicy.verify_and_consume_authorization(
+                    db=db,
+                    auth_id=req.network_authorization_id,
+                    user_id=None,
+                    workspace_id=req.workspace_id,
+                    command=req.command
+                )
+
+        if not is_authorized:
+            return {
+                "success": False,
+                "tool": req.tool_name,
+                "command": cmd_display,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "Security Error: Outbound network access blocked. Valid server authorization is required.",
+                "duration_ms": 0,
+                "timed_out": False,
+                "blocked": True,
+                "isolation_unavailable": False,
+                "output_truncated": False,
+                "output_limit_exceeded": False
+            }
+        network_flag = "bridge"
+
+    # 5. Check docker daemon availability
     if not check_docker_operational():
         return {
             "success": False,
@@ -504,13 +538,12 @@ async def execute_command(
             "output_limit_exceeded": False
         }
 
-    # 5. Build Docker mount and execution specifications
+    # 6. Build Docker mount and execution specifications
     if isinstance(req.command, list):
         cmd_args = req.command
     else:
         cmd_args = ["sh", "-c", req.command]
 
-    network_flag = "bridge" if req.allow_network else "none"
     mount_mode = "ro" if req.read_only else "rw"
 
     # PER-WORKSPACE ISOLATION: Mount ONLY this specific workspace to /workspace.

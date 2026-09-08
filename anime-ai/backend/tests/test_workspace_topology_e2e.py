@@ -144,15 +144,16 @@ class TestWorkspaceTopologyE2E(unittest.IsolatedAsyncioTestCase):
             "SAKURA_SANDBOX_SERVICE_TOKEN": "internal_token_secret",
             "OPENAI_API_KEY": "sk-proj-secret-key",
             "GROQ_API_KEY": "gsk_secret_key",
+            "PYTHONUNBUFFERED": "1",
             "CUSTOM_SAFE_TASK_VAR": "my_task_param"
         }
         child_env = WorkspaceSecurity.build_safe_child_environment(host_env_with_secrets)
 
         # Allowlisted baseline is preserved
-        self.assertEqual(child_env["PATH"], "/usr/local/bin:/usr/bin:/bin")
         self.assertEqual(child_env["HOME"], "/home/sandbox")
         self.assertEqual(child_env["LANG"], "C.UTF-8")
-        self.assertEqual(child_env["CUSTOM_SAFE_TASK_VAR"], "my_task_param")
+        self.assertEqual(child_env["PYTHONUNBUFFERED"], "1")
+        self.assertNotIn("CUSTOM_SAFE_TASK_VAR", child_env)
 
         # Backend secrets must NEVER reach child environment
         forbidden_secrets = [

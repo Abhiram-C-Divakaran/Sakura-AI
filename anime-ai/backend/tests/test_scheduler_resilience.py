@@ -86,7 +86,7 @@ class TestSchedulerResilience(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(gt_next, now_cmp)
 
     async def test_duplicate_occurrence_integrity_error_handled_gracefully(self):
-        """Forces IntegrityError branch when inserting occurrence run."""
+        """Focused unit test: IntegrityError raised during occurrence dispatch is handled cleanly without crashing poll."""
         from sqlalchemy.exc import IntegrityError
 
         task_id = uuid.uuid4()
@@ -107,18 +107,91 @@ class TestSchedulerResilience(unittest.IsolatedAsyncioTestCase):
             db.add(t)
             db.commit()
 
-        # Mock db.commit() inside transactional dispatch to raise IntegrityError
-        orig_commit = None
-        with get_db_context() as db:
-            orig_commit = db.commit
+        # Patch Session.commit to raise IntegrityError on the transactional dispatch
+        real_get_db = get_db_context
 
-        with patch("tasks.scheduler.get_db_context") as mock_ctx:
-            mock_session = MagicMock()
-            mock_ctx.return_value.__enter__.return_value = mock_session
-            mock_session.query.return_value.filter.return_value.all.return_value = []
-            
-            # Now run the actual real scheduler to verify no unhandled exception
+        class MockSessionContext:
+            def __init__(self):
+                self.ctx = real_get_db()
+                self.session = None
+
+            def __enter__(self):
+                self.session = self.ctx.__enter__()
+                orig_commit = self.session.commit
+                def guarded_commit():
+                    # If committing the occurrence run, simulate unique constraint collision
+                    if any(isinstance(obj, ScheduledTaskRun) for obj in self.session.new):
+                        raise IntegrityError("duplicate key value violates unique constraint", params=None, orig=Exception("uq_scheduled_task_run_occurrence"))
+                    return orig_commit()
+                self.session.commit = guarded_commit
+                return self.session
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return self.ctx.__exit__(exc_type, exc_val, exc_tb)
+
+        with patch("tasks.scheduler.get_db_context", side_effect=MockSessionContext):
+            # Must complete cleanly without raising IntegrityError
             await self.scheduler.poll_and_execute()
+
+    async def test_concurrent_scheduler_polling_race_executes_exactly_once(self):
+        """
+        P1.13: Real concurrency race test:
+        Two concurrent scheduler instances poll the same due ScheduledTask simultaneously.
+        Expected:
+        - Exactly 1 ScheduledTaskRun
+        - Exactly 1 BackgroundTask
+        - next_run_at advanced correctly
+        - No duplicate execution
+        - No unhandled exceptions
+        """
+        task_id = uuid.uuid4()
+        now = utc_now()
+        occurrence = now - timedelta(minutes=5)
+
+        with get_db_context() as db:
+            task = ScheduledTask(
+                id=task_id,
+                user_id=self.user_id,
+                title="Concurrent Race Task",
+                prompt="Execute concurrently",
+                schedule="*/10 * * * *",
+                timezone="UTC",
+                enabled=True,
+                next_run_at=occurrence
+            )
+            db.add(task)
+            db.commit()
+
+        scheduler_a = TaskSchedulerService(poll_interval_seconds=1)
+        scheduler_b = TaskSchedulerService(poll_interval_seconds=1)
+
+        # Run both schedulers concurrently
+        await asyncio.gather(
+            scheduler_a.poll_and_execute(),
+            scheduler_b.poll_and_execute()
+        )
+
+        from database.models import BackgroundTask
+
+        with get_db_context() as db:
+            # 1. Exactly 1 ScheduledTaskRun
+            runs = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.task_id == task_id).all()
+            self.assertEqual(len(runs), 1, f"Expected exactly 1 ScheduledTaskRun, got {len(runs)}")
+
+            # 2. Exactly 1 BackgroundTask
+            bg_tasks = db.query(BackgroundTask).filter(
+                BackgroundTask.user_id == self.user_id,
+                BackgroundTask.type == "scheduled_run"
+            ).all()
+            matching_bg = [t for t in bg_tasks if (t.payload or {}).get("scheduled_task_id") == str(task_id)]
+            self.assertEqual(len(matching_bg), 1, f"Expected exactly 1 BackgroundTask, got {len(matching_bg)}")
+
+            # 3. next_run_at advanced correctly into future
+            refreshed_task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
+            self.assertTrue(refreshed_task.enabled)
+            refreshed_next = refreshed_task.next_run_at.replace(tzinfo=None) if refreshed_task.next_run_at.tzinfo else refreshed_task.next_run_at
+            now_cmp = now.replace(tzinfo=None) if now.tzinfo else now
+            self.assertGreater(refreshed_next, now_cmp)
 
 
 if __name__ == "__main__":

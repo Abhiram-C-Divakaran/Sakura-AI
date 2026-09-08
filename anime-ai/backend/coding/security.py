@@ -143,6 +143,17 @@ class WorkspaceSecurity:
         "PASSWORD_",
     )
 
+    BASELINE_ENV_VARS = {
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "CI",
+        "NONINTERACTIVE",
+        "DEBIAN_FRONTEND",
+        "NODE_ENV",
+    }
+
     ALLOWED_TASK_ENV_VARS = {
         "APP_ENV",
         "TEST_TARGET",
@@ -225,8 +236,10 @@ class WorkspaceSecurity:
                 if "\0" in val_str:
                     continue
 
-                # Only allow if in permitted task-specific list or is a valid alphanumeric identifier
-                if k_clean in WorkspaceSecurity.ALLOWED_TASK_ENV_VARS or re.match(r"^[A-Za-z0-9_]{1,64}$", k_clean):
+                # P1.1: TRUE CHILD ENVIRONMENT ALLOWLIST
+                # Default baseline is already set. ONLY baseline and explicitly permitted tool variables are allowed.
+                # Generic ^[A-Za-z0-9_]{1,64}$ allowance is removed to prevent arbitrary user/LLM variables.
+                if k_clean in WorkspaceSecurity.BASELINE_ENV_VARS or k_clean in WorkspaceSecurity.ALLOWED_TASK_ENV_VARS:
                     env[k_clean] = val_str
 
         return env
@@ -302,6 +315,15 @@ def is_command_safe(command: str) -> bool:
         return False
 
 
+import hashlib
+
+
+def compute_command_hash(command: Union[str, List[str]]) -> str:
+    """Computes SHA-256 hash of canonical command string for server-authoritative authorization."""
+    cmd_str = " ".join(command) if isinstance(command, list) else str(command)
+    return hashlib.sha256(cmd_str.strip().encode("utf-8")).hexdigest()
+
+
 class NetworkAccessPolicy:
     """Enforces policy authorization for sandbox network access."""
 
@@ -318,32 +340,72 @@ class NetworkAccessPolicy:
     ]
 
     @staticmethod
-    def requires_network_authorization(command: str) -> bool:
+    def requires_network_authorization(command: Union[str, List[str]]) -> bool:
         """Returns True if the command is typically an outbound network operation."""
-        if not command or not isinstance(command, str):
+        cmd_str = " ".join(command) if isinstance(command, list) else str(command)
+        if not cmd_str or not isinstance(cmd_str, str):
             return False
         for pat in NetworkAccessPolicy.NETWORK_COMMAND_PATTERNS:
-            if re.search(pat, command, re.IGNORECASE):
+            if re.search(pat, cmd_str, re.IGNORECASE):
                 return True
         return False
 
     @staticmethod
-    def is_network_authorized(
-        command: str,
-        requested_allow_network: bool,
-        authorization_scope: Optional[str] = None
+    def verify_and_consume_authorization(
+        db,
+        auth_id: Union[str, uuid.UUID],
+        user_id: Optional[Union[str, uuid.UUID]],
+        workspace_id: Optional[Union[str, uuid.UUID]],
+        command: Union[str, List[str]]
     ) -> bool:
         """
-        Determines whether network access can be activated.
-        Network remains disabled by default unless an explicit valid authorization scope is present.
+        Server-authoritative verification of SandboxNetworkAuthorization record:
+        - Validates existence, user ownership, workspace match, command hash match, expiry.
+        - Atomically consumes authorization (one-time use).
         """
-        if not requested_allow_network:
+        try:
+            import uuid as _uuid
+            from database.models import SandboxNetworkAuthorization, utc_now
+            a_uuid = _uuid.UUID(str(auth_id).strip())
+        except (ValueError, TypeError, AttributeError):
             return False
-        valid_scopes = {"trusted_backend", "user_approved", "network_once"}
-        if authorization_scope in valid_scopes:
-            return True
-        # In non-production environments without strict policy enforcement, allow if requested
-        env_name = os.getenv("ENVIRONMENT", "development").lower()
-        if env_name not in ("production", "prod"):
-            return True
-        return False
+
+        cmd_hash = compute_command_hash(command)
+        now = utc_now()
+
+        query = db.query(SandboxNetworkAuthorization).filter(
+            SandboxNetworkAuthorization.id == a_uuid,
+            SandboxNetworkAuthorization.command_hash == cmd_hash,
+            SandboxNetworkAuthorization.consumed_at.is_(None),
+            SandboxNetworkAuthorization.expires_at > now
+        )
+
+        if user_id:
+            try:
+                u_uuid = _uuid.UUID(str(user_id).strip())
+                query = query.filter(SandboxNetworkAuthorization.user_id == u_uuid)
+            except Exception:
+                return False
+
+        if workspace_id:
+            try:
+                w_uuid = _uuid.UUID(str(workspace_id).strip())
+                query = query.filter(SandboxNetworkAuthorization.workspace_id == w_uuid)
+            except Exception:
+                return False
+
+        auth = query.first()
+        if not auth:
+            return False
+
+        # Atomic CAS consumption: exactly one concurrent consumer can consume
+        rows = db.query(SandboxNetworkAuthorization).filter(
+            SandboxNetworkAuthorization.id == auth.id,
+            SandboxNetworkAuthorization.consumed_at.is_(None)
+        ).update({"consumed_at": now})
+        db.commit()
+
+        return rows > 0
+
+
+build_safe_child_environment = WorkspaceSecurity.build_safe_child_environment

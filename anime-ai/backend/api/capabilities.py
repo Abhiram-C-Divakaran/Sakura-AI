@@ -69,14 +69,28 @@ async def get_system_capabilities(
             if configured:
                 has_configured_provider = True
 
+            telem = getattr(llm_router, "provider_telemetry", {}).get(name, {})
+            last_verified = telem.get("last_verified_at")
+            is_healthy = telem.get("healthy", None)
+
+            if not configured:
+                prov_status = "NOT_CONFIGURED"
+            elif is_healthy is True:
+                prov_status = "AVAILABLE"
+            elif is_healthy is False:
+                prov_status = "UNAVAILABLE"
+            else:
+                prov_status = "CONFIGURED"
+
             available_providers[name] = {
+                "implemented": True,
                 "active": configured,
                 "configured": configured,
-                "healthy": configured,
-                "status": "CONFIGURED" if configured else "UNAVAILABLE",
+                "healthy": is_healthy,
+                "status": prov_status,
                 "model": getattr(provider, "model", "default"),
                 "class": provider.__class__.__name__,
-                "last_verified_at": None
+                "last_verified_at": last_verified
             }
 
     # 3. GitHub connectivity

@@ -1,5 +1,6 @@
 import uuid
 from typing import List, Dict, Any, Optional
+from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -211,3 +212,58 @@ def delete_workspace(
         raise HTTPException(status_code=404, detail="Workspace not found")
 
     return {"status": "deleted", "id": workspace_id}
+
+
+class NetworkAuthorizationCreateRequest(BaseModel):
+    command: str
+    reason: Optional[str] = None
+
+
+@router.post("/workspaces/{workspace_id}/network-authorizations", response_model=Dict[str, Any])
+def create_workspace_network_authorization(
+    workspace_id: str,
+    req: NetworkAuthorizationCreateRequest,
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Creates a server-authoritative short-lived network authorization for a specific workspace and command."""
+    try:
+        ws_uuid = uuid.UUID(workspace_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid workspace ID")
+
+    ws = db.query(RepositoryWorkspace).filter(
+        RepositoryWorkspace.id == ws_uuid,
+        RepositoryWorkspace.user_id == current_user.id
+    ).first()
+    if not ws:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    cmd = req.command.strip()
+    if not cmd:
+        raise HTTPException(status_code=400, detail="Command cannot be empty")
+
+    from coding.security import compute_command_hash
+    from database.models import SandboxNetworkAuthorization, utc_now
+    from datetime import timedelta
+
+    cmd_hash = compute_command_hash(cmd)
+    auth = SandboxNetworkAuthorization(
+        id=uuid.uuid4(),
+        user_id=current_user.id,
+        workspace_id=ws.id,
+        command_hash=cmd_hash,
+        created_at=utc_now(),
+        expires_at=utc_now() + timedelta(seconds=300),
+        consumed_at=None
+    )
+    db.add(auth)
+    db.commit()
+    db.refresh(auth)
+
+    return {
+        "status": "authorized",
+        "authorization_id": str(auth.id),
+        "command_hash": auth.command_hash,
+        "expires_at": auth.expires_at.isoformat()
+    }

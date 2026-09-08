@@ -108,6 +108,47 @@ class TestWorkerFencing(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(res_b["status"], "Completed")
 
+    async def test_execute_task_aborts_without_overwriting_when_owned_by_another_worker(self):
+        """Worker A attempting execute_task on a task owned by Worker B raises TaskLeaseLostError without overwriting DB."""
+        task_id = uuid.uuid4()
+        token_b = uuid.uuid4()
+        worker_a = DurableTaskWorker(worker_id="worker-node-A")
+        worker_b = DurableTaskWorker(worker_id="worker-node-B")
+
+        with get_db_context() as db:
+            task = BackgroundTask(
+                id=task_id,
+                user_id=self.user_id,
+                type="code_analysis",
+                title="Fencing Takeover Test",
+                status="Running",
+                worker_id=worker_b.worker_id,
+                execution_attempt_id=token_b
+            )
+            db.add(task)
+            db.commit()
+
+        # Worker A attempts to execute task with its own stale token
+        stale_task = BackgroundTask(
+            id=task_id,
+            user_id=self.user_id,
+            type="code_analysis",
+            title="Fencing Takeover Test",
+            status="Running",
+            worker_id=worker_a.worker_id,
+            execution_attempt_id=uuid.uuid4()
+        )
+
+        with self.assertRaises(TaskLeaseLostError):
+            await worker_a.execute_task(stale_task)
+
+        # In DB, Worker B's ownership must remain completely intact and unaltered
+        with get_db_context() as db:
+            db_task = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
+            self.assertEqual(db_task.worker_id, worker_b.worker_id)
+            self.assertEqual(db_task.execution_attempt_id, token_b)
+            self.assertEqual(db_task.status, "Running")
+
 
 if __name__ == "__main__":
     unittest.main()

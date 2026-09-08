@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { Mail, Lock, Eye, EyeOff, User, Loader2, AlertCircle, Check, ArrowLeft } from 'lucide-react';
 import { SakuraLogo, SakuraWordmark } from '../components/SakuraLogo';
 import { getAccessToken, setAccessToken } from '../lib/auth';
+import { apiUrl } from '../lib/api';
 
 const GoogleIcon = () => (
   <svg className="w-4 h-4 flex-shrink-0" viewBox="0 0 24 24">
@@ -45,7 +46,6 @@ export default function Login() {
     setSuccess('');
     setLoading(true);
 
-    const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
     const cleanEmail = email.trim();
 
     try {
@@ -63,7 +63,7 @@ export default function Login() {
         }
 
         // 1. Register User with Email / Name
-        const regRes = await fetch(`${apiBase}/api/v1/auth/register`, {
+        const regRes = await fetch(apiUrl('/api/v1/auth/register'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -83,7 +83,7 @@ export default function Login() {
       formData.append('username', cleanEmail);
       formData.append('password', password);
 
-      const authRes = await fetch(`${apiBase}/api/v1/auth/token`, {
+      const authRes = await fetch(apiUrl('/api/v1/auth/token'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: formData.toString()

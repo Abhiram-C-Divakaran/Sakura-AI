@@ -26,6 +26,7 @@ dist/
 
 # Uploads and temporary data
 uploaded_documents/
+workspaces/
 media/cache/
 *.log
 

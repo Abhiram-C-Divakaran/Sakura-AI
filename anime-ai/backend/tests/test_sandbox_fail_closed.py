@@ -53,11 +53,12 @@ class TestSandboxFailClosed(unittest.TestCase):
         """Tests that dangerous variables are stripped and PATH cannot be redefined in production."""
         # 1. In production, client passing PATH is ignored
         env_prod = WorkspaceSecurity.build_safe_child_environment(
-            requested_env={"PATH": "/malicious/bin", "FOO": "bar"},
+            requested_env={"PATH": "/malicious/bin", "FOO": "bar", "NODE_ENV": "development"},
             is_production=True
         )
         self.assertNotIn("/malicious/bin", env_prod["PATH"])
-        self.assertEqual(env_prod["FOO"], "bar")
+        self.assertNotIn("FOO", env_prod)
+        self.assertEqual(env_prod["NODE_ENV"], "development")
 
         # 2. Blocked variables and prefixes are always stripped
         dangerous_env = {
@@ -86,7 +87,8 @@ class TestSandboxFailClosed(unittest.TestCase):
         self.assertNotIn("DATABASE_URL", sanitized)
         self.assertNotIn("REDIS_URL", sanitized)
         self.assertNotIn("SAKURA_SANDBOX_SERVICE_TOKEN", sanitized)
-        self.assertEqual(sanitized["SAFE_VAR"], "allowed_value")
+        self.assertNotIn("SAFE_VAR", sanitized)
+        self.assertEqual(sanitized["NODE_ENV"], "production")
         self.assertEqual(sanitized["CI"], "true")
 
 

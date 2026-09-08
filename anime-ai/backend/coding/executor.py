@@ -58,7 +58,8 @@ class SandboxExecutor:
         cwd_relative: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
         tool_name: str = "run_command",
-        allow_network: bool = False
+        allow_network: bool = False,
+        network_authorization_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Executes a command inside the isolated sandbox boundary.
@@ -79,7 +80,8 @@ class SandboxExecutor:
                 cwd_relative=cwd_relative,
                 timeout_seconds=timeout,
                 tool_name=tool_name,
-                allow_network=allow_network
+                allow_network=allow_network,
+                network_authorization_id=network_authorization_id
             )
             if "timed_out" not in res:
                 res["timed_out"] = False

@@ -242,7 +242,7 @@ export const ImageLightboxModal: React.FC<ImageLightboxModalProps> = ({
                 }}
                 className="w-full py-2.5 bg-[#212121] hover:bg-[#2A2A2A] text-white rounded-xl text-[13px] font-medium transition-colors border border-[#333333] flex items-center justify-center gap-2"
               >
-                <span>✏️ Edit this image in chat</span>
+                <span>✏️ Edit prompt</span>
               </button>
             )}
             {onVariation && (
@@ -254,7 +254,7 @@ export const ImageLightboxModal: React.FC<ImageLightboxModalProps> = ({
                 }}
                 className="w-full py-2.5 bg-[#212121] hover:bg-[#2A2A2A] text-white rounded-xl text-[13px] font-medium transition-colors border border-[#333333] flex items-center justify-center gap-2"
               >
-                <span>🔀 Create variations</span>
+                <span>🔀 Create variation</span>
               </button>
             )}
             {onUpscale && (

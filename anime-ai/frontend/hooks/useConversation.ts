@@ -128,7 +128,8 @@ export function useConversation() {
           message: userText,
           intensity: payload.intensity,
           tools: payload.tools,
-          attachments: payload.attachments
+          attachments: payload.attachments,
+          active_workspace_id: payload.active_workspace_id || null
         }),
         signal: ctrl.signal
       });

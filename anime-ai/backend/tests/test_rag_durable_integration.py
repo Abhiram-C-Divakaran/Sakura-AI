@@ -91,12 +91,12 @@ class TestRagDurableIntegration(unittest.IsolatedAsyncioTestCase):
 
         # 3. Worker claims and executes document_index task
         worker = DurableTaskWorker(worker_id="test-rag-worker")
-        task_to_run = None
-        with get_db_context() as db:
-            task_to_run = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
+        claimed = worker.claim_next_task()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.id, task_id)
 
         # Execute task
-        await worker.execute_task(task_to_run)
+        await worker.execute_task(claimed)
 
         # 4. Verify document state transitions in authoritative DB columns
         with get_db_context() as db:

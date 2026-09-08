@@ -191,7 +191,14 @@ async def readiness_check():
             secrets_ok = False
             errors.append("Missing INTEGRATION_ENCRYPTION_KEY in production.")
 
-    is_ready = db_ok and tables_ok and secrets_ok
+    # 4. Storage subsystem readiness
+    from services.storage import check_storage_readiness
+    storage_info = check_storage_readiness(is_production=is_prod)
+    storage_ok = storage_info.get("healthy", False)
+    if is_prod and not storage_ok:
+        errors.append(f"Storage error: {storage_info.get('reason') or 'Storage backend unhealthy'}")
+
+    is_ready = db_ok and tables_ok and secrets_ok and (storage_ok if is_prod else True)
     status_str = "READY" if is_ready else ("DEGRADED" if (db_ok and not is_prod) else "NOT_READY")
 
     response_payload = {
@@ -200,6 +207,7 @@ async def readiness_check():
         "database": "CONNECTED" if db_ok else "UNAVAILABLE",
         "schema_migrated": tables_ok,
         "redis": "CONNECTED" if redis_ok else "DEGRADED",
+        "storage": storage_info,
         "secrets_configured": secrets_ok,
         "environment": settings.environment,
         "errors": errors

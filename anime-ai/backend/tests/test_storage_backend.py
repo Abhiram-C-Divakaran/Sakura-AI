@@ -105,7 +105,7 @@ class TestStorageBackend(unittest.TestCase):
             data = b"\x89PNG\r\n\x1a\nFakeImageData"
             res = s3_storage.put(key, data, content_type="image/png")
             self.assertEqual(res["key"], key)
-            mock_s3_client.put_object.assert_called_once()
+            mock_s3_client.upload_fileobj.assert_called_once()
 
             # Test exists
             mock_s3_client.head_object.return_value = {"ContentLength": len(data)}

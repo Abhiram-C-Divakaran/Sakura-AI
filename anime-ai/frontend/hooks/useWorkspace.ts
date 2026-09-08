@@ -5,6 +5,7 @@ export interface Workspace {
   id: string;
   name: string;
   repository_url?: string;
+  active_branch?: string;
   branch?: string;
   status: 'READY' | 'CLONING' | 'ERROR';
   created_at?: string;
@@ -21,9 +22,16 @@ export function useWorkspace() {
   const fetchWorkspaces = useCallback(async () => {
     try {
       setLoading(true);
-      const res = await authFetch('/api/v1/workspaces');
+      const res = await authFetch('/api/v1/coding/workspaces');
       if (res.ok) {
-        const data = await res.json();
+        const rawData = await res.json();
+        const data: Workspace[] = Array.isArray(rawData)
+          ? rawData.map((w: any) => ({
+              ...w,
+              branch: w.active_branch || w.branch || 'main',
+              active_branch: w.active_branch || w.branch || 'main'
+            }))
+          : [];
         setWorkspaces(data);
         if (data.length > 0 && !activeWorkspaceId) {
           setActiveWorkspaceId(data[0].id);
@@ -42,7 +50,7 @@ export function useWorkspace() {
 
   const createWorkspace = useCallback(async (name: string, repositoryUrl?: string, branch: string = 'main') => {
     try {
-      const res = await authFetch('/api/v1/workspaces', {
+      const res = await authFetch('/api/v1/coding/workspaces', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -53,7 +61,13 @@ export function useWorkspace() {
         })
       });
       if (res.ok) {
-        const created = await res.json();
+        const resData = await res.json();
+        const rawCreated = resData.workspace || resData;
+        const created: Workspace = {
+          ...rawCreated,
+          branch: rawCreated.active_branch || rawCreated.branch || branch,
+          active_branch: rawCreated.active_branch || rawCreated.branch || branch
+        };
         setWorkspaces(prev => [created, ...prev]);
         setActiveWorkspaceId(created.id);
         return created;

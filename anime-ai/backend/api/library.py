@@ -19,57 +19,10 @@ from services.storage import (
     build_image_storage_key,
     assert_user_storage_key,
 )
+import services.documents as docs_svc
+from services.documents import serialize_document, get_file_category
 
 router = APIRouter(prefix="/library", tags=["library"])
-
-
-# Helper to categorize MIME types & extensions
-def get_file_category(mime_type: str, filename: str) -> str:
-    ext = os.path.splitext(filename)[1].lower()
-    if mime_type.startswith("image/") or ext in [".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".bmp"]:
-        return "images"
-    if ext in [".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".rs", ".go", ".cpp", ".c", ".java", ".sql", ".sh", ".yaml", ".yml", ".json"]:
-        return "code"
-    if ext in [".csv", ".tsv", ".xlsx", ".xls"] or mime_type in ["text/csv", "application/vnd.ms-excel"]:
-        return "data"
-    if mime_type in ["application/pdf", "text/plain", "text/markdown"] or ext in [".pdf", ".docx", ".doc", ".txt", ".md", ".rtf"]:
-        return "documents"
-    return "other"
-
-
-def serialize_document(doc: Document) -> Dict[str, Any]:
-    """
-    Serializes Document reading canonical DB fields (Document.is_knowledge_base and Document.indexing_status)
-    as authoritative sources of truth.
-    """
-    meta = doc.metadata_json or {}
-    category = meta.get("category") or get_file_category(doc.mime_type, doc.filename)
-
-    # Real database fields are authoritative
-    is_kb = bool(doc.is_knowledge_base)
-    idx_status = doc.indexing_status or DocumentIndexingStatus.NOT_INDEXED
-    size_bytes = doc.storage_size if doc.storage_size is not None else meta.get("size", 0)
-
-    return {
-        "id": str(doc.id),
-        "name": doc.filename,
-        "filename": doc.filename,
-        "mime_type": doc.mime_type,
-        "category": category,
-        "source": meta.get("source", "upload"),
-        "status": idx_status,
-        "indexing_status": idx_status,
-        "size_bytes": size_bytes,
-        "size": size_bytes,
-        "is_knowledge_base": is_kb,
-        "chunks": meta.get("chunks", 0),
-        "created_at": doc.created_at.isoformat() if doc.created_at else datetime.now(timezone.utc).isoformat(),
-        "modified_at": meta.get("modified_at", doc.created_at.isoformat() if doc.created_at else datetime.now(timezone.utc).isoformat()),
-        "error": meta.get("error", None),
-        "storage_backend": getattr(doc, "storage_backend", "local") or "local",
-        "storage_key": getattr(doc, "storage_key", None),
-        "metadata": meta
-    }
 
 
 # ─── Endpoints ─────────────────────────────────────────────────────────────
@@ -142,50 +95,7 @@ def get_library_file_content(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid file ID")
 
-    doc = db.query(Document).filter(Document.id == doc_uuid, Document.user_id == current_user.id).first()
-    if not doc:
-        raise HTTPException(status_code=404, detail="File not found")
-
-    storage = get_storage_backend(getattr(doc, "storage_backend", "local"))
-    content_bytes = None
-
-    if doc.storage_key and storage.exists(doc.storage_key):
-        try:
-            content_bytes = storage.get_bytes(doc.storage_key)
-        except Exception:
-            pass
-
-    if content_bytes is None and doc.storage_path and os.path.exists(doc.storage_path):
-        try:
-            with open(doc.storage_path, "rb") as f:
-                content_bytes = f.read(500000)
-        except Exception:
-            pass
-
-    if content_bytes is None:
-        raise HTTPException(status_code=404, detail="Physical file missing from storage")
-
-    category = (doc.metadata_json or {}).get("category", get_file_category(doc.mime_type, doc.filename))
-    try:
-        content_text = content_bytes[:500000].decode("utf-8", errors="replace")
-        return {
-            "id": str(doc.id),
-            "filename": doc.filename,
-            "mime_type": doc.mime_type,
-            "category": category,
-            "content": content_text,
-            "is_text": True
-        }
-    except Exception as e:
-        return {
-            "id": str(doc.id),
-            "filename": doc.filename,
-            "mime_type": doc.mime_type,
-            "category": category,
-            "content": None,
-            "is_text": False,
-            "error": str(e)
-        }
+    return docs_svc.get_document_content(doc_uuid, current_user.id, db)
 
 
 def authenticate_user_from_req(token: Optional[str], req_headers: Any, db: Session) -> User:
@@ -232,12 +142,17 @@ def download_library_file(
         storage = get_storage_backend(getattr(doc, "storage_backend", "local"))
         if doc.storage_key and storage.exists(doc.storage_key):
             return storage.generate_download_response(doc.storage_key, doc.filename, doc.mime_type)
-        if doc.storage_path and os.path.exists(doc.storage_path):
-            return FileResponse(
-                path=doc.storage_path,
-                media_type=doc.mime_type or "application/octet-stream",
-                filename=doc.filename
-            )
+        if doc.storage_path:
+            try:
+                safe_path = resolve_legacy_local_path(doc.storage_path)
+                if os.path.exists(safe_path):
+                    return FileResponse(
+                        path=safe_path,
+                        media_type=doc.mime_type or "application/octet-stream",
+                        filename=doc.filename
+                    )
+            except Exception:
+                pass
 
     # 2. Check GeneratedImage table owned by this user
     gen_img = db.query(GeneratedImage).filter(GeneratedImage.id == doc_uuid, GeneratedImage.user_id == current_user.id).first()
@@ -245,12 +160,17 @@ def download_library_file(
         storage = get_storage_backend(getattr(gen_img, "storage_backend", "local"))
         if getattr(gen_img, "storage_key", None) and storage.exists(gen_img.storage_key):
             return storage.generate_download_response(gen_img.storage_key, f"image_{file_id[:8]}.png", "image/png")
-        if gen_img.storage_path and os.path.exists(gen_img.storage_path):
-            return FileResponse(
-                path=gen_img.storage_path,
-                media_type="image/png",
-                filename=f"image_{file_id[:8]}.png"
-            )
+        if gen_img.storage_path:
+            try:
+                safe_path = resolve_legacy_local_path(gen_img.storage_path)
+                if os.path.exists(safe_path):
+                    return FileResponse(
+                        path=safe_path,
+                        media_type="image/png",
+                        filename=f"image_{file_id[:8]}.png"
+                    )
+            except Exception:
+                pass
 
     raise HTTPException(status_code=404, detail="File not found in storage or access denied")
 
@@ -275,16 +195,26 @@ def get_library_file_thumbnail(
         storage = get_storage_backend(getattr(doc, "storage_backend", "local"))
         if doc.storage_key and storage.exists(doc.storage_key):
             return storage.generate_download_response(doc.storage_key, doc.filename, doc.mime_type)
-        if doc.storage_path and os.path.exists(doc.storage_path):
-            return FileResponse(path=doc.storage_path, media_type=doc.mime_type)
+        if doc.storage_path:
+            try:
+                safe_path = resolve_legacy_local_path(doc.storage_path)
+                if os.path.exists(safe_path):
+                    return FileResponse(path=safe_path, media_type=doc.mime_type)
+            except Exception:
+                pass
 
     gen_img = db.query(GeneratedImage).filter(GeneratedImage.id == doc_uuid, GeneratedImage.user_id == current_user.id).first()
     if gen_img:
         storage = get_storage_backend(getattr(gen_img, "storage_backend", "local"))
         if getattr(gen_img, "storage_key", None) and storage.exists(gen_img.storage_key):
             return storage.generate_download_response(gen_img.storage_key, f"image_{file_id[:8]}.png", "image/png")
-        if gen_img.storage_path and os.path.exists(gen_img.storage_path):
-            return FileResponse(path=gen_img.storage_path, media_type="image/png")
+        if gen_img.storage_path:
+            try:
+                safe_path = resolve_legacy_local_path(gen_img.storage_path)
+                if os.path.exists(safe_path):
+                    return FileResponse(path=safe_path, media_type="image/png")
+            except Exception:
+                pass
 
     raise HTTPException(status_code=404, detail="File not found or access denied")
 
@@ -296,8 +226,7 @@ async def upload_library_file(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    from services.upload import save_uploaded_file
-    doc = await save_uploaded_file(
+    doc = await docs_svc.upload_document(
         file=file,
         user_id=current_user.id,
         db=db,
@@ -311,20 +240,6 @@ async def upload_library_file(
         "action": "created",
         "data": serialized
     })
-
-    category = (doc.metadata_json or {}).get("category", "")
-    if auto_index and category in ["documents", "code", "data"]:
-        from tasks.task_manager import TaskManager
-        TaskManager.create_task(
-            user_id=current_user.id,
-            task_type="document_index",
-            title=f"Index {doc.filename}",
-            payload={
-                "document_id": str(doc.id),
-                "requested_by_user_id": str(current_user.id),
-                "force_reindex": False
-            }
-        )
 
     return {"status": "success", "file": serialized}
 
@@ -346,51 +261,13 @@ async def create_document(
     if not clean_name:
         raise HTTPException(status_code=400, detail="Filename cannot be empty")
 
-    file_id = uuid.uuid4()
-    ext = os.path.splitext(clean_name)[1] or ".txt"
-    mime_type = "text/markdown" if ext == ".md" else ("text/x-python" if ext == ".py" else "text/plain")
-    category = req.category or get_file_category(mime_type, clean_name)
-
-    storage = get_storage_backend()
-    storage_key = build_document_storage_key(current_user.id, file_id, clean_name)
-    content_bytes = req.content.encode("utf-8")
-    put_res = storage.put(storage_key, content_bytes, content_type=mime_type, user_id=current_user.id)
-    file_size = len(content_bytes)
-
-    doc = Document(
-        id=file_id,
-        user_id=current_user.id,
+    doc = docs_svc.create_document(
         filename=clean_name,
-        mime_type=mime_type,
-        storage_path=put_res.get("storage_path") or storage_key,
-        storage_backend=put_res.get("storage_backend", storage.backend_type),
-        storage_key=storage_key,
-        storage_size=file_size,
-        is_knowledge_base=True,
-        indexing_status=DocumentIndexingStatus.READY,
-        metadata_json={
-            "status": "READY",
-            "indexing_status": "Ready",
-            "size": file_size,
-            "category": category,
-            "source": "ai_document",
-            "is_knowledge_base": True,
-            "modified_at": datetime.now(timezone.utc).isoformat(),
-            "chunks": 1,
-            "error": None
-        }
-    )
-    db.add(doc)
-    db.commit()
-
-    chunk = DocumentChunk(
-        document_id=doc.id,
-        chunk_index=0,
         content=req.content,
-        metadata_json={"source": clean_name}
+        user_id=current_user.id,
+        db=db,
+        category=req.category
     )
-    db.add(chunk)
-    db.commit()
 
     from api.routes import ws_manager
     serialized = serialize_document(doc)
@@ -486,22 +363,7 @@ async def delete_library_file(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid file ID")
 
-    doc = db.query(Document).filter(Document.id == doc_uuid, Document.user_id == current_user.id).first()
-    if not doc:
-        raise HTTPException(status_code=404, detail="File not found")
-
-    # Delete physical file from storage backend
-    storage = get_storage_backend(getattr(doc, "storage_backend", "local"))
-    if doc.storage_key:
-        storage.delete(doc.storage_key)
-    if doc.storage_path and os.path.exists(doc.storage_path):
-        try:
-            os.remove(doc.storage_path)
-        except Exception:
-            pass
-
-    db.delete(doc)
-    db.commit()
+    docs_svc.delete_document(doc_uuid, current_user.id, db)
 
     from api.routes import ws_manager
     await ws_manager.send_to_user(str(current_user.id), {
@@ -525,31 +387,9 @@ async def add_file_to_knowledge_base(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid file ID")
 
+    docs_svc.enqueue_index(doc_uuid, current_user.id, db, force_reindex=True)
+
     doc = db.query(Document).filter(Document.id == doc_uuid, Document.user_id == current_user.id).first()
-    if not doc:
-        raise HTTPException(status_code=404, detail="File not found")
-
-    doc.is_knowledge_base = False
-    doc.indexing_status = DocumentIndexingStatus.QUEUED
-    doc.metadata_json = {
-        **(doc.metadata_json or {}),
-        "status": "QUEUED",
-        "indexing_status": "Queued",
-        "error": None
-    }
-    db.commit()
-
-    from tasks.task_manager import TaskManager
-    TaskManager.create_task(
-        user_id=current_user.id,
-        task_type="document_index",
-        title=f"Index {doc.filename}",
-        payload={
-            "document_id": str(doc.id),
-            "requested_by_user_id": str(current_user.id),
-            "force_reindex": True
-        }
-    )
 
     from api.routes import ws_manager
     serialized = serialize_document(doc)
@@ -574,22 +414,7 @@ async def remove_file_from_knowledge_base(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid file ID")
 
-    doc = db.query(Document).filter(Document.id == doc_uuid, Document.user_id == current_user.id).first()
-    if not doc:
-        raise HTTPException(status_code=404, detail="File not found")
-
-    db.query(DocumentChunk).filter(DocumentChunk.document_id == doc.id).delete()
-    doc.is_knowledge_base = False
-    doc.indexing_status = DocumentIndexingStatus.NOT_INDEXED
-    doc.metadata_json = {
-        **(doc.metadata_json or {}),
-        "is_knowledge_base": False,
-        "chunks": 0,
-        "indexing_status": "Not indexed",
-        "status": "READY"
-    }
-    db.commit()
-    db.refresh(doc)
+    doc = docs_svc.remove_from_kb(doc_uuid, current_user.id, db)
 
     from api.routes import ws_manager
     serialized = serialize_document(doc)
