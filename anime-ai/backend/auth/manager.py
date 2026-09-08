@@ -129,4 +129,98 @@ class AuthManager:
         except Exception:
             return None
 
+    @staticmethod
+    def issue_ws_ticket(user_id: Any, ttl_seconds: int = 60, db: Optional[Session] = None) -> dict:
+        """
+        Issues a short-lived single-use WebSocket connection ticket.
+        Persisted in database and optionally Redis.
+        """
+        import secrets
+        import uuid as _uuid
+        from database.models import WebSocketTicket, utc_now
+        from database.db import get_db_context
+
+        uid = _uuid.UUID(str(user_id)) if not isinstance(user_id, _uuid.UUID) else user_id
+        ticket_str = f"wst_{secrets.token_urlsafe(32)}"
+        now = utc_now()
+        expires_at = now + timedelta(seconds=ttl_seconds)
+
+        def _do_persist(session: Session):
+            ws_ticket = WebSocketTicket(
+                ticket=ticket_str,
+                user_id=uid,
+                created_at=now,
+                expires_at=expires_at,
+                consumed_at=None
+            )
+            session.add(ws_ticket)
+            session.commit()
+
+        if db is not None:
+            _do_persist(db)
+        else:
+            with get_db_context() as session:
+                _do_persist(session)
+
+        # Also store in Redis if available
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        try:
+            import redis
+            client = redis.from_url(redis_url, socket_connect_timeout=0.5, socket_timeout=0.5)
+            client.set(f"sakura:ws_ticket:{ticket_str}", str(uid), ex=ttl_seconds)
+        except Exception:
+            pass
+
+        return {
+            "ticket": ticket_str,
+            "expires_at": expires_at.isoformat(),
+            "ttl_seconds": ttl_seconds
+        }
+
+    @staticmethod
+    def consume_ws_ticket(ticket_str: str, db: Optional[Session] = None) -> Optional[Any]:
+        """
+        Validates and atomically consumes a single-use WebSocket ticket.
+        Returns the user_id if valid and successfully consumed, or None.
+        """
+        if not ticket_str or not isinstance(ticket_str, str) or not ticket_str.startswith("wst_"):
+            return None
+
+        from database.models import WebSocketTicket, utc_now
+        from database.db import get_db_context
+        now = utc_now()
+
+        def _do_consume(session: Session) -> Optional[Any]:
+            ticket_rec = session.query(WebSocketTicket).filter(
+                WebSocketTicket.ticket == ticket_str,
+                WebSocketTicket.consumed_at.is_(None),
+                WebSocketTicket.expires_at > now
+            ).first()
+
+            if not ticket_rec:
+                return None
+
+            user_id = ticket_rec.user_id
+            rows = session.query(WebSocketTicket).filter(
+                WebSocketTicket.ticket == ticket_str,
+                WebSocketTicket.consumed_at.is_(None)
+            ).update({WebSocketTicket.consumed_at: now})
+            session.commit()
+
+            if rows > 0:
+                try:
+                    import redis
+                    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+                    client = redis.from_url(redis_url, socket_connect_timeout=0.5, socket_timeout=0.5)
+                    client.delete(f"sakura:ws_ticket:{ticket_str}")
+                except Exception:
+                    pass
+                return user_id
+            return None
+
+        if db is not None:
+            return _do_consume(db)
+        with get_db_context() as session:
+            return _do_consume(session)
+
 

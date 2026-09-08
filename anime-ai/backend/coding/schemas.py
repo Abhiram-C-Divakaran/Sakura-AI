@@ -19,6 +19,7 @@ class CodingTaskCreateRequest(BaseModel):
     title: str
     objective: str
     intensity: Optional[str] = "high"
+    stream: Optional[bool] = False
 
 class ToolExecutionRequest(BaseModel):
     tool_name: str

@@ -107,6 +107,15 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     return {"access_token": access_token, "token_type": "bearer"}
 
 
+@router.post("/auth/ws-ticket")
+def issue_websocket_ticket(
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Issues a short-lived, single-use WebSocket ticket for authenticating realtime connections."""
+    return AuthManager.issue_ws_ticket(user_id=current_user.id, ttl_seconds=60, db=db)
+
+
 # ─── Conversation Endpoints ──────────────────────────────────────────────────
 
 def serialize_conversation(c: Conversation) -> Dict[str, Any]:
@@ -837,7 +846,7 @@ async def chat_stream(
                     if c:
                         if c.title.startswith("Chat with"):
                             c.title = req.message[:50] + ("..." if len(req.message) > 50 else "")
-                        c.updated_at = __import__("datetime").datetime.utcnow()
+                        c.updated_at = utc_now()
                     db_ctx.commit()
 
             return StreamingResponse(coding_stream_generator(), media_type="text/event-stream")
@@ -1001,39 +1010,56 @@ def system_status(current_user: User = Depends(AuthManager.get_current_user)):
 
 # WebSocket route
 @router.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = None):
+async def websocket_endpoint(
+    websocket: WebSocket,
+    ticket: Optional[str] = None,
+    token: Optional[str] = None
+):
+    user_id = None
+    if not ticket:
+        ticket = websocket.query_params.get("ticket")
     if not token:
         token = websocket.query_params.get("token")
-        
-    if not token:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-        
-    try:
-        from jose import jwt
-        from auth.manager import SECRET_KEY, ALGORITHM
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
+
+    if ticket:
+        user_uuid = AuthManager.consume_ws_ticket(ticket)
+        if user_uuid:
+            user_id = str(user_uuid)
+        else:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
-    except Exception:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-        
-    from database.db import get_db_context
-    with get_db_context() as db:
-        user = db.query(User).filter(User.username == username).first()
-        if not user:
+    elif token:
+        try:
+            from jose import jwt
+            from auth.manager import SECRET_KEY, ALGORITHM
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            username: str = payload.get("sub")
+            if username is None:
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+            from database.db import get_db_context
+            with get_db_context() as db:
+                user = db.query(User).filter(User.username == username).first()
+                if not user:
+                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                    return
+                user_id = str(user.id)
+        except Exception:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
-        user_id = str(user.id)
+    else:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
 
     await ws_manager.connect(user_id, websocket)
     try:
-        user_tasks = [t for t in ACTIVE_TASKS.values() if t["userId"] == user_id]
-        await websocket.send_json({"type": "tasks_list", "data": user_tasks})
-        
+        try:
+            import uuid as _uuid
+            user_tasks = [t.to_dict() for t in TaskManager.list_tasks(_uuid.UUID(user_id))]
+            await websocket.send_json({"type": "tasks_list", "data": user_tasks})
+        except Exception:
+            pass
+
         while True:
             data = await websocket.receive_text()
             if data == "ping":

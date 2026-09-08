@@ -31,7 +31,9 @@ class BaseSandboxRuntime(ABC):
         cwd_relative: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
         tool_name: str = "run_command",
-        allow_network: bool = False
+        allow_network: bool = False,
+        network_authorization_id: Optional[str] = None,
+        network_capability: Optional[str] = None
     ) -> Dict[str, Any]:
         pass
 
@@ -64,7 +66,8 @@ class DockerSandboxRuntime(BaseSandboxRuntime):
         timeout_seconds: Optional[int] = None,
         tool_name: str = "run_command",
         allow_network: bool = False,
-        network_authorization_id: Optional[str] = None
+        network_authorization_id: Optional[str] = None,
+        network_capability: Optional[str] = None
     ) -> Dict[str, Any]:
         start_time = time.time()
         timeout = timeout_seconds or self.default_timeout_seconds
@@ -181,7 +184,8 @@ class RemoteHttpSandboxRuntime(BaseSandboxRuntime):
         timeout_seconds: Optional[int] = None,
         tool_name: str = "run_command",
         allow_network: bool = False,
-        network_authorization_id: Optional[str] = None
+        network_authorization_id: Optional[str] = None,
+        network_capability: Optional[str] = None
     ) -> Dict[str, Any]:
         timeout = timeout_seconds or self.default_timeout_seconds
         payload = {
@@ -192,6 +196,7 @@ class RemoteHttpSandboxRuntime(BaseSandboxRuntime):
             "cwd_relative": cwd_relative,
             "allow_network": allow_network,
             "network_authorization_id": network_authorization_id,
+            "network_capability": network_capability or network_authorization_id,
             "tool_name": tool_name
         }
         headers = {}
@@ -258,7 +263,8 @@ class LocalRestrictedSandboxRuntime(BaseSandboxRuntime):
         timeout_seconds: Optional[int] = None,
         tool_name: str = "run_command",
         allow_network: bool = False,
-        network_authorization_id: Optional[str] = None
+        network_authorization_id: Optional[str] = None,
+        network_capability: Optional[str] = None
     ) -> Dict[str, Any]:
         start_time = time.time()
         timeout = timeout_seconds or self.default_timeout_seconds
@@ -587,9 +593,10 @@ class SandboxManager:
                 "runtime": "local_restricted",
                 "isolation_level": "restricted_subprocess",
                 "production_safe": False,
+                "network_isolated": False,
                 "reason": "Running in development mode using local restricted subprocess",
                 "docker_available": False,
                 "cpu_limit": "host_shared",
                 "memory_limit_mb": "host_shared",
-                "network_disabled_by_default": True
+                "network_disabled_by_default": False
             }

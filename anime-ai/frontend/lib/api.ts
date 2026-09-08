@@ -2,12 +2,19 @@
  * Sakura AI — Centralized Frontend API & WebSocket Client Utilities
  *
  * Exposes canonical API base resolution and URL builders for HTTP and WebSockets,
- * ensuring uniform routing across development, Docker Compose, and split-port production.
+ * ensuring uniform routing across development, Docker Compose, single-origin reverse proxies,
+ * and split-port production deployments without hardcoded assumptions.
  */
 
+const rawApiUrl = typeof process !== 'undefined' ? process.env?.NEXT_PUBLIC_API_URL : undefined;
+const isProd = typeof process !== 'undefined' && process.env?.NODE_ENV === 'production';
+
+// If explicitly specified (even as empty string for relative mode), respect it;
+// otherwise default to localhost:8000 in dev and relative in production.
 export const API_BASE = (
-  (typeof process !== 'undefined' && process.env?.NEXT_PUBLIC_API_URL) ||
-  'http://localhost:8000'
+  rawApiUrl !== undefined
+    ? rawApiUrl
+    : (isProd ? '' : 'http://localhost:8000')
 ).replace(/\/+$/, '');
 
 /**
@@ -17,7 +24,7 @@ export function apiUrl(path: string): string {
   if (!path) return API_BASE;
   if (/^https?:\/\//i.test(path)) return path;
   const cleanPath = path.startsWith('/') ? path : `/${path}`;
-  return `${API_BASE}${cleanPath}`;
+  return API_BASE ? `${API_BASE}${cleanPath}` : cleanPath;
 }
 
 /**
@@ -35,16 +42,18 @@ export function websocketUrl(path: string): string {
     return `${wsBase}${cleanPath}`;
   }
 
-  // 2. Derive protocol and host from API_BASE
-  if (/^https:\/\//i.test(API_BASE)) {
-    return `${API_BASE.replace(/^https:/i, 'wss:')}${cleanPath}`;
-  }
-  if (/^http:\/\//i.test(API_BASE)) {
-    return `${API_BASE.replace(/^http:/i, 'ws:')}${cleanPath}`;
+  // 2. Derive protocol and host from API_BASE if non-empty
+  if (API_BASE) {
+    if (/^https:\/\//i.test(API_BASE)) {
+      return `${API_BASE.replace(/^https:/i, 'wss:')}${cleanPath}`;
+    }
+    if (/^http:\/\//i.test(API_BASE)) {
+      return `${API_BASE.replace(/^http:/i, 'ws:')}${cleanPath}`;
+    }
   }
 
-  // 3. Fallback to browser location
-  if (typeof window !== 'undefined') {
+  // 3. Fallback to browser location (supports single origin reverse proxy)
+  if (typeof window !== 'undefined' && window.location) {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     return `${protocol}//${window.location.host}${cleanPath}`;
   }

@@ -34,6 +34,7 @@ jobs:
       JWT_SECRET: "test-secret-key-for-ci-minimum-32-chars-ok"
       INTEGRATION_ENCRYPTION_KEY: "test_integration_key_32_chars_ok!"
       SAKURA_SANDBOX_SERVICE_TOKEN: "test_sandbox_service_token_ci"
+      SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY: "test_capability_signing_key_32chars"
       ENVIRONMENT: "test"
       SAKURA_EMBEDDED_WORKER: "false"
       SAKURA_EMBEDDED_SCHEDULER: "false"
@@ -97,6 +98,7 @@ jobs:
           JWT_SECRET: "test-secret-key-for-ci-minimum-32-chars-ok"
           INTEGRATION_ENCRYPTION_KEY: "test_integration_key_32_chars_ok!"
           SAKURA_SANDBOX_SERVICE_TOKEN: "test_sandbox_service_token_ci"
+          SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY: "test_capability_signing_key_32chars"
         run: |
           docker compose -f docker-compose.prod.yml config
 
@@ -108,6 +110,7 @@ jobs:
           ENVIRONMENT: "test"
           SAKURA_EMBEDDED_WORKER: "false"
           SAKURA_EMBEDDED_SCHEDULER: "false"
+          SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY: "test_capability_signing_key_32chars"
         run: |
           python -m unittest discover -s tests -p "test_*.py" -v
 
@@ -142,6 +145,10 @@ jobs:
       - name: Production Build
         run: npm run build
 
+      - name: Build and Validate Production Frontend Docker Image
+        run: |
+          docker build -t sakura-frontend:test -f Dockerfile .
+
   sandbox-integration:
     name: Docker Sandbox E2E Integration
     runs-on: ubuntu-latest
@@ -171,6 +178,7 @@ jobs:
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v sakura_workspaces_vol:/workspaces \
             -e SAKURA_SANDBOX_SERVICE_TOKEN=ci_test_sandbox_token_abc123 \
+            -e SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY=ci_test_capability_signing_key_32chars \
             -e SAKURA_SANDBOX_IMAGE=sakura-sandbox:latest \
             -e SAKURA_WORKSPACES_VOLUME=sakura_workspaces_vol \
             -e SAKURA_WORKSPACE_ROOT=/workspaces \
@@ -204,6 +212,7 @@ jobs:
           SAKURA_SANDBOX_E2E: "1"
           SAKURA_SANDBOX_URL: "http://localhost:9000"
           SAKURA_SANDBOX_SERVICE_TOKEN: "ci_test_sandbox_token_abc123"
+          SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY: "ci_test_capability_signing_key_32chars"
           POSTGRES_PASSWORD: "ci_secret_super_secret_pg_pwd"
           JWT_SECRET: "ci_secret_super_secret_jwt_key_32c"
           HOST_SENSITIVE_SECRET: "very_sensitive_host_secret_should_never_leak"

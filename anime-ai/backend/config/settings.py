@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
 
     # Model Routing
-    sakura_model_fast: str = Field(default="llama-3.1-8b-instant", alias="SAKURA_MODEL_FAST")
+    sakura_model_fast: str = Field(default="qwen/qwen3.8-27b", alias="SAKURA_MODEL_FAST")
     sakura_model_code: str = Field(default="qwen/qwen3.8-27b", alias="SAKURA_MODEL_CODE")
     sakura_model_reasoning: str = Field(default="deepseek-r1-distill-llama-70b", alias="SAKURA_MODEL_REASONING")
 
@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     sakura_sandbox_image: str = Field(default="sakura-sandbox:latest", alias="SAKURA_SANDBOX_IMAGE")
     sakura_sandbox_executor_url: str = Field(default="http://sandbox-executor:9000", alias="SAKURA_SANDBOX_EXECUTOR_URL")
     sakura_sandbox_service_token: Optional[str] = Field(default=None, alias="SAKURA_SANDBOX_SERVICE_TOKEN")
+    sakura_sandbox_capability_signing_key: Optional[str] = Field(
+        default="sakura_dev_capability_signing_key_32_chars_ok!",
+        alias="SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY"
+    )
 
     # Mocks & Reliability
     sakura_allow_mocks: bool = Field(default=False, alias="SAKURA_ALLOW_MOCKS")
@@ -121,6 +125,13 @@ class Settings(BaseSettings):
                     "Production startup failed: FATAL PRODUCTION SECURITY ERROR: INTEGRATION_ENCRYPTION_KEY must be at least 32 characters long "
                     f"in production (current length: {len(self.integration_encryption_key)})."
                 )
+            if self.jwt_secret == self.integration_encryption_key:
+                raise RuntimeError("Production security error: INTEGRATION_ENCRYPTION_KEY must be independent of JWT_SECRET.")
+            if self.sakura_sandbox_capability_signing_key:
+                if self.sakura_sandbox_capability_signing_key in [self.jwt_secret, self.integration_encryption_key, self.sakura_sandbox_service_token]:
+                    raise RuntimeError("Production security error: SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY must be independent of other secrets.")
+                if len(self.sakura_sandbox_capability_signing_key) < 32:
+                    raise RuntimeError("Production security error: SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY must be at least 32 characters long.")
 
 
 @lru_cache()

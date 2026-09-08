@@ -1,15 +1,18 @@
 import uuid
+import json
+import asyncio
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from database.db import get_db, get_db_context
-from database.models import User, RepositoryWorkspace, CodingTask, ToolExecution
+from database.models import User, RepositoryWorkspace, CodingTask, CodingJob, CodingTaskEvent, ToolExecution, utc_now
 from auth.manager import AuthManager
 from coding.repository import WorkspaceManager
 from coding.agent import CodingAgent
+from coding.job_worker import CodingJobWorker, enqueue_coding_job
 from coding.schemas import (
     WorkspaceCreateRequest,
     WorkspaceResponse,
@@ -153,6 +156,39 @@ async def execute_workspace_tool(
     result = await agent.execute_tool(None, req.tool_name, req.arguments)
     return result
 
+async def stream_coding_task_events(task_id: str, after_seq: int = 0):
+    """Streams CodingTaskEvent records as Server-Sent Events with replay and terminal closure."""
+    current_seq = after_seq
+    terminal_phases = ["COMPLETED_VERIFIED", "COMPLETED_UNVERIFIED", "FAILED", "CANCELLED", "MAX_ITERATIONS"]
+    is_terminal = False
+    max_idle_polls = 120  # 60s idle timeout
+    idle_count = 0
+
+    while not is_terminal and idle_count < max_idle_polls:
+        with get_db_context() as db:
+            evts = db.query(CodingTaskEvent).filter(
+                CodingTaskEvent.task_id == str(task_id),
+                CodingTaskEvent.sequence_number > current_seq
+            ).order_by(CodingTaskEvent.sequence_number.asc()).all()
+
+            if evts:
+                idle_count = 0
+                for evt in evts:
+                    current_seq = evt.sequence_number
+                    yield f"data: {json.dumps(evt.to_dict())}\n\n"
+                    if evt.phase in terminal_phases:
+                        is_terminal = True
+                        break
+            else:
+                idle_count += 1
+                job = db.query(CodingJob).filter(CodingJob.task_id == str(task_id)).first()
+                if job and job.status in terminal_phases:
+                    is_terminal = True
+
+        if not is_terminal:
+            await asyncio.sleep(0.5)
+
+
 @router.post("/workspaces/{workspace_id}/tasks")
 async def create_and_run_task(
     workspace_id: str,
@@ -160,7 +196,7 @@ async def create_and_run_task(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Launches an agentic coding task and streams execution updates."""
+    """Launches an agentic coding task backed by a durable CodingJob queue."""
     try:
         ws_uuid = uuid.UUID(workspace_id)
     except ValueError:
@@ -173,26 +209,148 @@ async def create_and_run_task(
     if not ws:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
+    task_id = uuid.uuid4()
     task = CodingTask(
-        id=uuid.uuid4(),
+        id=task_id,
         workspace_id=ws.id,
         user_id=current_user.id,
         title=req.title,
         objective=req.objective,
         status="QUEUED"
     )
+
+    job = CodingJob(
+        id=uuid.uuid4(),
+        task_id=str(task_id),
+        workspace_id=ws.id,
+        user_id=current_user.id,
+        instructions=req.objective,
+        status="QUEUED"
+    )
+
     db.add(task)
+    db.add(job)
     db.commit()
     db.refresh(task)
+    db.refresh(job)
 
-    agent = CodingAgent(db, ws, current_user, llm_router, intensity=req.intensity or "high")
+    # 1. Enqueue to durable Redis queue
+    enqueued = enqueue_coding_job(str(task.id), job.id)
 
-    async def event_generator():
-        import json
-        async for update in agent.run_task_stream(task):
-            yield f"data: {json.dumps(update)}\n\n"
+    # 2. In embedded mode or local dev, ensure execution starts immediately
+    worker = CodingJobWorker(worker_id=f"api_worker_{uuid.uuid4().hex[:6]}")
+    asyncio.create_task(worker.execute_job(job))
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    if req.stream:
+        return StreamingResponse(
+            stream_coding_task_events(str(task.id), after_seq=0),
+            media_type="text/event-stream"
+        )
+
+    return {
+        "status": "QUEUED",
+        "taskId": str(task.id),
+        "jobId": str(job.id),
+        "workspaceId": str(ws.id)
+    }
+
+
+@router.get("/workspaces/{workspace_id}/tasks/{task_id}")
+@router.get("/tasks/{task_id}")
+def get_coding_task_status(
+    task_id: str,
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Fetches task status and verification summary."""
+    job = db.query(CodingJob).filter(
+        CodingJob.task_id == str(task_id),
+        CodingJob.user_id == current_user.id
+    ).first()
+
+    task = db.query(CodingTask).filter(
+        CodingTask.id == uuid.UUID(task_id),
+        CodingTask.user_id == current_user.id
+    ).first() if not job else None
+
+    if not job and not task:
+        raise HTTPException(status_code=404, detail="Coding task not found")
+
+    if job:
+        return job.to_dict()
+
+    return {
+        "id": str(task.id),
+        "taskId": str(task.id),
+        "workspaceId": str(task.workspace_id),
+        "userId": str(task.user_id),
+        "status": task.status,
+        "title": task.title,
+        "instructions": task.objective,
+        "verificationState": task.verification_summary or {},
+        "createdAt": task.created_at.isoformat() if task.created_at else None
+    }
+
+
+@router.get("/workspaces/{workspace_id}/tasks/{task_id}/events")
+@router.get("/tasks/{task_id}/events")
+def get_coding_task_events(
+    task_id: str,
+    after_sequence: int = Query(0, ge=0),
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Returns persistent execution events for reconnect and audit."""
+    events = db.query(CodingTaskEvent).filter(
+        CodingTaskEvent.task_id == str(task_id),
+        CodingTaskEvent.sequence_number > after_sequence
+    ).order_by(CodingTaskEvent.sequence_number.asc()).all()
+
+    return [evt.to_dict() for evt in events]
+
+
+@router.get("/workspaces/{workspace_id}/tasks/{task_id}/events/stream")
+@router.get("/tasks/{task_id}/events/stream")
+async def stream_coding_task_events_endpoint(
+    task_id: str,
+    after_sequence: int = Query(0, ge=0),
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Server-Sent Events endpoint for real-time task log streaming with reconnect replay."""
+    return StreamingResponse(
+        stream_coding_task_events(str(task_id), after_seq=after_sequence),
+        media_type="text/event-stream"
+    )
+
+
+@router.post("/workspaces/{workspace_id}/tasks/{task_id}/cancel")
+@router.post("/tasks/{task_id}/cancel")
+def cancel_coding_task(
+    task_id: str,
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Signals cancellation to running or queued coding task."""
+    job = db.query(CodingJob).filter(
+        CodingJob.task_id == str(task_id),
+        CodingJob.user_id == current_user.id
+    ).first()
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Coding task not found")
+
+    job.cancel_requested = True
+    if job.status in ["QUEUED", "RUNNING"]:
+        job.status = "CANCELLED"
+        job.completed_at = utc_now()
+
+    task = db.query(CodingTask).filter(CodingTask.id == uuid.UUID(task_id)).first()
+    if task:
+        task.status = "CANCELLED"
+
+    db.commit()
+    return {"status": "cancelled", "taskId": str(task_id)}
 
 @router.delete("/workspaces/{workspace_id}")
 def delete_workspace(

@@ -145,13 +145,20 @@ class TestFrontendApiRouting(unittest.TestCase):
             "active_workspace_id": ws_b_id
         }
 
-        # Use streaming response check
-        with self.client.stream("POST", "/api/v1/chat/stream", headers=headers, json=chat_payload) as stream_resp:
-            self.assertEqual(stream_resp.status_code, 200)
-            events = []
-            for line in stream_resp.iter_lines():
-                if line.startswith("data: "):
-                    events.append(line[6:])
+        # Use streaming response check with mocked task stream to avoid external LLM rate limits
+        async def mock_run_task_stream(self_agent, task):
+            yield {"message": "Coding started"}
+            yield {"phase": "COMPLETED_VERIFIED", "final_output": "Success"}
+
+        from unittest.mock import patch
+        from coding.agent import CodingAgent
+        with patch.object(CodingAgent, "run_task_stream", mock_run_task_stream):
+            with self.client.stream("POST", "/api/v1/chat/stream", headers=headers, json=chat_payload) as stream_resp:
+                self.assertEqual(stream_resp.status_code, 200)
+                events = []
+                for line in stream_resp.iter_lines():
+                    if line.startswith("data: "):
+                        events.append(line[6:])
 
         # Verify that a CodingTask was created explicitly for Workspace B
         with get_db_context() as db:

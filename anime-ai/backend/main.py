@@ -143,7 +143,11 @@ async def readiness_check():
         with get_db_context() as db:
             db.execute(sa.text("SELECT 1"))
             insp = sa.inspect(db.bind)
-            required_tables = {"users", "conversations", "messages", "background_tasks", "scheduled_tasks", "scheduled_task_runs"}
+            required_tables = {
+                "users", "conversations", "messages", "background_tasks",
+                "scheduled_tasks", "scheduled_task_runs",
+                "coding_jobs", "coding_task_events", "websocket_tickets"
+            }
             existing_tables = set(insp.get_table_names())
             if required_tables.issubset(existing_tables):
                 tables_ok = True

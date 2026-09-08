@@ -47,12 +47,25 @@ class WorkspaceManager:
         WorkspaceSecurity.validate_branch_name(branch)
 
         if repository_url and clone_existing:
-            # Validate URL to prevent shell/flag injection
+            # Validate URL to prevent shell/flag injection and SSRF
             WorkspaceSecurity.validate_repository_url(repository_url)
 
             executor = SandboxExecutor(workspace_dir, workspace_id=str(workspace_id))
             clone_cmd = ["git", "clone", "--depth", "1", "--branch", branch, repository_url, "."]
-            clone_res = await executor.run_command(clone_cmd, allow_network=True)
+            from coding.capabilities import mint_sandbox_capability
+            clone_capability = mint_sandbox_capability(
+                workspace_id=str(workspace_id),
+                command=clone_cmd,
+                scope="repository_clone",
+                repository_url=repository_url,
+                branch=branch,
+                ttl_seconds=180
+            )
+            clone_res = await executor.run_command(
+                clone_cmd,
+                allow_network=True,
+                network_capability=clone_capability
+            )
             if not clone_res["success"]:
                 status = "ERROR"
             else:

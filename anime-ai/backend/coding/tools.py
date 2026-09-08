@@ -180,11 +180,12 @@ class CodingToolchain:
         cwd: Optional[str] = None,
         timeout: int = 60,
         allow_network: bool = False,
-        network_authorization_id: Optional[str] = None
+        network_authorization_id: Optional[str] = None,
+        network_capability: Optional[str] = None
     ) -> Dict[str, Any]:
         """Runs a safe shell command inside workspace."""
         from coding.security import NetworkAccessPolicy
-        if NetworkAccessPolicy.requires_network_authorization(command) and not network_authorization_id:
+        if NetworkAccessPolicy.requires_network_authorization(command) and not (network_authorization_id or network_capability):
             return {
                 "success": False,
                 "tool": "run_command",
@@ -204,8 +205,9 @@ class CodingToolchain:
             cwd_relative=cwd,
             timeout_seconds=timeout,
             tool_name="run_command",
-            allow_network=allow_network or bool(network_authorization_id),
-            network_authorization_id=network_authorization_id
+            allow_network=allow_network or bool(network_authorization_id or network_capability),
+            network_authorization_id=network_authorization_id,
+            network_capability=network_capability
         )
 
     async def run_tests(self, command: str = "npm test", timeout: int = 120) -> Dict[str, Any]:

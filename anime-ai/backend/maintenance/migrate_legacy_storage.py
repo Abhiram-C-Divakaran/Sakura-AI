@@ -130,6 +130,19 @@ def migrate_storage(
                     continue
 
             if not dry_run:
+                # Checksum verification before modifying DB or deleting source
+                dest_bytes = storage.get_bytes(canonical_key)
+                dest_hash = compute_bytes_sha256(dest_bytes)
+                if dest_hash != source_hash:
+                    logger.error(f"Document {doc_id}: SHA-256 mismatch between source ({source_hash}) and destination ({dest_hash}). Skipping deletion.")
+                    summary["failed"] += 1
+                    summary["errors"].append({
+                        "id": doc_id,
+                        "type": "document",
+                        "error": f"Checksum mismatch: source={source_hash}, dest={dest_hash}"
+                    })
+                    continue
+
                 doc.storage_key = canonical_key
                 doc.storage_backend = storage.backend_type
                 doc.storage_size = source_size
@@ -138,7 +151,7 @@ def migrate_storage(
                 if remove_source and os.path.exists(safe_source):
                     try:
                         os.remove(safe_source)
-                        logger.info(f"Document {doc_id}: Removed legacy source file '{safe_source}'.")
+                        logger.info(f"Document {doc_id}: Verified SHA256 matches ({dest_hash[:8]}). Removed legacy source file '{safe_source}'.")
                     except Exception as rm_err:
                         logger.warning(f"Document {doc_id}: Could not remove legacy source file: {rm_err}")
 
@@ -169,6 +182,7 @@ def migrate_storage(
                 continue
 
             source_size = os.path.getsize(safe_source)
+            source_hash = compute_file_sha256(safe_source)
 
             if not storage.exists(canonical_key) and not dry_run:
                 try:
@@ -185,6 +199,14 @@ def migrate_storage(
                     continue
 
             if not dry_run:
+                dest_bytes = storage.get_bytes(canonical_key)
+                dest_hash = compute_bytes_sha256(dest_bytes)
+                if dest_hash != source_hash:
+                    logger.error(f"Image {img_id}: SHA-256 mismatch between source and destination. Skipping deletion.")
+                    summary["failed"] += 1
+                    summary["errors"].append({"id": img_id, "type": "image", "error": "Checksum mismatch"})
+                    continue
+
                 img.storage_key = canonical_key
                 img.storage_backend = storage.backend_type
                 img.storage_size = source_size
@@ -203,10 +225,12 @@ def migrate_storage(
 
 
 def main():
+    import json
     parser = argparse.ArgumentParser(description="Sakura AI Legacy Storage Migration")
     parser.add_argument("--dry-run", action="store_true", help="Simulate migration without modifying files or DB")
     parser.add_argument("--remove-source", action="store_true", help="Remove legacy local files after verified migration")
     parser.add_argument("--batch-size", type=int, default=100, help="Number of records to migrate per batch")
+    parser.add_argument("--report", type=str, default=None, help="File path to save JSON migration report")
     args = parser.parse_args()
 
     res = migrate_storage(
@@ -214,6 +238,15 @@ def main():
         remove_source=args.remove_source,
         batch_size=args.batch_size
     )
+
+    if args.report:
+        try:
+            with open(args.report, "w", encoding="utf-8") as f:
+                json.dump(res, f, indent=2)
+            logger.info(f"Migration report written to {args.report}")
+        except Exception as e:
+            logger.error(f"Failed to write report to {args.report}: {e}")
+
     if res["failed"] > 0:
         sys.exit(1)
 

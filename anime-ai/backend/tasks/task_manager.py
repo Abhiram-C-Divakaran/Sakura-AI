@@ -45,33 +45,48 @@ class TaskExecutionContext:
     execution_attempt_id: uuid.UUID
     lease_lost_event: Optional[asyncio.Event] = None
 
-    def assert_owned(self) -> bool:
+    def assert_owned_in_session(self, db: Session, lock: bool = True) -> bool:
         """
-        Validates that this worker and attempt token currently hold an active, unexpired lease.
-        If lease_lost_event is set, or if database state has diverged/expired, raises TaskLeaseLostError.
+        Validates that this worker and attempt token currently hold an active, unexpired lease
+        within the caller's active database session.
+        If lock=True, applies row-level locking to prevent concurrent modification.
         """
         if self.lease_lost_event and self.lease_lost_event.is_set():
             raise TaskLeaseLostError(
                 f"Task {self.task_id} lease lost event was signaled for worker '{self.worker_id}'."
             )
 
+        now = utc_now()
+        query = db.query(BackgroundTask).filter(
+            BackgroundTask.id == self.task_id,
+            BackgroundTask.worker_id == self.worker_id,
+            BackgroundTask.execution_attempt_id == self.execution_attempt_id,
+            BackgroundTask.status.in_(["Starting", "Running"])
+        )
+        if lock:
+            try:
+                query = query.with_for_update()
+            except Exception:
+                pass
+
+        task = query.first()
+        if not task:
+            raise TaskLeaseLostError(
+                f"Task {self.task_id} lease lost: worker '{self.worker_id}' with token '{self.execution_attempt_id}' is no longer the active owner."
+            )
+        if _is_lease_expired(task.lease_expires_at, now):
+            raise TaskLeaseLostError(
+                f"Task {self.task_id} lease expired at {task.lease_expires_at} (current time {now})."
+            )
+        return True
+
+    def assert_owned(self) -> bool:
+        """
+        Validates that this worker and attempt token currently hold an active, unexpired lease.
+        If lease_lost_event is set, or if database state has diverged/expired, raises TaskLeaseLostError.
+        """
         with get_db_context() as db:
-            now = utc_now()
-            task = db.query(BackgroundTask).filter(
-                BackgroundTask.id == self.task_id,
-                BackgroundTask.worker_id == self.worker_id,
-                BackgroundTask.execution_attempt_id == self.execution_attempt_id,
-                BackgroundTask.status.in_(["Starting", "Running"])
-            ).first()
-            if not task:
-                raise TaskLeaseLostError(
-                    f"Task {self.task_id} lease lost: worker '{self.worker_id}' with token '{self.execution_attempt_id}' is no longer the active owner."
-                )
-            if _is_lease_expired(task.lease_expires_at, now):
-                raise TaskLeaseLostError(
-                    f"Task {self.task_id} lease expired at {task.lease_expires_at} (current time {now})."
-                )
-            return True
+            return self.assert_owned_in_session(db, lock=False)
 
 
 def assert_task_lease_owned(
@@ -94,20 +109,32 @@ class TaskManager:
     """Manages persistent background tasks with durable database state."""
 
     @staticmethod
+    def create_task_in_session(
+        db: Session,
+        user_id: uuid.UUID,
+        task_type: str,
+        title: str,
+        payload: dict
+    ) -> BackgroundTask:
+        """Creates a BackgroundTask in the caller's database transaction without committing."""
+        task = BackgroundTask(
+            id=uuid.uuid4(),
+            user_id=user_id,
+            type=task_type,
+            title=title,
+            payload=payload or {},
+            status="Queued",
+            progress=0,
+            created_at=utc_now(),
+            retry_count=0
+        )
+        db.add(task)
+        return task
+
+    @staticmethod
     def create_task(user_id: uuid.UUID, task_type: str, title: str, payload: dict) -> BackgroundTask:
         with get_db_context() as db:
-            task = BackgroundTask(
-                id=uuid.uuid4(),
-                user_id=user_id,
-                type=task_type,
-                title=title,
-                payload=payload or {},
-                status="Queued",
-                progress=0,
-                created_at=utc_now(),
-                retry_count=0
-            )
-            db.add(task)
+            task = TaskManager.create_task_in_session(db, user_id, task_type, title, payload)
             db.commit()
             db.refresh(task)
 
@@ -138,6 +165,47 @@ class TaskManager:
                     pass
 
             return task
+
+    @staticmethod
+    def recover_stale_tasks(db: Optional[Session] = None, max_retries: int = 3) -> int:
+        """
+        Recovers tasks in 'Running' or 'Starting' status where lease has expired OR lease_expires_at is NULL.
+        """
+        from sqlalchemy import or_
+        now = utc_now()
+
+        def _do_recover(session: Session) -> int:
+            stale_tasks = session.query(BackgroundTask).filter(
+                BackgroundTask.status.in_(["Running", "Starting"]),
+                or_(
+                    BackgroundTask.lease_expires_at.is_(None),
+                    BackgroundTask.lease_expires_at < now
+                )
+            ).all()
+
+            count = 0
+            for task in stale_tasks:
+                current_retries = task.retry_count or 0
+                if current_retries >= max_retries:
+                    task.status = "Failed"
+                    task.error = f"Task exceeded maximum retries ({max_retries}). Lease expired without heartbeat."
+                    task.completed_at = now
+                else:
+                    task.status = "Queued"
+                    task.retry_count = current_retries + 1
+                    task.worker_id = None
+                    task.execution_attempt_id = None
+                    task.started_at = None
+                    task.heartbeat_at = None
+                    task.lease_expires_at = None
+                    count += 1
+            session.commit()
+            return count
+
+        if db is not None:
+            return _do_recover(db)
+        with get_db_context() as session:
+            return _do_recover(session)
 
     @staticmethod
     def get_task(task_id: uuid.UUID, user_id: uuid.UUID) -> Optional[BackgroundTask]:
@@ -704,11 +772,11 @@ async def execute_scheduled_task_job(
         )
         duration_ms = int((time.time() - start_time) * 1000)
 
-        if ctx:
-            ctx.assert_owned()
-
-        # Check cancellation before final persistence
+        # Check cancellation and lease before final persistence
         with get_db_context() as db:
+            if ctx:
+                ctx.assert_owned_in_session(db, lock=True)
+
             curr = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
             if curr and (curr.cancel_requested or curr.status == "Cancelled"):
                 r = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
@@ -729,9 +797,17 @@ async def execute_scheduled_task_job(
                 db.commit()
 
         await update_task_state(task_id, "Completed", 100, result=response_text, ctx=ctx)
+    except TaskLeaseLostError:
+        logger.warning(f"Scheduled task {task_id} lost lease ownership. Performing zero state mutations.")
+        raise
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
         with get_db_context() as db:
+            if ctx:
+                try:
+                    ctx.assert_owned_in_session(db, lock=False)
+                except TaskLeaseLostError:
+                    return
             run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
             if run:
                 run.status = "FAILED"
@@ -911,11 +987,15 @@ async def execute_document_index(
     embeddings = embed_mgr.get_embeddings(contents)
 
     # 4. Final transactional chunk persistence
-    if ctx:
-        ctx.assert_owned()
-
     with get_db_context() as db:
-        d = db.query(Document).filter(Document.id == doc_uuid).first()
+        if ctx:
+            ctx.assert_owned_in_session(db, lock=True)
+
+        try:
+            d = db.query(Document).filter(Document.id == doc_uuid).with_for_update().first()
+        except Exception:
+            d = db.query(Document).filter(Document.id == doc_uuid).first()
+
         if not d:
             raise FileNotFoundError("Document was deleted during indexing")
 

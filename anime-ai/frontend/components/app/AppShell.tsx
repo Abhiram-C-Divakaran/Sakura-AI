@@ -10,6 +10,7 @@ import { PluginsView } from '../PluginsView';
 import { ShareModal, DeleteConfirmModal } from '../ChatModals';
 import { ImageLightboxModal, ImageMetadata } from '../ImageLightboxModal';
 import { ConversationFilesSheet } from '../ConversationFilesSheet';
+import { SearchModal } from '../SearchModal';
 import { useConversation, Conversation } from '../../hooks/useConversation';
 import { useCapabilities } from '../../hooks/useCapabilities';
 import { useTasks } from '../../hooks/useTasks';
@@ -296,6 +297,17 @@ export const AppShell: React.FC<AppShellProps> = ({ currentUser, onLogout }) => 
           onClose={() => setShowFilesSheet(false)}
         />
       )}
+
+      <SearchModal
+        isOpen={showSearchModal}
+        initialQuery={searchQuery}
+        onClose={() => setShowSearchModal(false)}
+        onSelectConversation={(id) => {
+          selectConversation(id);
+          setActiveView('chat');
+          setShowSearchModal(false);
+        }}
+      />
     </div>
   );
 };

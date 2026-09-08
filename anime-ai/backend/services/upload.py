@@ -57,9 +57,10 @@ async def save_uploaded_file(
     storage = get_storage_backend()
     mime_type = file.content_type or "application/octet-stream"
 
-    # Stream file into memory / temp buffer with hard size limit
+    # Stream file into temp buffer with hard size limit (max 1MB in RAM before spooling to disk)
+    import tempfile
+    spooled = tempfile.SpooledTemporaryFile(max_size=1024 * 1024)
     bytes_read = 0
-    chunks = []
     try:
         while True:
             chunk = await file.read(1024 * 1024)
@@ -67,24 +68,29 @@ async def save_uploaded_file(
                 break
             bytes_read += len(chunk)
             if bytes_read > MAX_UPLOAD_SIZE_BYTES:
+                spooled.close()
                 raise HTTPException(status_code=413, detail="File exceeds maximum allowed size of 50MB")
-            chunks.append(chunk)
+            spooled.write(chunk)
     except HTTPException:
+        spooled.close()
         raise
     except Exception as e:
+        spooled.close()
         raise HTTPException(status_code=500, detail=f"Failed to read uploaded file: {str(e)}")
 
-    full_payload = b"".join(chunks)
-
+    spooled.seek(0)
     try:
         put_result = storage.put(
             storage_key=storage_key,
-            data=full_payload,
+            data=spooled,
             content_type=mime_type,
             user_id=user_id
         )
     except Exception as e:
+        spooled.close()
         raise HTTPException(status_code=500, detail=f"Failed to write file to storage: {str(e)}")
+    finally:
+        spooled.close()
 
     category = get_file_category(mime_type, clean_filename)
     idx_status = DocumentIndexingStatus.QUEUED if auto_index else DocumentIndexingStatus.NOT_INDEXED
@@ -116,7 +122,17 @@ async def save_uploaded_file(
         indexing_status=idx_status,
         metadata_json=meta
     )
-    db.add(doc)
-    db.commit()
-    db.refresh(doc)
+    try:
+        db.add(doc)
+        db.commit()
+        db.refresh(doc)
+    except Exception as e:
+        db.rollback()
+        # Compensate storage: delete orphaned object
+        try:
+            storage.delete(storage_key)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Database error saving document record: {str(e)}")
+
     return doc

@@ -470,3 +470,112 @@ class BackgroundTask(Base):
             "cancelRequested": self.cancel_requested,
             "resultMetadata": self.result_metadata or {},
         }
+
+
+class CodingJob(Base):
+    __tablename__ = "coding_jobs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id = Column(String(128), nullable=False, index=True)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("repository_workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    worker_id = Column(String(128), nullable=True)
+    execution_attempt_id = Column(UUID(as_uuid=True), nullable=True)
+    status = Column(String(64), nullable=False, default="QUEUED", index=True)  # QUEUED, RUNNING, COMPLETED_VERIFIED, COMPLETED_UNVERIFIED, FAILED, CANCELLED, BLOCKED
+    instructions = Column(Text, nullable=False)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    cancel_requested = Column(Boolean, default=False, nullable=False)
+    retry_count = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    error = Column(Text, nullable=True)
+    verification_state = Column(JSON, default=dict, nullable=False)
+    metadata_json = Column(JSON, default=dict, nullable=False)
+
+    workspace = relationship("RepositoryWorkspace")
+    user = relationship("User")
+    events = relationship("CodingTaskEvent", back_populates="job", cascade="all, delete-orphan", order_by="CodingTaskEvent.sequence_number")
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "taskId": self.task_id,
+            "workspaceId": str(self.workspace_id),
+            "userId": str(self.user_id),
+            "workerId": self.worker_id,
+            "executionAttemptId": str(self.execution_attempt_id) if self.execution_attempt_id else None,
+            "status": self.status,
+            "instructions": self.instructions,
+            "cancelRequested": self.cancel_requested,
+            "retryCount": self.retry_count,
+            "createdAt": self.created_at.isoformat() if self.created_at else None,
+            "startedAt": self.started_at.isoformat() if self.started_at else None,
+            "completedAt": self.completed_at.isoformat() if self.completed_at else None,
+            "error": self.error,
+            "verificationState": self.verification_state or {},
+            "metadata": self.metadata_json or {},
+        }
+
+
+class CodingTaskEvent(Base):
+    __tablename__ = "coding_task_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id = Column(String(128), nullable=False, index=True)
+    job_id = Column(UUID(as_uuid=True), ForeignKey("coding_jobs.id", ondelete="CASCADE"), nullable=True, index=True)
+    sequence_number = Column(Integer, nullable=False, index=True)
+    phase = Column(String(64), nullable=False)
+    event_type = Column(String(64), nullable=False)
+    tool_name = Column(String(128), nullable=True)
+    arguments_summary = Column(Text, nullable=True)
+    stdout_preview = Column(Text, nullable=True)
+    stderr_preview = Column(Text, nullable=True)
+    exit_code = Column(Integer, nullable=True)
+    diff_metadata = Column(JSON, default=dict, nullable=True)
+    verification_metadata = Column(JSON, default=dict, nullable=True)
+    message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    job = relationship("CodingJob", back_populates="events")
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "taskId": self.task_id,
+            "jobId": str(self.job_id) if self.job_id else None,
+            "sequenceNumber": self.sequence_number,
+            "phase": self.phase,
+            "eventType": self.event_type,
+            "toolName": self.tool_name,
+            "argumentsSummary": self.arguments_summary,
+            "stdoutPreview": self.stdout_preview,
+            "stderrPreview": self.stderr_preview,
+            "exitCode": self.exit_code,
+            "diffMetadata": self.diff_metadata or {},
+            "verificationMetadata": self.verification_metadata or {},
+            "message": self.message,
+            "createdAt": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class WebSocketTicket(Base):
+    __tablename__ = "websocket_tickets"
+
+    ticket = Column(String(128), primary_key=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    consumed_at = Column(DateTime(timezone=True), nullable=True)
+
+    user = relationship("User")
+
+    def to_dict(self):
+        return {
+            "ticket": self.ticket,
+            "userId": str(self.user_id),
+            "createdAt": self.created_at.isoformat() if self.created_at else None,
+            "expiresAt": self.expires_at.isoformat() if self.expires_at else None,
+            "consumedAt": self.consumed_at.isoformat() if self.consumed_at else None,
+        }

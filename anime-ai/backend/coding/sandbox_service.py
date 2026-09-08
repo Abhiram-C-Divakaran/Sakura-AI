@@ -145,6 +145,7 @@ class ExecuteRequest(BaseModel):
     environment: Optional[Dict[str, str]] = None
     allow_network: bool = False
     network_authorization_id: Optional[str] = None
+    network_capability: Optional[str] = None
     read_only: bool = False
     tool_name: str = "run_command"
 
@@ -341,6 +342,152 @@ async def provision_workspace(
     return {"status": "ok", "workspace_id": canonical_id, "path": ws_path}
 
 
+class CloneRequest(BaseModel):
+    repository_url: str
+    branch: Optional[str] = "main"
+    capability_token: str
+    timeout_seconds: Optional[int] = 120
+
+
+@app.post("/workspaces/{workspace_id}/clone")
+async def clone_repository(
+    workspace_id: str,
+    req: CloneRequest,
+    _auth: bool = Depends(verify_service_token)
+):
+    """
+    Executes a scoped git clone operation inside an ephemeral Docker container.
+    Requires a valid signed repository_clone capability token.
+    Enables outbound network strictly for the duration of the clone operation.
+    """
+    start_time = time.time()
+    timeout = req.timeout_seconds or 120
+
+    try:
+        ws_uuid = uuid.UUID(str(workspace_id).strip())
+        canonical_ws_id = str(ws_uuid)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid workspace UUID format")
+
+    canonical_ws = os.path.realpath(os.path.join(WORKSPACE_ROOT, canonical_ws_id))
+    canonical_root = os.path.realpath(WORKSPACE_ROOT)
+    if os.path.commonpath([canonical_ws, canonical_root]) != canonical_root or canonical_ws == canonical_root:
+        raise HTTPException(status_code=400, detail="Workspace path escapes WORKSPACE_ROOT")
+    os.makedirs(canonical_ws, exist_ok=True)
+
+    from coding.capabilities import verify_and_consume_capability, CapabilityError
+    from coding.security import WorkspaceSecurity, SecurityException
+
+    try:
+        WorkspaceSecurity.validate_repository_url(req.repository_url)
+        if req.branch:
+            WorkspaceSecurity.validate_branch_name(req.branch)
+    except SecurityException as e:
+        return {
+            "success": False,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"Security Error: {str(e)}",
+            "duration_ms": 0,
+            "blocked": True
+        }
+
+    expected_clone_cmd = ["git", "clone", "--depth", "1", "--branch", req.branch or "main", req.repository_url, "."]
+    try:
+        verify_and_consume_capability(
+            capability_token=req.capability_token,
+            expected_scope="repository_clone",
+            expected_workspace_id=canonical_ws_id,
+            expected_command=expected_clone_cmd,
+            expected_repository_url=req.repository_url,
+            expected_branch=req.branch
+        )
+    except CapabilityError as e:
+        return {
+            "success": False,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"Security Error: Repository clone blocked ({str(e)}). Valid signed capability is required.",
+            "duration_ms": 0,
+            "blocked": True
+        }
+
+    if not check_docker_operational():
+        return {
+            "success": False,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": "Container isolation runtime is unavailable on sandbox host.",
+            "duration_ms": int((time.time() - start_time) * 1000),
+            "isolation_unavailable": True
+        }
+
+    container_name = f"sakura-clone-{uuid.uuid4().hex[:12]}"
+    mount_source = canonical_ws
+    if WORKSPACES_VOLUME:
+        host_root = get_volume_host_mountpoint(WORKSPACES_VOLUME)
+        if host_root:
+            mount_source = os.path.join(host_root, canonical_ws_id)
+
+    safe_env = WorkspaceSecurity.build_safe_child_environment()
+    env_args = []
+    for k, v in safe_env.items():
+        env_args.extend(["-e", f"{k}={v}"])
+
+    docker_run_cmd = [
+        "docker", "run",
+        "--name", container_name,
+        "--network", "bridge",
+        "--security-opt", "no-new-privileges:true",
+        "--cap-drop", "ALL",
+        "--cpus", str(CPU_LIMIT),
+        "--memory", f"{MEMORY_MB}m",
+        "--pids-limit", str(PIDS_LIMIT),
+        "-v", f"{mount_source}:/workspace:rw",
+        "-w", "/workspace",
+        *env_args,
+        SANDBOX_IMAGE,
+        *expected_clone_cmd
+    ]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *docker_run_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout_drainer = StreamDrainer(CAPTURE_LIMIT_BYTES, HARD_OUTPUT_LIMIT_BYTES)
+        stderr_drainer = StreamDrainer(CAPTURE_LIMIT_BYTES, HARD_OUTPUT_LIMIT_BYTES)
+
+        stdout_data, stderr_data = await asyncio.wait_for(
+            asyncio.gather(stdout_drainer.read(proc.stdout), stderr_drainer.read(proc.stderr)),
+            timeout=timeout
+        )
+        await proc.wait()
+        duration_ms = int((time.time() - start_time) * 1000)
+        return {
+            "success": proc.returncode == 0,
+            "exit_code": proc.returncode,
+            "stdout": stdout_data.decode("utf-8", errors="replace"),
+            "stderr": stderr_data.decode("utf-8", errors="replace"),
+            "duration_ms": duration_ms,
+            "timed_out": False,
+            "blocked": False
+        }
+    except asyncio.TimeoutError:
+        subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return {
+            "success": False,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"Repository clone timed out after {timeout} seconds.",
+            "duration_ms": int((time.time() - start_time) * 1000),
+            "timed_out": True
+        }
+    finally:
+        subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
 @app.post("/execute")
 async def execute_command(
     req: ExecuteRequest,
@@ -488,21 +635,38 @@ async def execute_command(
                 "output_limit_exceeded": False
             }
 
-    # 4. Validate network authorization policy
+    # 4. Validate network authorization policy via cryptographically signed capability
     network_flag = "none"
     if req.allow_network:
         is_authorized = False
-        if req.network_authorization_id:
-            from database.db import get_db_context
-            from coding.security import NetworkAccessPolicy
-            with get_db_context() as db:
-                is_authorized = NetworkAccessPolicy.verify_and_consume_authorization(
-                    db=db,
-                    auth_id=req.network_authorization_id,
-                    user_id=None,
-                    workspace_id=req.workspace_id,
-                    command=req.command
+        cap_token = req.network_capability or req.network_authorization_id
+        if cap_token:
+            from coding.capabilities import verify_and_consume_capability, CapabilityError
+            try:
+                verify_and_consume_capability(
+                    capability_token=cap_token,
+                    expected_scope=["network_exec", "repository_clone"],
+                    expected_workspace_id=canonical_ws_id,
+                    expected_command=req.command
                 )
+                is_authorized = True
+            except CapabilityError as e:
+                return {
+                    "success": False,
+                    "tool": req.tool_name,
+                    "command": cmd_display,
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"Security Error: Outbound network access blocked ({str(e)}). Server authorization is required for network access (valid signed capability is required).",
+                    "duration_ms": 0,
+                    "timed_out": False,
+                    "blocked": True,
+                    "isolation_unavailable": False,
+                    "output_truncated": False,
+                    "output_limit_exceeded": False
+                }
+            except Exception as e:
+                is_authorized = False
 
         if not is_authorized:
             return {
@@ -511,7 +675,7 @@ async def execute_command(
                 "command": cmd_display,
                 "exit_code": -1,
                 "stdout": "",
-                "stderr": "Security Error: Outbound network access blocked. Valid server authorization is required.",
+                "stderr": "Security Error: Outbound network access blocked. Server authorization is required for network access (valid signed capability token is required).",
                 "duration_ms": 0,
                 "timed_out": False,
                 "blocked": True,

@@ -195,6 +195,37 @@ class TestSandboxDockerE2E(unittest.TestCase):
         self.assertTrue(res.get("timed_out"))
         self.assertLess(duration, 8.0, "Execution did not terminate in expected timeout window")
 
+    def test_network_capability_enforcement(self):
+        """Commands requesting allow_network=True must fail if capability token is missing or invalid."""
+        ws_id = self._provision_workspace()
+
+        # 1. Missing capability token with allow_network=True
+        res_no_cap = requests.post(
+            f"{SANDBOX_URL}/execute",
+            headers=self.headers,
+            json={
+                "command": "echo 1",
+                "workspace_id": ws_id,
+                "allow_network": True
+            },
+            timeout=10
+        )
+        self.assertEqual(res_no_cap.status_code, 403)
+
+        # 2. Invalid/tampered capability token
+        res_bad_cap = requests.post(
+            f"{SANDBOX_URL}/execute",
+            headers=self.headers,
+            json={
+                "command": "echo 1",
+                "workspace_id": ws_id,
+                "allow_network": True,
+                "network_capability": "invalid.tampered.token"
+            },
+            timeout=10
+        )
+        self.assertEqual(res_bad_cap.status_code, 403)
+
 
 if __name__ == "__main__":
     unittest.main()

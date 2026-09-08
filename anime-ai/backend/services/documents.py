@@ -99,7 +99,8 @@ def enqueue_index(
     force_reindex: bool = False
 ) -> BackgroundTask:
     """
-    Atomically increments Document.index_generation and enqueues durable document_index BackgroundTask.
+    Atomically increments Document.index_generation and enqueues durable document_index BackgroundTask
+    within the same database transaction.
     """
     doc = db.query(Document).filter(Document.id == doc_id, Document.user_id == user_id).first()
     if not doc:
@@ -117,11 +118,10 @@ def enqueue_index(
         "indexing_status": "Queued",
         "error": None
     }
-    db.commit()
-    db.refresh(doc)
 
     from tasks.task_manager import TaskManager
-    task = TaskManager.create_task(
+    task = TaskManager.create_task_in_session(
+        db=db,
         user_id=user_id,
         task_type="document_index",
         title=f"Index {doc.filename}",
@@ -132,6 +132,16 @@ def enqueue_index(
             "force_reindex": force_reindex
         }
     )
+    db.commit()
+    db.refresh(doc)
+    db.refresh(task)
+
+    try:
+        from tasks.worker import enqueue_task
+        enqueue_task(task.id)
+    except Exception as e:
+        logger.warning(f"Failed to enqueue task {task.id} to Redis: {e}")
+
     return task
 
 

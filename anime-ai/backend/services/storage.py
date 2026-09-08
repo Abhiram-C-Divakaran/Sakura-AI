@@ -37,6 +37,21 @@ class StorageObjectNotFoundError(Exception):
     pass
 
 
+class StoragePermissionError(StorageSecurityError):
+    """Raised when storage access is denied due to permissions."""
+    pass
+
+
+class StorageAuthenticationError(StorageSecurityError):
+    """Raised when storage credentials or authentication fail."""
+    pass
+
+
+class StorageTimeoutError(Exception):
+    """Raised when storage backend connection or read times out."""
+    pass
+
+
 # Exception aliases for compatibility
 StoragePathTraversalError = StorageSecurityError
 StorageNotFoundError = StorageObjectNotFoundError
@@ -117,6 +132,11 @@ class StorageBackend(ABC):
     @abstractmethod
     def get_bytes(self, storage_key: str) -> bytes:
         """Returns the full binary contents of the stored object."""
+        pass
+
+    @abstractmethod
+    def read_prefix(self, storage_key: str, max_bytes: int) -> bytes:
+        """Reads up to max_bytes from the beginning of the object."""
         pass
 
     @abstractmethod
@@ -242,6 +262,13 @@ class LocalFilesystemStorage(StorageBackend):
             raise StorageObjectNotFoundError(f"Storage object '{storage_key}' not found at {file_path}")
         with open(file_path, "rb") as f:
             return f.read()
+
+    def read_prefix(self, storage_key: str, max_bytes: int) -> bytes:
+        file_path = self._resolve_key_path(storage_key)
+        if not os.path.exists(file_path):
+            raise StorageObjectNotFoundError(f"Storage object '{storage_key}' not found at {file_path}")
+        with open(file_path, "rb") as f:
+            return f.read(max(0, max_bytes))
 
     def exists(self, storage_key: str) -> bool:
         file_path = self._resolve_key_path(storage_key)
@@ -423,7 +450,31 @@ class S3CompatibleStorage(StorageBackend):
             resp = client.get_object(Bucket=self.bucket_name, Key=norm_key)
             return resp["Body"].read()
         except Exception as e:
+            err_str = str(e)
+            if "NoSuchKey" in err_str or "404" in err_str:
+                raise StorageObjectNotFoundError(f"S3 error retrieving '{norm_key}': {e}")
+            if "AccessDenied" in err_str or "403" in err_str:
+                raise StoragePermissionError(f"Access denied to S3 object '{norm_key}': {e}")
+            if "Timeout" in err_str or "ConnectTimeoutError" in err_str:
+                raise StorageTimeoutError(f"S3 timeout reading '{norm_key}': {e}")
             raise StorageObjectNotFoundError(f"S3 error retrieving '{norm_key}': {e}")
+
+    def read_prefix(self, storage_key: str, max_bytes: int) -> bytes:
+        client = self._get_client()
+        norm_key = storage_key.replace("\\", "/").lstrip("/")
+        try:
+            range_header = f"bytes=0-{max(0, max_bytes - 1)}"
+            resp = client.get_object(Bucket=self.bucket_name, Key=norm_key, Range=range_header)
+            return resp["Body"].read()
+        except Exception as e:
+            err_str = str(e)
+            if "NoSuchKey" in err_str or "404" in err_str:
+                raise StorageObjectNotFoundError(f"Object '{norm_key}' not found in S3: {e}")
+            if "AccessDenied" in err_str or "403" in err_str:
+                raise StoragePermissionError(f"Access denied to S3 object '{norm_key}': {e}")
+            if "Timeout" in err_str or "ConnectTimeoutError" in err_str:
+                raise StorageTimeoutError(f"S3 timeout reading '{norm_key}': {e}")
+            raise
 
     def exists(self, storage_key: str) -> bool:
         client = self._get_client()

@@ -279,6 +279,55 @@ class WorkspaceSecurity:
         if not (re.match(https_pattern, url) or re.match(ssh_pattern, url)):
             raise SecurityException("Repository URL must be a valid HTTPS or SSH Git URL.")
 
+        # SSRF Protection: extract hostname and check for private / loopback / link-local / metadata targets
+        import urllib.parse
+        import ipaddress
+        import socket
+
+        hostname = None
+        if lower_url.startswith("https://"):
+            try:
+                parsed = urllib.parse.urlparse(url)
+                hostname = parsed.hostname
+            except Exception as e:
+                raise SecurityException(f"Invalid URL structure: {e}")
+        elif lower_url.startswith("git@"):
+            # Format: git@hostname:repo/path.git
+            match = re.match(r"^git@([a-zA-Z0-9._~%-]+):", url)
+            if match:
+                hostname = match.group(1)
+
+        if not hostname:
+            raise SecurityException("Could not extract valid hostname from repository URL.")
+
+        lower_host = hostname.lower().strip()
+        blocked_hostnames = {
+            "localhost",
+            "metadata.google.internal",
+            "169.254.169.254",
+            "instance-data",
+        }
+        if lower_host in blocked_hostnames or lower_host.endswith(".local") or lower_host.endswith(".internal"):
+            raise SecurityException(f"Repository URL host '{hostname}' is not permitted (SSRF protection).")
+
+        # Check if hostname is an IP directly
+        try:
+            ip = ipaddress.ip_address(lower_host)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                raise SecurityException(f"Repository URL IP '{hostname}' is not permitted (SSRF protection).")
+        except ValueError:
+            # Not an IP literal; check DNS resolution if available
+            try:
+                addr_info = socket.getaddrinfo(lower_host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+                for entry in addr_info:
+                    ip_str = entry[4][0]
+                    ip = ipaddress.ip_address(ip_str)
+                    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                        raise SecurityException(f"Repository URL host '{hostname}' resolves to private/restricted IP (SSRF protection).")
+            except (socket.gaierror, socket.herror):
+                # If DNS resolution fails (e.g. offline dev/unit tests), allow if domain name conforms to public FQDN syntax
+                pass
+
     @staticmethod
     def validate_branch_name(branch: str) -> None:
         """

@@ -93,9 +93,13 @@ class DurableTaskWorker:
         recovered_count = 0
         now = utc_now()
         with get_db_context() as db:
+            from sqlalchemy import or_
             stale_tasks = db.query(BackgroundTask).filter(
                 BackgroundTask.status.in_(["Running", "Starting"]),
-                BackgroundTask.lease_expires_at < now
+                or_(
+                    BackgroundTask.lease_expires_at.is_(None),
+                    BackgroundTask.lease_expires_at < now
+                )
             ).all()
 
             for task in stale_tasks:
