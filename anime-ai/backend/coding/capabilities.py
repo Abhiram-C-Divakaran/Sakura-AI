@@ -5,6 +5,7 @@ atomic one-time nonce replay protection, replacing direct database lookups
 inside the sandbox executor service.
 """
 
+from __future__ import annotations
 import os
 import time
 import json
@@ -13,7 +14,7 @@ import hmac
 import base64
 import hashlib
 import logging
-from typing import Optional, Dict, Any, Union, List
+from typing import Optional, Dict, Any, Union, List, Set
 
 logger = logging.getLogger("sakura.coding.capabilities")
 
