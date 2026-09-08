@@ -4,6 +4,7 @@ import Head from 'next/head';
 import Link from 'next/link';
 import { SakuraLogo } from '../../components/SakuraLogo';
 import { Loader2, ArrowLeft, MessageSquare, AlertCircle } from 'lucide-react';
+import { apiUrl } from '../../lib/api';
 
 interface SharedMessage {
   id: string;
@@ -26,8 +27,6 @@ export default function SharedConversationPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-
   useEffect(() => {
     if (!token || typeof token !== 'string') return;
 
@@ -35,7 +34,7 @@ export default function SharedConversationPage() {
       try {
         setLoading(true);
         setError(null);
-        const res = await fetch(`${apiBase}/api/v1/share/${token}`);
+        const res = await fetch(apiUrl(`/api/v1/share/${token}`));
         if (!res.ok) {
           throw new Error('This shared conversation has expired or was removed.');
         }
@@ -49,7 +48,7 @@ export default function SharedConversationPage() {
     };
 
     fetchShared();
-  }, [token, apiBase]);
+  }, [token]);
 
   return (
     <div className="min-h-screen bg-[#0D0D0D] text-[#ECECEC] flex flex-col font-sans select-text">

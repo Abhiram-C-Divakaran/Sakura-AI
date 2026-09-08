@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useImperativeHandle, forwardRef } from 'react';
 import { SakuraLogo } from './SakuraLogo';
 import { authFetch } from '../lib/auth';
+import { API_BASE } from '../lib/api';
 
 export interface VoiceRecorderProps {
   onTranscriptionComplete: (text: string) => void;
@@ -18,7 +19,7 @@ type PermissionStatus = 'UNKNOWN' | 'REQUESTING' | 'ALLOWED' | 'DENIED' | 'UNAVA
 
 export const VoiceRecorder = forwardRef<VoiceRecorderHandle, VoiceRecorderProps>(({
   onTranscriptionComplete,
-  apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000',
+  apiBase = API_BASE,
   className = ''
 }, ref) => {
   const [isRecording, setIsRecording] = useState(false);

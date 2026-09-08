@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { X, Download, Eye, Paperclip, FileText, Image as ImageIcon, Code, FileSpreadsheet, Film } from 'lucide-react';
 import { authFetch } from '../lib/auth';
+import { API_BASE } from '../lib/api';
 
 export interface ConversationFile {
   id: string;
@@ -30,7 +31,7 @@ export const ConversationFilesSheet: React.FC<ConversationFilesSheetProps> = ({
   conversationId,
   conversationTitle = 'Chat',
   onAttachToChat,
-  apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+  apiBase = API_BASE
 }) => {
   const [files, setFiles] = useState<ConversationFile[]>([]);
   const [loading, setLoading] = useState(false);

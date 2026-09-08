@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { authFetch } from '../lib/auth';
+import { API_BASE } from '../lib/api';
 
 export interface AppConnector {
   id: string;
@@ -116,7 +117,7 @@ interface ConnectAppsModalProps {
 export const ConnectAppsModal: React.FC<ConnectAppsModalProps> = ({
   isOpen,
   onClose,
-  apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+  apiBase = API_BASE
 }) => {
   const [connectors, setConnectors] = useState<AppConnector[]>(DEFAULT_CONNECTORS);
   const [loading, setLoading] = useState(false);

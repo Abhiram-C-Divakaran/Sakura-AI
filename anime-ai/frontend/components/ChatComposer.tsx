@@ -6,6 +6,7 @@ import { FileLibraryModal, LibraryDocument } from './FileLibraryModal';
 import { ConnectAppsModal } from './ConnectAppsModal';
 import { AttachmentChips, AttachmentItem, ActiveMode } from './AttachmentChips';
 import { authFetch } from '../lib/auth';
+import { API_BASE } from '../lib/api';
 
 export interface ChatSubmitPayload {
   message: string;
@@ -42,7 +43,7 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
   isGenerating = false,
   documents = [],
   onRefreshDocuments,
-  apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000',
+  apiBase = API_BASE,
   placeholder = 'Ask Sakura AI',
   externalAttachment = null,
   onClearExternalAttachment,

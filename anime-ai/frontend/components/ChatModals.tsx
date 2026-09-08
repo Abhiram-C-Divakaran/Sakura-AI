@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { authFetch } from '../lib/auth';
+import { API_BASE } from '../lib/api';
 
 interface ShareModalProps {
   isOpen: boolean;
@@ -14,7 +15,7 @@ export const ShareModal: React.FC<ShareModalProps> = ({
   onClose, 
   chatTitle, 
   chatId,
-  apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+  apiBase = API_BASE
 }) => {
   const [copied, setCopied] = useState(false);
   const [shareUrl, setShareUrl] = useState<string>('');

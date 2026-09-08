@@ -4,6 +4,7 @@ import {
   AlertCircle, Loader2, Calendar, Search, MoreHorizontal, ArrowRight
 } from 'lucide-react';
 import { getAccessToken, authFetch } from '../lib/auth';
+import { API_BASE } from '../lib/api';
 
 interface ScheduledTask {
   id: string;
@@ -24,7 +25,7 @@ interface ScheduledViewProps {
 }
 
 export const ScheduledView: React.FC<ScheduledViewProps> = ({
-  apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+  apiBase = API_BASE
 }) => {
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
   const [loading, setLoading] = useState(true);

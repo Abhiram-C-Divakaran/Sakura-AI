@@ -3,6 +3,7 @@ import { FilePreviewModal, LibraryFile } from './FilePreviewModal';
 import { CreateDocumentModal } from './CreateDocumentModal';
 import { GenerateImageModal } from './GenerateImageModal';
 import { getAccessToken, authFetch } from '../lib/auth';
+import { API_BASE } from '../lib/api';
 
 interface LibraryViewProps {
   onAttachToChat: (file: LibraryFile) => void;
@@ -18,7 +19,7 @@ type ViewMode = 'list' | 'grid';
 export const LibraryView: React.FC<LibraryViewProps> = ({
   onAttachToChat,
   onNavigateToChat,
-  apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+  apiBase = API_BASE
 }) => {
   const [files, setFiles] = useState<LibraryFile[]>([]);
   const [loading, setLoading] = useState(true);

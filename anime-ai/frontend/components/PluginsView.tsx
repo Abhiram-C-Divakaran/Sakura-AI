@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import { ConnectAppsModal } from './ConnectAppsModal';
 import { authFetch } from '../lib/auth';
+import { API_BASE } from '../lib/api';
 
 export interface IntegrationStatus {
   id: string;
@@ -67,7 +68,7 @@ interface PluginsViewProps {
 }
 
 export const PluginsView: React.FC<PluginsViewProps> = ({
-  apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+  apiBase = API_BASE
 }) => {
   const [integrations, setIntegrations] = useState<IntegrationStatus[]>([]);
   const [capabilities, setCapabilities] = useState<CapabilitiesResponse | null>(null);

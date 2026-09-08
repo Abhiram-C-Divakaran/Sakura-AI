@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { authFetch } from '../lib/auth';
+import { API_BASE } from '../lib/api';
 
 export interface LibraryFile {
   id: string;
@@ -38,7 +39,7 @@ export const FilePreviewModal: React.FC<FilePreviewModalProps> = ({
   onToggleKnowledgeBase,
   onDeleteFile,
   onRenameFile,
-  apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+  apiBase = API_BASE
 }) => {
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);

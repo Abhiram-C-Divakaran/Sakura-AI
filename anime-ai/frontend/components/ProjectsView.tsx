@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { SakuraLogo } from './SakuraLogo';
 import { getAccessToken, authFetch } from '../lib/auth';
+import { API_BASE } from '../lib/api';
 
 interface Repository {
   id: string;
@@ -50,7 +51,7 @@ interface ProjectsViewProps {
 }
 
 export const ProjectsView: React.FC<ProjectsViewProps> = ({
-  apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000',
+  apiBase = API_BASE,
   onNavigateToChat
 }) => {
   const [projects, setProjects] = useState<ProjectItem[]>([]);
