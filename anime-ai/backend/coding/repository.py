@@ -61,10 +61,11 @@ class WorkspaceManager:
                 branch=branch,
                 ttl_seconds=180
             )
-            clone_res = await executor.run_command(
-                clone_cmd,
-                allow_network=True,
-                network_capability=clone_capability
+            clone_res = await executor.clone_repository(
+                repository_url=repository_url,
+                branch=branch,
+                capability_token=clone_capability,
+                timeout_seconds=180
             )
             if not clone_res["success"]:
                 status = "ERROR"

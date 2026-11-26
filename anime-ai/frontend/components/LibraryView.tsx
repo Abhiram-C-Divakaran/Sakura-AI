@@ -4,6 +4,7 @@ import { CreateDocumentModal } from './CreateDocumentModal';
 import { GenerateImageModal } from './GenerateImageModal';
 import { getAccessToken, authFetch } from '../lib/auth';
 import { API_BASE } from '../lib/api';
+import { useRealtime } from '../hooks/useRealtime';
 
 interface LibraryViewProps {
   onAttachToChat: (file: LibraryFile) => void;
@@ -98,39 +99,23 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     fetchFiles();
   }, [fetchFiles]);
 
-  // Connect WebSocket for real-time multi-device sync
-  useEffect(() => {
-    const token = getAccessToken();
-    if (!token) return;
-
-    const wsUrl = apiBase.replace('http', 'ws') + '/api/v1/ws?token=' + token;
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
-
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'library_update') {
-          const { action, data } = msg;
-          if (action === 'created') {
-            setFiles((prev) => [data, ...prev.filter((f) => f.id !== data.id)]);
-          } else if (action === 'updated') {
-            setFiles((prev) => prev.map((f) => (f.id === data.id ? { ...f, ...data } : f)));
-            setPreviewFile((curr) => (curr && curr.id === data.id ? { ...curr, ...data } : curr));
-          } else if (action === 'deleted') {
-            setFiles((prev) => prev.filter((f) => f.id !== data.id));
-            setPreviewFile((curr) => (curr && curr.id === data.id ? null : curr));
-          }
+  // Connect ticket-authenticated WebSocket for real-time multi-device sync
+  useRealtime({
+    onMessage: (msg: any) => {
+      if (msg?.type === 'library_update') {
+        const { action, data } = msg;
+        if (action === 'created') {
+          setFiles((prev) => [data, ...prev.filter((f) => f.id !== data.id)]);
+        } else if (action === 'updated') {
+          setFiles((prev) => prev.map((f) => (f.id === data.id ? { ...f, ...data } : f)));
+          setPreviewFile((curr) => (curr && curr.id === data.id ? { ...curr, ...data } : curr));
+        } else if (action === 'deleted') {
+          setFiles((prev) => prev.filter((f) => f.id !== data.id));
+          setPreviewFile((curr) => (curr && curr.id === data.id ? null : curr));
         }
-      } catch {}
-    };
-
-    return () => {
-      try {
-        ws.close();
-      } catch {}
-    };
-  }, [apiBase]);
+      }
+    },
+  });
 
   // Close menus on outside click
   useEffect(() => {

@@ -368,9 +368,50 @@ import hashlib
 
 
 def compute_command_hash(command: Union[str, List[str]]) -> str:
-    """Computes SHA-256 hash of canonical command string for server-authoritative authorization."""
-    cmd_str = " ".join(command) if isinstance(command, list) else str(command)
-    return hashlib.sha256(cmd_str.strip().encode("utf-8")).hexdigest()
+    """Computes SHA-256 hash of canonical command string or argument list (unified with capabilities)."""
+    from coding.capabilities import compute_command_hash as _cap_hash
+    return _cap_hash(command)
+
+
+_SENSITIVE_KEY_MARKERS = (
+    "api_key", "apikey", "secret", "password", "passwd", "token",
+    "authorization", "capability", "cookie", "jwt", "private_key", "credential"
+)
+
+_SENSITIVE_VALUE_PATTERNS = [
+    (re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9\-._~+/]+=*"), r"\1[REDACTED]"),
+    (re.compile(r"\b(sk-[A-Za-z0-9_\-]{12,}|gsk_[A-Za-z0-9_\-]{12,}|ghp_[A-Za-z0-9]{16,}|gho_[A-Za-z0-9]{16,}|AIza[0-9A-Za-z\-_]{20,})\b"), "[REDACTED]"),
+    (re.compile(r"\b[A-Za-z0-9_-]{32,}\.[0-9a-f]{64}\b"), "[REDACTED_CAPABILITY]"),
+    (re.compile(r"(?i)(password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|x-sandbox-token)(\s*[:=]\s*)([^\s\"',;&]+)"), r"\1\2[REDACTED]"),
+]
+
+
+def redact_sensitive_text(text: Optional[str]) -> Optional[str]:
+    """Redacts secrets, API keys, bearer tokens, passwords, and capability tokens from text."""
+    if not text or not isinstance(text, str):
+        return text
+    redacted = text
+    for pattern, repl in _SENSITIVE_VALUE_PATTERNS:
+        redacted = pattern.sub(repl, redacted)
+    return redacted
+
+
+def redact_sensitive_data(obj: Any) -> Any:
+    """Recursively redacts sensitive fields and token patterns from structured dicts/lists."""
+    if isinstance(obj, dict):
+        sanitized = {}
+        for k, v in obj.items():
+            k_lower = str(k).lower()
+            if any(marker in k_lower for marker in _SENSITIVE_KEY_MARKERS):
+                sanitized[k] = "[REDACTED]"
+            else:
+                sanitized[k] = redact_sensitive_data(v)
+        return sanitized
+    if isinstance(obj, list):
+        return [redact_sensitive_data(item) for item in obj]
+    if isinstance(obj, str):
+        return redact_sensitive_text(obj)
+    return obj
 
 
 class NetworkAccessPolicy:
@@ -450,11 +491,53 @@ class NetworkAccessPolicy:
         # Atomic CAS consumption: exactly one concurrent consumer can consume
         rows = db.query(SandboxNetworkAuthorization).filter(
             SandboxNetworkAuthorization.id == auth.id,
-            SandboxNetworkAuthorization.consumed_at.is_(None)
-        ).update({"consumed_at": now})
+            SandboxNetworkAuthorization.consumed_at.is_(None),
+            SandboxNetworkAuthorization.expires_at > now
+        ).update({"consumed_at": now}, synchronize_session=False)
         db.commit()
 
         return rows > 0
+
+    @staticmethod
+    def authorize_and_mint_capability(
+        db,
+        auth_id: Union[str, uuid.UUID],
+        user_id: Union[str, uuid.UUID],
+        workspace_id: Union[str, uuid.UUID],
+        command: Union[str, List[str]],
+        ttl_seconds: int = 60
+    ) -> str:
+        """
+        Full backend network authorization lifecycle:
+        1. Verifies ownership (user_id), workspace_id, exact command hash, expiry, non-consumed.
+        2. Atomically consumes the DB authorization record (one-time use).
+        3. Mints a short-lived HMAC-signed 'network_exec' capability bound to workspace & command.
+        Raises SecurityException on any validation failure.
+        """
+        if not db or not user_id or not workspace_id or not auth_id:
+            raise SecurityException("Network authorization verification requires authenticated user, workspace, and authorization ID.")
+
+        valid = NetworkAccessPolicy.verify_and_consume_authorization(
+            db=db,
+            auth_id=auth_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            command=command
+        )
+        if not valid:
+            raise SecurityException(
+                "Network authorization denied: authorization is invalid, expired, already consumed, "
+                "or does not match user, workspace, or exact command."
+            )
+
+        from coding.capabilities import mint_sandbox_capability
+        return mint_sandbox_capability(
+            workspace_id=str(workspace_id),
+            command=command,
+            scope="network_exec",
+            authorization_id=str(auth_id),
+            ttl_seconds=ttl_seconds
+        )
 
 
 build_safe_child_environment = WorkspaceSecurity.build_safe_child_environment

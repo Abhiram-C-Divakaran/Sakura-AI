@@ -13,9 +13,18 @@ class CodingToolchain:
     inside an isolated workspace.
     """
 
-    def __init__(self, workspace_root: str):
+    def __init__(
+        self,
+        workspace_root: str,
+        workspace_id: Optional[str] = None,
+        db=None,
+        user_id=None
+    ):
         self.workspace_root = os.path.realpath(os.path.abspath(workspace_root))
-        self.executor = SandboxExecutor(self.workspace_root)
+        self.workspace_id = str(workspace_id) if workspace_id else os.path.basename(self.workspace_root)
+        self.db = db
+        self.user_id = user_id
+        self.executor = SandboxExecutor(self.workspace_root, workspace_id=self.workspace_id)
         self.git = GitManager(self.workspace_root)
         self.searcher = CodeSearchEngine(self.workspace_root)
         self.patcher = FilePatcher(self.workspace_root)
@@ -183,9 +192,44 @@ class CodingToolchain:
         network_authorization_id: Optional[str] = None,
         network_capability: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Runs a safe shell command inside workspace."""
+        """Runs a safe shell command inside workspace with verified signed network capabilities."""
         from coding.security import NetworkAccessPolicy
-        if NetworkAccessPolicy.requires_network_authorization(command) and not (network_authorization_id or network_capability):
+        signed_capability = network_capability
+
+        if network_authorization_id and not signed_capability:
+            try:
+                if self.db is not None:
+                    signed_capability = NetworkAccessPolicy.authorize_and_mint_capability(
+                        db=self.db,
+                        auth_id=network_authorization_id,
+                        user_id=self.user_id,
+                        workspace_id=self.workspace_id,
+                        command=command
+                    )
+                else:
+                    from database.db import get_db_context
+                    with get_db_context() as db_ctx:
+                        signed_capability = NetworkAccessPolicy.authorize_and_mint_capability(
+                            db=db_ctx,
+                            auth_id=network_authorization_id,
+                            user_id=self.user_id,
+                            workspace_id=self.workspace_id,
+                            command=command
+                        )
+            except SecurityException as e:
+                return {
+                    "success": False,
+                    "tool": "run_command",
+                    "command": command,
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"Security Error: {str(e)}",
+                    "duration_ms": 0,
+                    "timed_out": False,
+                    "blocked": True
+                }
+
+        if (allow_network or NetworkAccessPolicy.requires_network_authorization(command)) and not signed_capability:
             return {
                 "success": False,
                 "tool": "run_command",
@@ -205,9 +249,9 @@ class CodingToolchain:
             cwd_relative=cwd,
             timeout_seconds=timeout,
             tool_name="run_command",
-            allow_network=allow_network or bool(network_authorization_id or network_capability),
-            network_authorization_id=network_authorization_id,
-            network_capability=network_capability
+            allow_network=bool(signed_capability),
+            network_authorization_id=None,
+            network_capability=signed_capability
         )
 
     async def run_tests(self, command: str = "npm test", timeout: int = 120) -> Dict[str, Any]:

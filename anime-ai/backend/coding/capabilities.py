@@ -14,6 +14,7 @@ import hmac
 import base64
 import hashlib
 import logging
+import threading
 from typing import Optional, Dict, Any, Union, List, Set
 
 logger = logging.getLogger("sakura.coding.capabilities")
@@ -23,11 +24,13 @@ DEFAULT_CAPABILITY_TTL_SECONDS = 60
 
 # In-memory fallback nonce set for test/dev when Redis is unavailable
 _LOCAL_NONCE_CACHE: Dict[str, float] = {}
+_LOCAL_NONCE_LOCK = threading.Lock()
 
 
 def clear_consumed_capabilities() -> None:
     """Clears local nonce cache for test isolation."""
-    _LOCAL_NONCE_CACHE.clear()
+    with _LOCAL_NONCE_LOCK:
+        _LOCAL_NONCE_CACHE.clear()
 
 
 class CapabilityError(Exception):
@@ -141,9 +144,16 @@ def decode_capability_payload(capability_token: str) -> Dict[str, Any]:
         raise CapabilityError(f"Failed to decode capability payload: {e}") from e
 
 
-def _consume_nonce_redis(nonce: str, ttl_seconds: int) -> bool:
-    """Attempts atomic nonce consumption in Redis via SET NX EX."""
+def _consume_nonce_redis(nonce: str, ttl_seconds: int) -> Optional[bool]:
+    """
+    Attempts atomic nonce consumption in Redis via SET NX EX.
+    Returns:
+      - True: nonce was freshly stored (valid first use)
+      - False: nonce already existed in Redis (REPLAY — must fail closed!)
+      - None: Redis is unreachable/unavailable
+    """
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    client = None
     try:
         import redis
         client = redis.from_url(redis_url, socket_connect_timeout=0.5, socket_timeout=0.5)
@@ -152,32 +162,45 @@ def _consume_nonce_redis(nonce: str, ttl_seconds: int) -> bool:
         return bool(res)
     except Exception as e:
         logger.debug(f"Redis capability nonce check unavailable: {e}")
-        return False
+        return None
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 def _consume_nonce_memory(nonce: str, expires_at: float) -> bool:
-    """Fallback in-memory nonce cache for dev/test environments."""
+    """Thread-safe fallback in-memory nonce cache for dev/test when Redis is unavailable."""
     now = time.time()
-    # Prune expired nonces
-    expired = [k for k, exp in _LOCAL_NONCE_CACHE.items() if exp < now]
-    for k in expired:
-        _LOCAL_NONCE_CACHE.pop(k, None)
+    with _LOCAL_NONCE_LOCK:
+        expired = [k for k, exp in _LOCAL_NONCE_CACHE.items() if exp < now]
+        for k in expired:
+            _LOCAL_NONCE_CACHE.pop(k, None)
 
-    if nonce in _LOCAL_NONCE_CACHE:
-        return False
-    _LOCAL_NONCE_CACHE[nonce] = expires_at
-    return True
+        if nonce in _LOCAL_NONCE_CACHE:
+            return False
+        _LOCAL_NONCE_CACHE[nonce] = expires_at
+        return True
 
 
 def consume_nonce(nonce: str, expires_at: float) -> bool:
-    """Atomically consumes capability nonce, prioritizing Redis in production."""
+    """
+    Atomically consumes capability nonce, prioritizing Redis.
+    If Redis explicitly reports a replay (False), NEVER fall through to memory.
+    In production, fails closed if Redis is unavailable.
+    """
     ttl_seconds = max(int(expires_at - time.time()), 1)
     env = os.getenv("ENVIRONMENT", "development").lower()
     is_prod = env in ["production", "prod"]
 
-    consumed = _consume_nonce_redis(nonce, ttl_seconds)
-    if consumed:
+    redis_result = _consume_nonce_redis(nonce, ttl_seconds)
+    if redis_result is True:
         return True
+    if redis_result is False:
+        # Definite replay detected in Redis — never fall back to local cache
+        return False
 
     if is_prod:
         # In production, require Redis atomic state for multiple executor replicas
@@ -252,8 +275,9 @@ def verify_and_consume_capability(
         if actual_repo_hash != expected_repo_hash:
             raise CapabilityMismatchError("Capability repository URL hash mismatch.")
 
-    if expected_branch is not None and payload.get("branch"):
-        if payload.get("branch") != expected_branch.strip():
+    if expected_branch is not None:
+        token_branch = payload.get("branch")
+        if not token_branch or str(token_branch).strip() != expected_branch.strip():
             raise CapabilityMismatchError("Capability branch mismatch.")
 
     # 7. One-time nonce consumption

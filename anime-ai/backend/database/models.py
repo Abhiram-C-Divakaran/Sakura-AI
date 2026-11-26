@@ -26,6 +26,7 @@ class User(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     username = Column(String(100), unique=True, nullable=False, index=True)
+    email = Column(String(255), nullable=True, index=True)
     hashed_password = Column(String(255), nullable=False)
     created_at = Column(DateTime(timezone=True), default=utc_now)
 
@@ -66,6 +67,7 @@ class Document(Base):
     is_knowledge_base = Column(Boolean, default=False, nullable=False, index=True)
     indexing_status = Column(String(50), default="UPLOADED", nullable=False, index=True)
     index_generation = Column(Integer, default=0, nullable=False)
+    deletion_status = Column(String(32), default="ACTIVE", nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), default=utc_now)
 
     # Relationships
@@ -376,6 +378,7 @@ class CodingTask(Base):
     verification_summary = Column(JSON, default=dict)
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
 
     workspace = relationship("RepositoryWorkspace", back_populates="tasks")
     executions = relationship("ToolExecution", back_populates="task", cascade="all, delete-orphan")
@@ -480,10 +483,12 @@ class CodingJob(Base):
     workspace_id = Column(UUID(as_uuid=True), ForeignKey("repository_workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     worker_id = Column(String(128), nullable=True)
-    execution_attempt_id = Column(UUID(as_uuid=True), nullable=True)
+    execution_attempt_id = Column(UUID(as_uuid=True), nullable=True, index=True)
     status = Column(String(64), nullable=False, default="QUEUED", index=True)  # QUEUED, RUNNING, COMPLETED_VERIFIED, COMPLETED_UNVERIFIED, FAILED, CANCELLED, BLOCKED
     instructions = Column(Text, nullable=False)
-    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    intensity = Column(String(32), default="high", nullable=False)
+    idempotency_key = Column(String(128), nullable=True, index=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
     heartbeat_at = Column(DateTime(timezone=True), nullable=True)
     cancel_requested = Column(Boolean, default=False, nullable=False)
     retry_count = Column(Integer, default=0, nullable=False)
@@ -493,6 +498,10 @@ class CodingJob(Base):
     error = Column(Text, nullable=True)
     verification_state = Column(JSON, default=dict, nullable=False)
     metadata_json = Column(JSON, default=dict, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_coding_jobs_user_idempotency"),
+    )
 
     workspace = relationship("RepositoryWorkspace")
     user = relationship("User")
@@ -540,6 +549,10 @@ class CodingTaskEvent(Base):
 
     job = relationship("CodingJob", back_populates="events")
 
+    __table_args__ = (
+        UniqueConstraint("task_id", "sequence_number", name="uq_coding_task_events_task_seq"),
+    )
+
     def to_dict(self):
         return {
             "id": str(self.id),
@@ -579,3 +592,115 @@ class WebSocketTicket(Base):
             "expiresAt": self.expires_at.isoformat() if self.expires_at else None,
             "consumedAt": self.consumed_at.isoformat() if self.consumed_at else None,
         }
+
+
+class ImageGenerationJobStatus:
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class ImageGenerationJob(Base):
+    __tablename__ = "image_generation_jobs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    prompt = Column(Text, nullable=False)
+    requested_pipeline = Column(String(64), default="auto", nullable=False)
+    actual_provider = Column(String(64), nullable=True)
+    actual_model = Column(String(128), nullable=True)
+    status = Column(String(32), default=ImageGenerationJobStatus.QUEUED, nullable=False, index=True)
+    attempt_count = Column(Integer, default=0, nullable=False)
+    max_attempts = Column(Integer, default=3, nullable=False)
+    error = Column(Text, nullable=True)
+    output_image_id = Column(UUID(as_uuid=True), ForeignKey("generated_images.id", ondelete="SET NULL"), nullable=True)
+    worker_id = Column(String(128), nullable=True)
+    execution_attempt_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    cancel_requested = Column(Boolean, default=False, nullable=False)
+    idempotency_key = Column(String(128), nullable=True, index=True)
+    parameters = Column(JSON, default=dict, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+    user = relationship("User")
+    output_image = relationship("GeneratedImage")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_image_jobs_user_idempotency"),
+    )
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "job_id": str(self.id),
+            "user_id": str(self.user_id),
+            "prompt": self.prompt,
+            "requested_pipeline": self.requested_pipeline,
+            "actual_provider": self.actual_provider,
+            "actual_model": self.actual_model,
+            "status": self.status,
+            "attempt_count": self.attempt_count,
+            "max_attempts": self.max_attempts,
+            "error": self.error,
+            "output_image_id": str(self.output_image_id) if self.output_image_id else None,
+            "cancel_requested": self.cancel_requested,
+            "parameters": self.parameters or {},
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class StorageDeletionOutbox(Base):
+    __tablename__ = "storage_deletion_outbox"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    document_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    storage_backend = Column(String(50), default="local", nullable=False)
+    storage_key = Column(String(1024), nullable=False, index=True)
+    legacy_path = Column(String(1024), nullable=True)
+    status = Column(String(32), default="PENDING", nullable=False, index=True)  # PENDING, COMPLETED, FAILED
+    attempt_count = Column(Integer, default=0, nullable=False)
+    max_attempts = Column(Integer, default=5, nullable=False)
+    last_error = Column(Text, nullable=True)
+    next_retry_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "user_id": str(self.user_id) if self.user_id else None,
+            "document_id": str(self.document_id) if self.document_id else None,
+            "storage_backend": self.storage_backend,
+            "storage_key": self.storage_key,
+            "status": self.status,
+            "attempt_count": self.attempt_count,
+            "max_attempts": self.max_attempts,
+            "last_error": self.last_error,
+            "next_retry_at": self.next_retry_at.isoformat() if self.next_retry_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+        }
+
+
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    token_hash = Column(String(128), unique=True, nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    consumed_at = Column(DateTime(timezone=True), nullable=True)
+
+    user = relationship("User")

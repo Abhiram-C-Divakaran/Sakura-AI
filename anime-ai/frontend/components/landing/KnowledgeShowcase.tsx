@@ -1,0 +1,6 @@
+import Link from 'next/link';
+import { FileText, ArrowUpRight } from 'lucide-react';
+export const KnowledgeShowcase = () => <section id="library" className="landing-section landing-container landing-knowledge">
+  <div><p className="landing-eyebrow">YOUR KNOWLEDGE</p><h2>Bring your files into<br />the conversation.</h2><p className="landing-body">Upload supported documents, code, and notes. Ask Sakura to summarize, explain, and work with the information you provide.</p><p className="landing-note">Search uses the retrieval tools available in your workspace. Uploading a file does not automatically turn it into memory.</p><Link className="landing-text-link" href="/chat">Explore your library <ArrowUpRight size={16} /></Link></div>
+  <div className="landing-library"><div className="landing-preview-label">Library · Illustrative preview</div><table><thead><tr><th>Filename</th><th>Type</th><th>Status</th></tr></thead><tbody>{[['research.pdf','Document','Ready'],['project-notes.md','Markdown','Ready'],['architecture.ts','Code','Uploaded']].map(([name,type,status]) => <tr key={name}><td><FileText size={16} />{name}</td><td>{type}</td><td><span className={status === 'Ready' ? 'landing-ready' : ''}>{status}</span></td></tr>)}</tbody></table></div>
+</section>;

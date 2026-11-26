@@ -83,7 +83,7 @@ class SandboxExecutor:
                 tool_name=tool_name,
                 allow_network=allow_network,
                 network_authorization_id=network_authorization_id,
-                network_capability=network_capability or network_authorization_id
+                network_capability=network_capability
             )
             if "timed_out" not in res:
                 res["timed_out"] = False
@@ -93,6 +93,80 @@ class SandboxExecutor:
                 "success": False,
                 "tool": tool_name,
                 "command": cmd_display,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Sandbox Unavailable: {str(e)}",
+                "error": str(e),
+                "duration_ms": 0,
+                "timed_out": False,
+                "blocked": True,
+                "isolation_unavailable": True
+            }
+
+    async def clone_repository(
+        self,
+        repository_url: str,
+        branch: str,
+        capability_token: str,
+        timeout_seconds: int = 120
+    ) -> Dict[str, Any]:
+        """Executes a repository clone bound to a signed repository_clone capability."""
+        clone_cmd = ["git", "clone", "--depth", "1", "--branch", branch, repository_url, "."]
+        try:
+            runtime = self.runtime
+            from coding.sandbox import RemoteHttpSandboxRuntime, DockerSandboxRuntime
+            if isinstance(runtime, RemoteHttpSandboxRuntime):
+                return await runtime.clone_repository(
+                    repository_url=repository_url,
+                    branch=branch,
+                    capability_token=capability_token,
+                    timeout_seconds=timeout_seconds
+                )
+            if isinstance(runtime, DockerSandboxRuntime):
+                return await runtime.run_command(
+                    command=clone_cmd,
+                    timeout_seconds=timeout_seconds,
+                    tool_name="repository_clone",
+                    allow_network=True,
+                    network_capability=capability_token,
+                    expected_scope="repository_clone",
+                    expected_repository_url=repository_url,
+                    expected_branch=branch
+                )
+            from coding.capabilities import verify_and_consume_capability, CapabilityError
+            try:
+                verify_and_consume_capability(
+                    capability_token=capability_token,
+                    expected_scope="repository_clone",
+                    expected_workspace_id=self.workspace_id,
+                    expected_command=clone_cmd,
+                    expected_repository_url=repository_url,
+                    expected_branch=branch
+                )
+            except CapabilityError as e:
+                return {
+                    "success": False,
+                    "tool": "repository_clone",
+                    "command": " ".join(clone_cmd),
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"Security Error: Repository clone blocked ({str(e)}).",
+                    "duration_ms": 0,
+                    "timed_out": False,
+                    "blocked": True
+                }
+            return await runtime.run_command(
+                command=clone_cmd,
+                timeout_seconds=timeout_seconds,
+                tool_name="repository_clone",
+                allow_network=True,
+                network_capability=capability_token
+            )
+        except SandboxUnavailableError as e:
+            return {
+                "success": False,
+                "tool": "repository_clone",
+                "command": " ".join(clone_cmd),
                 "exit_code": -1,
                 "stdout": "",
                 "stderr": f"Sandbox Unavailable: {str(e)}",

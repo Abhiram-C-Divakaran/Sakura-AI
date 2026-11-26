@@ -20,6 +20,8 @@ class TestCodingDurableJobs(unittest.TestCase):
 
     def setUp(self):
         with get_db_context() as db:
+            db.query(CodingTaskEvent).delete()
+            db.query(CodingJob).delete()
             self.user_id = uuid.uuid4()
             self.user = User(
                 id=self.user_id,

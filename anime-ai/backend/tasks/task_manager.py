@@ -925,6 +925,7 @@ async def execute_document_index(
 
     except Exception as e:
         logger.error(f"Failed to parse document {doc_uuid}: {e}", exc_info=True)
+        serialized = None
         with get_db_context() as db:
             d = db.query(Document).filter(Document.id == doc_uuid).first()
             if d:
@@ -934,7 +935,8 @@ async def execute_document_index(
                 db.commit()
                 db.refresh(d)
                 serialized = serialize_document(d)
-        await ws_manager.send_to_user(str(user_id), {"type": "library_update", "action": "updated", "data": serialized})
+        if serialized is not None:
+            await ws_manager.send_to_user(str(user_id), {"type": "library_update", "action": "updated", "data": serialized})
         await update_task_state(task_id, "Failed", 100, error=str(e), ctx=ctx)
         return
 

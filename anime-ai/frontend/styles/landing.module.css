@@ -1,0 +1,106 @@
+.page {
+  min-height: 100vh;
+  background: #030407;
+  color: #f6f6f7;
+  font-family: Inter, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.hero {
+  position: relative;
+  width: 100%;
+  min-height: 44.44vw;
+  aspect-ratio: 2.25 / 1;
+  overflow: hidden;
+  isolation: isolate;
+}
+.artwork {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: url('/branding/sakura-cinematic-hero.png') center / 100% 100% no-repeat;
+}
+.header {
+  display: flex;
+  align-items: center;
+  padding: 2.2vw 8.2% 0 5.6%;
+  gap: 3vw;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  white-space: nowrap;
+  font-size: clamp(18px, 1.32vw, 28px);
+  font-weight: 600;
+  letter-spacing: -.04em;
+}
+.navigation {
+  display: flex;
+  align-items: center;
+  gap: 2.15vw;
+  margin-left: 4.9vw;
+  font-size: clamp(12px, 1vw, 21px);
+  white-space: nowrap;
+}
+.signIn {
+  margin-left: auto;
+  white-space: nowrap;
+  font-size: clamp(14px, 1.1vw, 23px);
+  font-weight: 600;
+  color: #160c12;
+}
+.header a { text-decoration: none; transition: color .2s ease; }
+.header a:hover { color: #ff5f8f; }
+.header a:focus-visible { outline: 2px solid #ff5f8f; outline-offset: 7px; border-radius: 2px; }
+.copy { position: absolute; top: 26.8%; left: 5.8%; }
+.eyebrow {
+  color: #ff5f8f;
+  font-size: clamp(12px, 1.08vw, 23px);
+  letter-spacing: .17em;
+  font-weight: 600;
+  margin: 0 0 1.55vw;
+}
+.copy h1 {
+  font-family: Inter, Arial, sans-serif;
+  font-size: clamp(36px, 3.85vw, 84px);
+  font-weight: 750;
+  line-height: 1.1;
+  letter-spacing: -.035em;
+  margin: 0;
+}
+.copy h1 span { color: #ff5f8f; }
+.description {
+  font-size: clamp(14px, 1.3vw, 28px);
+  line-height: 1.55;
+  color: #e6e6e9;
+  margin: 1.55vw 0 0;
+  letter-spacing: -.02em;
+}
+@media (max-width: 1050px) {
+  .header { gap: 22px; padding-right: 5.6%; }
+  .navigation { gap: 18px; margin-left: auto; }
+  .brand { gap: 8px; }
+  .brand img { width: 28px !important; height: 28px !important; }
+  .signIn { margin-left: 0; }
+}
+@media (max-width: 760px) {
+  .hero { aspect-ratio: auto; min-height: 100svh; }
+  .header { padding: 24px 6%; flex-wrap: wrap; gap: 24px; }
+  .brand { font-size: 22px; }
+  .signIn { margin-left: auto; color: #f6f6f7; }
+  .navigation { order: 3; width: 100%; margin: 0; gap: 12px 22px; flex-wrap: wrap; font-size: 12px; }
+  .artwork { background-size: auto 65%; background-position: 70% bottom; }
+  .artwork::after { content: ''; position: absolute; inset: 0; background: linear-gradient(#030407 20%, transparent 65%); }
+  .copy { top: 175px; left: 6%; right: 6%; }
+  .eyebrow { font-size: 11px; margin-bottom: 22px; }
+  .copy h1 { font-size: clamp(28px, 6.6vw, 50px); }
+  .description { max-width: 440px; font-size: 15px; margin-top: 22px; }
+  .desktopBreak { display: none; }
+}
+@media (min-width: 761px) and (max-width: 1050px) {
+  .navigation { margin-left: 4vw; gap: 18px; }
+  .signIn { margin-left: auto; }
+}
+@media (min-width: 761px) {
+  .artwork { mask-image: linear-gradient(to bottom, #000 93%, transparent 100%); }
+}

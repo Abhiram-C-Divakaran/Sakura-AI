@@ -5,6 +5,7 @@ audio transcription, GitHub integrations, web search, image generation, and conf
 Never returns hard-coded fake "Active" statuses.
 """
 import os
+import asyncio
 from typing import Dict, Any, Optional
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
@@ -62,7 +63,9 @@ async def get_system_capabilities(
             elif name == "anthropic":
                 configured = bool(anthropic_key)
             elif name == "ollama":
-                configured = bool(os.getenv("OLLAMA_HOST") or os.getenv("OLLAMA_MODEL"))
+                configured = bool(
+                    os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST") or os.getenv("OLLAMA_MODEL")
+                )
             else:
                 configured = False
 
@@ -120,12 +123,21 @@ async def get_system_capabilities(
     embeddings_configured = bool(openai_key)
     rag_status = "AVAILABLE" if embeddings_configured else "DEGRADED"
 
-    # 7. Image generation diagnostics (runtime source of truth from ImageGenerationEngine)
+    # 7. Image generation diagnostics (runtime source of truth from ImageGenerationEngine; non-blocking)
     from media.image_engine import ImageGenerationEngine
-    img_status = ImageGenerationEngine.get_status()
+    img_status = await asyncio.to_thread(ImageGenerationEngine.get_status)
     image_gen_status = img_status.get("status", "UNKNOWN")
     image_provider = img_status.get("provider", "pollinations")
     image_model = img_status.get("models", ["flux"])[0]
+
+    # Auth & Email capabilities (truthful reporting for frontend auth UX)
+    from services.email import is_email_configured
+    password_reset_enabled = is_email_configured()
+    google_oauth_enabled = bool(os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET"))
+    github_oauth_enabled = bool(github_client_id and github_client_secret)
+    private_local_configured = bool(
+        os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST") or os.getenv("OLLAMA_MODEL")
+    )
 
     # 8. Subsystems map for PluginsView
     subsystems = {
@@ -225,6 +237,12 @@ async def get_system_capabilities(
             "health_verified_at": img_status.get("health_verified_at")
         },
         "realtime": await ws_manager.get_status(),
+        "auth": {
+            "password_reset_enabled": password_reset_enabled,
+            "google_oauth_enabled": google_oauth_enabled,
+            "github_oauth_enabled": github_oauth_enabled,
+            "private_local_mode_available": private_local_configured,
+        },
         "providers": available_providers,
         "subsystems": subsystems
     }

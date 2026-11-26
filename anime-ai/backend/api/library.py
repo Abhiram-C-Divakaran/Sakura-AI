@@ -18,6 +18,7 @@ from services.storage import (
     build_document_storage_key,
     build_image_storage_key,
     assert_user_storage_key,
+    resolve_legacy_local_path,
 )
 import services.documents as docs_svc
 from services.documents import serialize_document, get_file_category

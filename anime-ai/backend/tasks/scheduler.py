@@ -4,6 +4,7 @@ Sakura AI — Persistent Scheduled Task Execution Engine
 Executes scheduled recurring assistant prompts, logs execution history to ScheduledTaskRun,
 and manages periodic evaluation of cron and natural-language schedules with timezone awareness.
 """
+import os
 import uuid
 import time
 import asyncio

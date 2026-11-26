@@ -1,10 +1,12 @@
 import json
 import uuid
 import time
-from typing import Dict, Any, List, Optional, AsyncGenerator
+from typing import Dict, Any, List, Optional, AsyncGenerator, Callable
 from sqlalchemy.orm import Session
-from database.models import CodingTask, ToolExecution, RepositoryWorkspace, User, TaskOutcome
+from database.db import get_db_context
+from database.models import CodingTask, ToolExecution, RepositoryWorkspace, User, TaskOutcome, utc_now
 from coding.tools import CodingToolchain
+from coding.security import redact_sensitive_data, redact_sensitive_text
 from llm.router import LLMRouter
 
 CODING_AGENT_TOOLS = [
@@ -313,7 +315,7 @@ class CodingAgent:
 
     def __init__(
         self,
-        db: Session,
+        db: Optional[Session],
         workspace: RepositoryWorkspace,
         user: User,
         llm_router: LLMRouter,
@@ -323,14 +325,56 @@ class CodingAgent:
         self.workspace = workspace
         self.user = user
         self.llm_router = llm_router
-        self.intensity = intensity.lower()
-        self.toolchain = CodingToolchain(workspace.workspace_path)
+        self.intensity = (intensity or "high").lower()
+        self.toolchain = CodingToolchain(
+            workspace.workspace_path,
+            workspace_id=str(workspace.id),
+            db=db,
+            user_id=user.id
+        )
         self.modified_files: List[str] = []
         self.tests_run: List[Dict[str, Any]] = []
         self.linters_run: List[Dict[str, Any]] = []
         self.typechecks_run: List[Dict[str, Any]] = []
         self.builds_run: List[Dict[str, Any]] = []
         self.diff_reviewed: bool = False
+
+    def _persist_task_state(
+        self,
+        task: CodingTask,
+        *,
+        status: Optional[str] = None,
+        files_modified: Optional[List[str]] = None,
+        verification_summary: Optional[Dict[str, Any]] = None,
+        completed_at=None,
+        persist_to_db: bool = True
+    ) -> None:
+        """Safely persists CodingTask mutations via a fresh DB context so detached sessions never drop writes."""
+        if status is not None:
+            task.status = status
+        if files_modified is not None:
+            task.files_modified = list(files_modified)
+        if verification_summary is not None:
+            task.verification_summary = dict(verification_summary)
+        if completed_at is not None:
+            task.completed_at = completed_at
+
+        if not persist_to_db or not getattr(task, "id", None):
+            return
+
+        with get_db_context() as db_ctx:
+            db_task = db_ctx.query(CodingTask).filter(CodingTask.id == task.id).first()
+            if db_task:
+                if status is not None:
+                    db_task.status = status
+                if files_modified is not None:
+                    db_task.files_modified = list(files_modified)
+                if verification_summary is not None:
+                    db_task.verification_summary = dict(verification_summary)
+                if completed_at is not None:
+                    db_task.completed_at = completed_at
+                db_task.updated_at = utc_now()
+                db_ctx.commit()
 
     @staticmethod
     def classify_task_kind(objective: str) -> str:
@@ -403,7 +447,8 @@ class CodingAgent:
                 command=args.get("command", ""),
                 cwd=args.get("cwd"),
                 allow_network=args.get("allow_network", False),
-                network_authorization_id=args.get("network_authorization_id")
+                network_authorization_id=args.get("network_authorization_id"),
+                network_capability=args.get("network_capability")
             )
         elif tool_name == "run_tests":
             res = await self.toolchain.run_tests(args.get("command", "npm test"))
@@ -431,33 +476,46 @@ class CodingAgent:
 
         duration_ms = int((time.time() - start_time) * 1000)
 
-        # Record tool execution if attached to task
+        # Record tool execution if attached to task (redacting secrets and using fresh session)
         if task_id:
             try:
-                exec_record = ToolExecution(
-                    coding_task_id=task_id,
-                    tool_name=tool_name,
-                    arguments=args,
-                    status="SUCCESS" if res.get("success") else "FAILED",
-                    stdout_preview=str(res.get("stdout") or res.get("content") or res.get("tree") or "")[:2000],
-                    stderr_preview=str(res.get("stderr") or res.get("error") or "")[:2000],
-                    exit_code=res.get("exit_code"),
-                    duration_ms=duration_ms
-                )
-                self.db.add(exec_record)
-                self.db.commit()
+                safe_args = redact_sensitive_data(args)
+                safe_stdout = redact_sensitive_text(str(res.get("stdout") or res.get("content") or res.get("tree") or ""))[:2000]
+                safe_stderr = redact_sensitive_text(str(res.get("stderr") or res.get("error") or ""))[:2000]
+                with get_db_context() as db_ctx:
+                    exec_record = ToolExecution(
+                        coding_task_id=task_id,
+                        tool_name=tool_name,
+                        arguments=safe_args,
+                        status="SUCCESS" if res.get("success") else "FAILED",
+                        stdout_preview=safe_stdout,
+                        stderr_preview=safe_stderr,
+                        exit_code=res.get("exit_code"),
+                        duration_ms=duration_ms
+                    )
+                    db_ctx.add(exec_record)
+                    db_ctx.commit()
             except Exception:
                 pass
 
         return res
 
-    async def run_task_stream(self, task: CodingTask) -> AsyncGenerator[Dict[str, Any], None]:
+    async def run_task_stream(
+        self,
+        task: CodingTask,
+        should_stop: Optional[Callable[[], bool]] = None,
+        persist_directly: bool = True
+    ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Executes an end-to-end coding task with tool streaming, test verification,
         diff review, and completion summary.
+        Checks should_stop() before every LLM turn and tool execution to guarantee
+        cooperative cancellation / lease-loss termination.
         """
-        task.status = TaskOutcome.EXPLORING
-        self.db.commit()
+        if should_stop and should_stop():
+            return
+
+        self._persist_task_state(task, status=TaskOutcome.EXPLORING, persist_to_db=persist_directly)
 
         system_prompt = f"""You are SAKURA AI, an elite frontier software engineering assistant working on a real repository.
 Workspace: '{self.workspace.name}' ({self.workspace.active_branch})
@@ -493,6 +551,9 @@ Please execute this task: inspect the codebase, implement the changes, run tests
         max_turns = 15 if self.intensity == "high" else (8 if self.intensity == "medium" else 4)
 
         for turn in range(max_turns):
+            if should_stop and should_stop():
+                return
+
             yield {"phase": task.status, "turn": turn + 1, "message": f"Agent iteration {turn + 1}..."}
 
             # Call provider-neutral tool turn
@@ -505,8 +566,16 @@ Please execute this task: inspect the codebase, implement the changes, run tests
                 )
             except Exception as e:
                 yield {"error": f"LLM provider error: {str(e)}"}
-                task.status = TaskOutcome.FAILED
-                self.db.commit()
+                self._persist_task_state(
+                    task,
+                    status=TaskOutcome.FAILED,
+                    files_modified=self.modified_files,
+                    completed_at=utc_now(),
+                    persist_to_db=persist_directly
+                )
+                return
+
+            if should_stop and should_stop():
                 return
 
             tool_calls = turn_result.get("tool_calls", [])
@@ -521,6 +590,9 @@ Please execute this task: inspect the codebase, implement the changes, run tests
                 })
 
                 for tc in tool_calls:
+                    if should_stop and should_stop():
+                        return
+
                     fn_name = tc.get("name")
                     fn_args = tc.get("arguments", {})
                     if isinstance(fn_args, str):
@@ -532,25 +604,34 @@ Please execute this task: inspect the codebase, implement the changes, run tests
                     yield {
                         "phase": "TOOL_EXECUTION",
                         "tool": fn_name,
-                        "args": fn_args
+                        "args": redact_sensitive_data(fn_args)
                     }
 
                     tool_res = await self.execute_tool(task.id, fn_name, fn_args)
 
+                    if should_stop and should_stop():
+                        return
+
                     # Update phase based on tool
+                    next_status = task.status
                     if fn_name in ["write_file", "create_file", "apply_patch", "delete_file", "rename_file"]:
-                        task.status = TaskOutcome.IMPLEMENTING
+                        next_status = TaskOutcome.IMPLEMENTING
                     elif fn_name in ["run_tests", "run_command", "run_linter", "run_typecheck", "run_build"]:
-                        task.status = TaskOutcome.TESTING
+                        next_status = TaskOutcome.TESTING
                     elif fn_name in ["git_diff", "git_status", "git_log", "git_show"]:
-                        task.status = TaskOutcome.REVIEWING
-                    self.db.commit()
+                        next_status = TaskOutcome.REVIEWING
+                    self._persist_task_state(
+                        task,
+                        status=next_status,
+                        files_modified=self.modified_files,
+                        persist_to_db=persist_directly
+                    )
 
                     yield {
                         "phase": "TOOL_RESULT",
                         "tool": fn_name,
                         "success": tool_res.get("success", False),
-                        "snippet": str(tool_res.get("stdout") or tool_res.get("content") or tool_res.get("error") or "")[:200]
+                        "snippet": redact_sensitive_text(str(tool_res.get("stdout") or tool_res.get("content") or tool_res.get("error") or ""))[:200]
                     }
 
                     messages.append({
@@ -617,8 +698,7 @@ Please execute this task: inspect the codebase, implement the changes, run tests
 
                 verification_passed = (len(unverified_reasons) == 0 and task.status == TaskOutcome.COMPLETED_VERIFIED)
 
-                task.files_modified = self.modified_files
-                task.verification_summary = {
+                verification_summary = {
                     "task_kind": task_kind,
                     "files_changed": self.modified_files,
                     "tests": {
@@ -643,7 +723,14 @@ Please execute this task: inspect the codebase, implement the changes, run tests
                     "unverified_reasons": unverified_reasons
                 }
 
-                self.db.commit()
+                self._persist_task_state(
+                    task,
+                    status=task.status,
+                    files_modified=self.modified_files,
+                    verification_summary=verification_summary,
+                    completed_at=utc_now(),
+                    persist_to_db=persist_directly
+                )
 
                 yield {
                     "phase": task.status,
@@ -654,9 +741,13 @@ Please execute this task: inspect the codebase, implement the changes, run tests
                 return
 
         # Max iterations reached
-        task.status = TaskOutcome.MAX_ITERATIONS
-        task.files_modified = self.modified_files
-        self.db.commit()
+        self._persist_task_state(
+            task,
+            status=TaskOutcome.MAX_ITERATIONS,
+            files_modified=self.modified_files,
+            completed_at=utc_now(),
+            persist_to_db=persist_directly
+        )
         yield {
             "phase": TaskOutcome.MAX_ITERATIONS,
             "message": "Max tool turns reached without final conclusion."

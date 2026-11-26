@@ -12,6 +12,14 @@ from llm.providers.ollama import OllamaProvider
 
 logger = logging.getLogger("sakura.llm.router")
 
+PRIVATE_INTENTS = {"local_private", "private_data"}
+CLOUD_PROVIDERS = {"openai", "groq", "anthropic"}
+
+
+class PrivateModelUnavailableError(RuntimeError):
+    """Raised when a private/local-only intent cannot be served by a configured local provider."""
+    pass
+
 
 def is_transient_error(e: Exception) -> bool:
     """
@@ -74,28 +82,40 @@ class LLMRouter:
             except Exception as e:
                 print(f"LLM Router: Failed to initialize Anthropic: {e}")
 
-        # 4. Ollama (Always check local fallback)
-        try:
-            ollama_model = os.getenv("OLLAMA_MODEL", "llama3")
-            self.providers["ollama"] = OllamaProvider(model=ollama_model)
-            print("LLM Router: Ollama local adapter registered.")
-        except Exception as e:
-            print(f"LLM Router: Failed to register Ollama: {e}")
+        # 4. Ollama (Register only when explicitly configured via env)
+        ollama_url = (os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST") or "").strip()
+        ollama_model = (os.getenv("OLLAMA_MODEL") or "").strip()
+        if ollama_url or ollama_model:
+            try:
+                self.providers["ollama"] = OllamaProvider(
+                    base_url=ollama_url or "http://localhost:11434",
+                    model=ollama_model or "llama3"
+                )
+                print("LLM Router: Ollama local adapter registered.")
+            except Exception as e:
+                print(f"LLM Router: Failed to register Ollama: {e}")
+
+    def is_private_intent(self, intent: Optional[str]) -> bool:
+        return (intent or "general_chat").strip().lower() in PRIVATE_INTENTS
 
     def get_ordered_providers(self, intent: str = "general_chat") -> List[Tuple[str, LLMProvider]]:
         """Returns ordered list of available providers for priority intent routing and failover."""
-        intent_lower = (intent or "general_chat").lower()
-        if intent_lower in ["code_generation", "repository_coding", "debugging", "architecture"]:
+        intent_lower = (intent or "general_chat").strip().lower()
+        if intent_lower in PRIVATE_INTENTS:
+            # STRICT PRIVACY BOUNDARY: Private intents may ONLY use explicitly configured local providers.
+            # Cloud providers (OpenAI, Groq, Anthropic) are strictly prohibited from this list.
+            preferred = ["ollama"]
+        elif intent_lower in ["code_generation", "repository_coding", "debugging", "architecture"]:
             preferred = ["groq", "anthropic", "openai", "ollama"]
         elif intent_lower in ["reasoning", "deep_research", "document_analysis"]:
             preferred = ["anthropic", "openai", "groq", "ollama"]
-        elif intent_lower in ["local_private", "private_data"]:
-            preferred = ["ollama", "openai", "groq"]
         else:
             preferred = ["groq", "openai", "anthropic", "ollama"]
 
         ordered = []
         for name in preferred:
+            if intent_lower in PRIVATE_INTENTS and name in CLOUD_PROVIDERS:
+                continue
             if name in self.providers:
                 ordered.append((name, self.providers[name]))
         return ordered
@@ -105,6 +125,11 @@ class LLMRouter:
         ordered = self.get_ordered_providers(intent)
         if ordered:
             return ordered[0]
+        if self.is_private_intent(intent):
+            raise PrivateModelUnavailableError(
+                "Private local model is not configured or unavailable. "
+                "Private requests fail closed and will not be sent to cloud providers."
+            )
         raise RuntimeError("No LLM providers available. Set GROQ_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY in .env.")
 
     async def generate(
@@ -115,10 +140,19 @@ class LLMRouter:
         intent: str = "general_chat",
         **kwargs
     ) -> tuple[str, str]:
-        """Routes and calls the appropriate model with bounded transient failover."""
-        allow_mocks = os.getenv("SAKURA_ALLOW_MOCKS", "false").lower() == "true"
+        """Routes and calls the appropriate model with bounded transient failover (fail-closed for private intents)."""
+        is_private = self.is_private_intent(intent)
+        allow_mocks = (not is_private) and os.getenv("SAKURA_ALLOW_MOCKS", "false").lower() == "true"
         candidates = self.get_ordered_providers(intent)
+        if is_private:
+            candidates = [(n, p) for n, p in candidates if n not in CLOUD_PROVIDERS]
+
         if not candidates:
+            if is_private:
+                raise PrivateModelUnavailableError(
+                    "Private local model is not configured or unavailable. "
+                    "To protect your data, this request was not sent to any cloud AI provider."
+                )
             if allow_mocks:
                 from llm.prompts.mock_generator import local_mock_response
                 return "fallback_mock", local_mock_response(prompt)
@@ -126,6 +160,8 @@ class LLMRouter:
 
         last_error = None
         for provider_name, provider in candidates:
+            if is_private and provider_name in CLOUD_PROVIDERS:
+                continue
             try:
                 response = await provider.generate(prompt, system_prompt, history, **kwargs)
                 self.provider_telemetry[provider_name] = {
@@ -143,11 +179,15 @@ class LLMRouter:
                     "error": str(e)
                 }
                 logger.warning(f"LLM Provider {provider_name} failed: {e}")
-                if not is_transient_error(e):
-                    # Do not failover on non-retryable auth/policy errors
+                if is_private or not is_transient_error(e):
                     break
                 continue
 
+        if is_private:
+            raise PrivateModelUnavailableError(
+                f"Private local model is currently unavailable ({last_error}). "
+                "To protect your privacy, this request was not routed to any cloud provider."
+            )
         if not allow_mocks:
             raise RuntimeError(f"LLM Provider unavailable: {str(last_error)}")
         print(f"LLM Router Error: {last_error}. Falling back to test mock generator.")
@@ -162,10 +202,19 @@ class LLMRouter:
         intent: str = "general_chat",
         **kwargs
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Streams content tokens with bounded transient failure handling and failover."""
-        allow_mocks = os.getenv("SAKURA_ALLOW_MOCKS", "false").lower() == "true"
+        """Streams content tokens with bounded transient failure handling (fail-closed for private intents)."""
+        is_private = self.is_private_intent(intent)
+        allow_mocks = (not is_private) and os.getenv("SAKURA_ALLOW_MOCKS", "false").lower() == "true"
         candidates = self.get_ordered_providers(intent)
+        if is_private:
+            candidates = [(n, p) for n, p in candidates if n not in CLOUD_PROVIDERS]
+
         if not candidates:
+            if is_private:
+                raise PrivateModelUnavailableError(
+                    "Private local model is not configured or unavailable. "
+                    "To protect your data, this request was not sent to any cloud AI provider."
+                )
             if allow_mocks:
                 from llm.prompts.mock_generator import local_mock_response
                 fallback_text = local_mock_response(prompt)
@@ -177,6 +226,8 @@ class LLMRouter:
 
         last_error = None
         for provider_name, provider in candidates:
+            if is_private and provider_name in CLOUD_PROVIDERS:
+                continue
             token_yielded = False
             try:
                 first = True
@@ -201,11 +252,15 @@ class LLMRouter:
                     "error": str(e)
                 }
                 logger.warning(f"LLM Provider stream {provider_name} failed: {e}")
-                if token_yielded or not is_transient_error(e):
-                    # If tokens were already sent to client, we cannot cleanly switch providers mid-stream
+                if is_private or token_yielded or not is_transient_error(e):
                     break
                 continue
 
+        if is_private:
+            raise PrivateModelUnavailableError(
+                f"Private local model is currently unavailable ({last_error}). "
+                "To protect your privacy, this request was not routed to any cloud provider."
+            )
         if not allow_mocks:
             raise RuntimeError(f"LLM Streaming failure: {str(last_error)}")
         print(f"LLM Router Streaming Error: {last_error}. Yielding fallback mock tokens for test environment.")

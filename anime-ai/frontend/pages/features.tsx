@@ -5,7 +5,7 @@ export default function FeaturesRedirect() {
   const router = useRouter();
 
   useEffect(() => {
-    router.replace('/#features');
+    router.replace('/#capabilities');
   }, [router]);
 
   return null;

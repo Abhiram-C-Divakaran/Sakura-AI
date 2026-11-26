@@ -20,6 +20,7 @@ class CodingTaskCreateRequest(BaseModel):
     objective: str
     intensity: Optional[str] = "high"
     stream: Optional[bool] = False
+    idempotency_key: Optional[str] = None
 
 class ToolExecutionRequest(BaseModel):
     tool_name: str

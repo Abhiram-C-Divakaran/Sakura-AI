@@ -8,15 +8,19 @@ import os
 import uuid
 import logging
 from typing import Dict, Any, Optional, List
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import UploadFile, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 
+from database.db import get_db_context
 from database.models import (
     Document,
     DocumentChunk,
     DocumentIndexingStatus,
     BackgroundTask,
+    GeneratedImage,
+    StorageDeletionOutbox,
     utc_now
 )
 from services.storage import (
@@ -88,6 +92,15 @@ async def upload_document(
     category = (doc.metadata_json or {}).get("category", "")
     if auto_index and category in ["documents", "code", "data"]:
         enqueue_index(doc.id, user_id, db, force_reindex=False)
+    elif doc.indexing_status == DocumentIndexingStatus.QUEUED:
+        doc.indexing_status = DocumentIndexingStatus.NOT_INDEXED
+        doc.metadata_json = {
+            **(doc.metadata_json or {}),
+            "status": "READY",
+            "indexing_status": "Not indexed",
+        }
+        db.commit()
+        db.refresh(doc)
 
     return doc
 
@@ -258,38 +271,337 @@ def remove_from_kb(doc_id: uuid.UUID, user_id: uuid.UUID, db: Session) -> Docume
     return doc
 
 
-def delete_document(doc_id: uuid.UUID, user_id: uuid.UUID, db: Session) -> bool:
+def _delete_physical_object(
+    storage_backend_name: str,
+    storage_key: Optional[str],
+    legacy_path: Optional[str] = None,
+    storage_override=None,
+) -> tuple[bool, Optional[str]]:
     """
-    Deletes document from database and StorageBackend.
+    Deletes an object from StorageBackend (and legacy local path if distinct).
+    Returns (True, None) ONLY when deletion is verified successful or object no longer exists.
+    Returns (False, error_message) on any storage error.
+    """
+    storage = storage_override or get_storage_backend(storage_backend_name or "local")
+    if storage_key:
+        try:
+            deleted = storage.delete(storage_key)
+            if not deleted:
+                return False, f"Storage backend '{storage.backend_type}' returned False deleting '{storage_key}'"
+        except Exception as e:
+            return False, f"Storage deletion error for '{storage_key}': {str(e)}"
+
+    if legacy_path and os.path.exists(legacy_path):
+        try:
+            safe_path = resolve_legacy_local_path(legacy_path)
+            if os.path.exists(safe_path):
+                os.remove(safe_path)
+        except Exception as e:
+            return False, f"Legacy file deletion error for '{legacy_path}': {str(e)}"
+
+    return True, None
+
+
+def delete_document(
+    doc_id: uuid.UUID,
+    user_id: uuid.UUID,
+    db: Session,
+    *,
+    storage_override=None,
+    raise_on_storage_error: bool = True,
+) -> Dict[str, Any]:
+    """
+    Durable outbox-backed document deletion lifecycle:
+    1. Transaction 1: Verify ownership, bump index_generation, cancel any queued/running
+       document_index BackgroundTasks, mark doc.deletion_status='DELETING', and persist
+       (or reuse) a PENDING StorageDeletionOutbox record.
+    2. Physical deletion: Attempt storage object deletion (never touching DB deletion first).
+    3. Transaction 2:
+       - On storage success: delete linked GeneratedImage, Document (and chunks), mark outbox COMPLETED.
+       - On storage failure: keep Document row intact with deletion_status='DELETE_FAILED',
+         record error + retry backoff on outbox (never silently drop DB row while object remains!).
     """
     doc = db.query(Document).filter(Document.id == doc_id, Document.user_id == user_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    storage = get_storage_backend(getattr(doc, "storage_backend", "local"))
-    if doc.storage_key:
-        try:
-            storage.delete(doc.storage_key)
-        except Exception as e:
-            logger.warning(f"Failed to delete storage key '{doc.storage_key}': {e}")
+    now = utc_now()
+    backend_name = getattr(doc, "storage_backend", "local") or "local"
+    storage_key = doc.storage_key
+    legacy_path = doc.storage_path if (doc.storage_path and doc.storage_path != storage_key) else None
 
-    if doc.storage_path and os.path.exists(doc.storage_path):
-        try:
-            safe_path = resolve_legacy_local_path(doc.storage_path)
-            if os.path.exists(safe_path):
-                os.remove(safe_path)
-        except Exception as e:
-            logger.warning(f"Failed to remove legacy storage path '{doc.storage_path}': {e}")
+    # Step 1: Record durable deletion intent & cancel in-flight indexing atomically
+    doc.index_generation = (getattr(doc, "index_generation", 0) or 0) + 1
+    doc.is_knowledge_base = False
+    doc.deletion_status = "DELETING"
 
-    # Delete related tasks
-    tasks = db.query(BackgroundTask).filter(BackgroundTask.user_id == user_id, BackgroundTask.type == "document_index").all()
-    for t in tasks:
+    active_index_tasks = db.query(BackgroundTask).filter(
+        BackgroundTask.user_id == user_id,
+        BackgroundTask.type == "document_index",
+        BackgroundTask.status.in_(["Queued", "Starting", "Running"]),
+    ).all()
+    cancelled_tasks = 0
+    for t in active_index_tasks:
         if (t.payload or {}).get("document_id") == str(doc.id):
-            db.delete(t)
+            t.cancel_requested = True
+            t.status = "Cancelled"
+            t.completed_at = now
+            cancelled_tasks += 1
 
-    db.delete(doc)
+    # Idempotent repeated deletion: reuse existing non-completed outbox row for this document
+    outbox = db.query(StorageDeletionOutbox).filter(
+        StorageDeletionOutbox.document_id == doc.id,
+        StorageDeletionOutbox.status != "COMPLETED",
+    ).first()
+    if not outbox:
+        outbox = StorageDeletionOutbox(
+            id=uuid.uuid4(),
+            user_id=user_id,
+            document_id=doc.id,
+            storage_backend=backend_name,
+            storage_key=storage_key or (legacy_path or f"document:{doc.id}"),
+            legacy_path=legacy_path,
+            status="PENDING",
+            attempt_count=0,
+            max_attempts=5,
+            next_retry_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(outbox)
+    else:
+        outbox.status = "PENDING"
+        outbox.next_retry_at = now
+        outbox.updated_at = now
+
+    # Commit intent BEFORE touching physical storage (if DB fails here, object stays untouched)
     db.commit()
-    return True
+    db.refresh(outbox)
+    outbox_id = outbox.id
+
+    # Step 2: Execute physical object deletion
+    ok, err_msg = _delete_physical_object(
+        storage_backend_name=backend_name,
+        storage_key=storage_key,
+        legacy_path=legacy_path,
+        storage_override=storage_override,
+    )
+
+    done_at = utc_now()
+    if not ok:
+        # Storage deletion FAILED: preserve Document row in DB with honest DELETE_FAILED status
+        outbox_rec = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == outbox_id).first()
+        doc_rec = db.query(Document).filter(Document.id == doc_id, Document.user_id == user_id).first()
+        if outbox_rec:
+            outbox_rec.attempt_count = int(outbox_rec.attempt_count or 0) + 1
+            outbox_rec.last_error = err_msg
+            outbox_rec.updated_at = done_at
+            if outbox_rec.attempt_count >= int(outbox_rec.max_attempts or 5):
+                outbox_rec.status = "FAILED"
+                outbox_rec.next_retry_at = None
+            else:
+                backoff_secs = min(60 * (2 ** (outbox_rec.attempt_count - 1)), 3600)
+                outbox_rec.status = "PENDING"
+                outbox_rec.next_retry_at = done_at + timedelta(seconds=backoff_secs)
+        if doc_rec:
+            doc_rec.deletion_status = "DELETE_FAILED"
+            doc_rec.metadata_json = {**(doc_rec.metadata_json or {}), "deletion_error": err_msg}
+        db.commit()
+
+        if raise_on_storage_error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to delete file from storage; document retained for retry (outbox_id={outbox_id}).",
+            )
+        return {
+            "status": "delete_failed",
+            "deletion_status": "DELETE_FAILED",
+            "outbox_id": str(outbox_id),
+            "cancelled_index_tasks": cancelled_tasks,
+            "error": err_msg,
+        }
+
+    # Step 3: Storage deletion succeeded -> finalize DB deletion + outbox COMPLETED atomically
+    try:
+        db.query(GeneratedImage).filter(
+            GeneratedImage.document_id == doc_id,
+            GeneratedImage.user_id == user_id,
+        ).delete(synchronize_session=False)
+
+        doc_rec = db.query(Document).filter(Document.id == doc_id, Document.user_id == user_id).first()
+        if doc_rec:
+            db.delete(doc_rec)
+
+        outbox_rec = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == outbox_id).first()
+        if outbox_rec:
+            outbox_rec.attempt_count = int(outbox_rec.attempt_count or 0) + 1
+            outbox_rec.status = "COMPLETED"
+            outbox_rec.last_error = None
+            outbox_rec.completed_at = done_at
+            outbox_rec.updated_at = done_at
+            outbox_rec.next_retry_at = None
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "status": "deleted",
+        "deletion_status": "COMPLETED",
+        "outbox_id": str(outbox_id),
+        "cancelled_index_tasks": cancelled_tasks,
+    }
+
+
+def process_storage_deletion_outbox(
+    db: Optional[Session] = None,
+    limit: int = 50,
+    storage_override=None,
+) -> Dict[str, int]:
+    """
+    Processes due PENDING StorageDeletionOutbox rows with bounded exponential retries.
+    Reconciles both physical object removal and remaining Document/GeneratedImage rows.
+    """
+    now = utc_now()
+    stats = {"processed": 0, "completed": 0, "retried": 0, "failed": 0}
+
+    def _run(session: Session):
+        entries = session.query(StorageDeletionOutbox).filter(
+            StorageDeletionOutbox.status == "PENDING",
+            or_(
+                StorageDeletionOutbox.next_retry_at.is_(None),
+                StorageDeletionOutbox.next_retry_at <= now,
+            ),
+        ).order_by(StorageDeletionOutbox.created_at.asc()).limit(limit).all()
+
+        for entry in entries:
+            stats["processed"] += 1
+            ok, err_msg = _delete_physical_object(
+                storage_backend_name=entry.storage_backend,
+                storage_key=entry.storage_key if not entry.storage_key.startswith("document:") else None,
+                legacy_path=entry.legacy_path,
+                storage_override=storage_override,
+            )
+            step_now = utc_now()
+            entry.attempt_count = int(entry.attempt_count or 0) + 1
+            entry.updated_at = step_now
+
+            if ok:
+                if entry.document_id:
+                    session.query(GeneratedImage).filter(
+                        GeneratedImage.document_id == entry.document_id
+                    ).delete(synchronize_session=False)
+                    doc_rec = session.query(Document).filter(Document.id == entry.document_id).first()
+                    if doc_rec:
+                        session.delete(doc_rec)
+                entry.status = "COMPLETED"
+                entry.last_error = None
+                entry.completed_at = step_now
+                entry.next_retry_at = None
+                session.commit()
+                stats["completed"] += 1
+            else:
+                entry.last_error = err_msg
+                if entry.attempt_count >= int(entry.max_attempts or 5):
+                    entry.status = "FAILED"
+                    entry.next_retry_at = None
+                    stats["failed"] += 1
+                else:
+                    backoff = min(60 * (2 ** (entry.attempt_count - 1)), 3600)
+                    entry.next_retry_at = step_now + timedelta(seconds=backoff)
+                    stats["retried"] += 1
+                session.commit()
+
+    if db is not None:
+        _run(db)
+    else:
+        with get_db_context() as session:
+            _run(session)
+    return stats
+
+
+def cleanup_orphaned_storage_objects(
+    user_id: uuid.UUID,
+    db: Session,
+    storage_override=None,
+) -> Dict[str, Any]:
+    """
+    User-isolated orphan garbage collection:
+    Lists storage keys strictly under `users/{user_id}/`, identifies objects with no
+    live Document or GeneratedImage reference, deletes them, and records audited outbox rows.
+    """
+    storage = storage_override or get_storage_backend()
+    prefix = f"users/{user_id}/"
+    stored_keys = storage.list_keys(prefix)
+
+    referenced_doc_keys = {
+        row[0]
+        for row in db.query(Document.storage_key).filter(
+            Document.user_id == user_id,
+            Document.storage_key.isnot(None),
+        ).all()
+        if row[0]
+    }
+    referenced_img_keys = {
+        row[0]
+        for row in db.query(GeneratedImage.storage_key).filter(
+            GeneratedImage.user_id == user_id,
+            GeneratedImage.storage_key.isnot(None),
+        ).all()
+        if row[0]
+    }
+    live_keys = referenced_doc_keys | referenced_img_keys
+
+    deleted_keys: List[str] = []
+    failed_keys: List[str] = []
+    now = utc_now()
+
+    for key in stored_keys:
+        norm_key = key.replace("\\", "/").lstrip("/")
+        if not norm_key.startswith(prefix):
+            continue
+        if norm_key in live_keys:
+            continue
+
+        ok = False
+        err_msg = None
+        try:
+            ok = bool(storage.delete(norm_key))
+            if not ok:
+                err_msg = f"Failed to delete orphan key '{norm_key}'"
+        except Exception as e:
+            err_msg = str(e)
+
+        outbox = StorageDeletionOutbox(
+            id=uuid.uuid4(),
+            user_id=user_id,
+            document_id=None,
+            storage_backend=storage.backend_type,
+            storage_key=norm_key,
+            status="COMPLETED" if ok else "PENDING",
+            attempt_count=1,
+            max_attempts=5,
+            last_error=err_msg,
+            completed_at=now if ok else None,
+            next_retry_at=None if ok else now + timedelta(seconds=60),
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(outbox)
+        if ok:
+            deleted_keys.append(norm_key)
+        else:
+            failed_keys.append(norm_key)
+
+    db.commit()
+    return {
+        "user_id": str(user_id),
+        "scanned": len(stored_keys),
+        "orphans_deleted": len(deleted_keys),
+        "orphans_failed": len(failed_keys),
+        "deleted_keys": deleted_keys,
+    }
 
 
 def retry_indexing(doc_id: uuid.UUID, user_id: uuid.UUID, db: Session) -> BackgroundTask:

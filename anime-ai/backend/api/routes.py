@@ -9,7 +9,7 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Request, status, UploadFile, File, Form, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
@@ -66,10 +66,18 @@ intent_classifier = IntentClassifier()
 class UserRegister(BaseModel):
     username: str
     password: str
+    email: Optional[str] = None
 
 class Token(BaseModel):
     access_token: str
     token_type: str
+
+class PasswordResetRequestBody(BaseModel):
+    identifier: str
+
+class PasswordResetConfirmBody(BaseModel):
+    token: str
+    new_password: str
 
 class ChatRequest(BaseModel):
     conversation_id: str
@@ -79,32 +87,180 @@ class ChatRequest(BaseModel):
     attachments: Optional[List[Dict[str, Any]]] = []
     active_workspace_id: Optional[str] = None
     repository_workspace_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 
 # ─── Auth Endpoints ─────────────────────────────────────────────────────────
 
+@router.get("/auth/config")
+def get_auth_config():
+    """Returns truthful authentication capabilities for the login/registration UI."""
+    from services.email import is_email_configured
+    return {
+        "password_reset_enabled": is_email_configured(),
+        "google_oauth_enabled": bool(os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET")),
+        "github_oauth_enabled": bool(os.getenv("GITHUB_CLIENT_ID") and os.getenv("GITHUB_CLIENT_SECRET")),
+    }
+
+
 @router.post("/auth/register", response_model=Dict[str, str])
-def register(user_data: UserRegister, db: Session = Depends(get_db)):
-    existing = db.query(User).filter(User.username == user_data.username).first()
+def register(user_data: UserRegister, request: Request, db: Session = Depends(get_db)):
+    from services.rate_limit import enforce_rate_limit, get_client_ip
+    client_ip = get_client_ip(request)
+    enforce_rate_limit("auth_register", client_ip, limit=15, window_seconds=900)
+
+    clean_username = (user_data.username or "").strip()
+    if not clean_username or len(clean_username) > 100:
+        raise HTTPException(status_code=400, detail="Valid username is required.")
+
+    existing = db.query(User).filter(User.username == clean_username).first()
     if existing:
         raise HTTPException(status_code=400, detail="Username already registered")
-    
+
+    clean_email = (user_data.email or "").strip().lower() or (clean_username.lower() if "@" in clean_username else None)
     new_user = User(
-        username=user_data.username,
-        hashed_password=AuthManager.hash_password(user_data.password)
+        username=clean_username,
+        email=clean_email,
+        hashed_password=AuthManager.hash_password(user_data.password),
     )
     db.add(new_user)
     db.commit()
     return {"message": "User registered successfully"}
 
+
 @router.post("/auth/token", response_model=Token)
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    from services.rate_limit import enforce_rate_limit, get_client_ip
+    client_ip = get_client_ip(request)
+    enforce_rate_limit("auth_login_ip", client_ip, limit=30, window_seconds=900)
+    enforce_rate_limit("auth_login_user", f"{client_ip}:{(form_data.username or '').strip().lower()}", limit=15, window_seconds=900)
+
     user = db.query(User).filter(User.username == form_data.username).first()
     if not user or not AuthManager.verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Incorrect username or password")
-    
+
     access_token = AuthManager.create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
+
+
+@router.post("/auth/password-reset/request")
+def request_password_reset(
+    req_body: PasswordResetRequestBody,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Real password reset initiation:
+    - Fails honestly with HTTP 503 if no email provider is configured (never simulates success).
+    - Rate limited per IP and identifier.
+    - Enumeration-safe identical response whether or not the account exists.
+    - Stores only SHA-256 hashed single-use token with 30-minute expiry.
+    """
+    import hashlib
+    import secrets
+    from datetime import timedelta
+    from urllib.parse import quote
+    from services.email import is_email_configured, send_password_reset_email
+    from services.rate_limit import enforce_rate_limit, get_client_ip
+    from database.models import PasswordResetToken
+
+    if not is_email_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Password reset is disabled on this deployment because no email delivery provider is configured.",
+        )
+
+    client_ip = get_client_ip(request)
+    clean_id = (req_body.identifier or "").strip()
+    if not clean_id:
+        raise HTTPException(status_code=400, detail="Email or username is required.")
+
+    enforce_rate_limit("auth_pw_reset_ip", client_ip, limit=10, window_seconds=900)
+    enforce_rate_limit("auth_pw_reset_id", clean_id.lower(), limit=5, window_seconds=900)
+
+    generic_response = {
+        "message": "If an account exists for this email or username, a password reset link has been sent."
+    }
+
+    user = db.query(User).filter(
+        (User.username == clean_id) | (User.email == clean_id.lower())
+    ).first()
+    if not user:
+        return generic_response
+
+    target_email = user.email or (user.username if "@" in user.username else None)
+    if not target_email:
+        return generic_response
+
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    now = utc_now()
+    reset_record = PasswordResetToken(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        token_hash=token_hash,
+        created_at=now,
+        expires_at=now + timedelta(minutes=30),
+        consumed_at=None,
+    )
+    db.add(reset_record)
+    db.commit()
+
+    base_url = (os.getenv("PUBLIC_APP_URL") or "http://localhost:3000").rstrip("/")
+    reset_url = f"{base_url}/login?reset_token={quote(raw_token)}"
+    send_password_reset_email(target_email, reset_url)
+    return generic_response
+
+
+@router.post("/auth/password-reset/confirm")
+def confirm_password_reset(
+    req_body: PasswordResetConfirmBody,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Atomically consumes a single-use hashed password reset token and updates the user's password.
+    """
+    import hashlib
+    from services.rate_limit import enforce_rate_limit, get_client_ip
+    from database.models import PasswordResetToken
+
+    client_ip = get_client_ip(request)
+    enforce_rate_limit("auth_pw_confirm_ip", client_ip, limit=15, window_seconds=900)
+
+    raw_token = (req_body.token or "").strip()
+    if not raw_token:
+        raise HTTPException(status_code=400, detail="Reset token is required.")
+
+    AuthManager.validate_password_strength(req_body.new_password)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    now = utc_now()
+
+    rec = db.query(PasswordResetToken).filter(
+        PasswordResetToken.token_hash == token_hash,
+        PasswordResetToken.consumed_at.is_(None),
+        PasswordResetToken.expires_at > now,
+    ).first()
+    if not rec:
+        raise HTTPException(status_code=400, detail="Password reset token is invalid or expired.")
+
+    rows = db.query(PasswordResetToken).filter(
+        PasswordResetToken.id == rec.id,
+        PasswordResetToken.consumed_at.is_(None),
+        PasswordResetToken.expires_at > now,
+    ).update({PasswordResetToken.consumed_at: now}, synchronize_session=False)
+    if rows != 1:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Password reset token has already been used or expired.")
+
+    user = db.query(User).filter(User.id == rec.user_id).first()
+    if not user:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Account not found.")
+
+    user.hashed_password = AuthManager.hash_password(req_body.new_password)
+    db.commit()
+    return {"message": "Password updated successfully."}
 
 
 @router.post("/auth/ws-ticket")
@@ -590,8 +746,7 @@ def delete_document(document_id: str, current_user: User = Depends(AuthManager.g
         doc_uuid = uuid.UUID(document_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid document ID format")
-    docs_svc.delete_document(doc_uuid, current_user.id, db)
-    return {"status": "deleted"}
+    return docs_svc.delete_document(doc_uuid, current_user.id, db)
 
 class RenameRequest(BaseModel):
     filename: str
@@ -670,7 +825,12 @@ async def chat_stream(
     db: Session = Depends(get_db)
 ):
     # 1. Fetch Conversation
-    conv = db.query(Conversation).filter(Conversation.id == uuid.UUID(req.conversation_id), Conversation.user_id == current_user.id).first()
+    try:
+        conv_uuid = uuid.UUID(str(req.conversation_id).strip())
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid conversation ID format")
+
+    conv = db.query(Conversation).filter(Conversation.id == conv_uuid, Conversation.user_id == current_user.id).first()
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
@@ -793,59 +953,109 @@ async def chat_stream(
                 return StreamingResponse(disambiguation_generator(), media_type="text/event-stream")
 
         if ws:
-            coding_agent = CodingAgent(
-                db=db,
-                workspace=ws,
-                user=current_user,
-                llm_router=llm_router,
-                intensity=req.intensity or "high"
+            from coding.job_worker import (
+                create_and_enqueue_coding_job,
+                is_terminal_coding_status,
             )
-            coding_task = CodingTask(
-                workspace_id=ws.id,
-                user_id=current_user.id,
+            from database.models import CodingJob, CodingTaskEvent
+
+            coding_task, coding_job, _created = create_and_enqueue_coding_job(
+                db=db,
+                user=current_user,
+                workspace=ws,
                 title=f"Chat Coding: {code_objective[:40]}",
                 objective=code_objective,
-                status=TaskOutcome.QUEUED
+                intensity=req.intensity or "high",
+                idempotency_key=req.idempotency_key,
+                metadata={"source": "chat_stream", "conversation_id": str(conv.id)},
             )
-            db.add(coding_task)
-            db.commit()
+            queued_task_id = str(coding_task.id)
+            queued_job_id = str(coding_job.id)
+            ws_uuid = ws.id
+            owner_id = current_user.id
+            conv_id_val = conv.id
+            req_msg_preview = req.message[:50] + ("..." if len(req.message) > 50 else "")
 
             async def coding_stream_generator():
                 full_response = ""
-                async for event in coding_agent.run_task_stream(coding_task):
-                    if "tool" in event:
-                        tool_name = event.get("tool")
-                        tool_phase = event.get("phase", "TOOL")
-                        chunk_msg = f"\n`[{tool_phase}: {tool_name}]`\n"
-                        full_response += chunk_msg
-                        yield f"data: {json.dumps({'token': chunk_msg, 'provider': 'sakura_code'})}\n\n"
-                    elif "message" in event:
-                        msg_token = f"*{event['message']}*\n"
-                        full_response += msg_token
-                        yield f"data: {json.dumps({'token': msg_token, 'provider': 'sakura_code'})}\n\n"
-                    elif "final_output" in event:
-                        final_out = f"\n\n### Coding Task Result: {event.get('phase')}\n\n{event['final_output']}"
-                        full_response += final_out
-                        yield f"data: {json.dumps({'token': final_out, 'provider': 'sakura_code'})}\n\n"
-                    elif "error" in event:
-                        err_out = f"\n\n**Error:** {event['error']}\n"
-                        full_response += err_out
-                        yield f"data: {json.dumps({'token': err_out, 'provider': 'sakura_code'})}\n\n"
+                current_seq = 0
+                is_terminal = False
+                idle_count = 0
+                queued_idle_count = 0
+                is_test_env = os.getenv("ENVIRONMENT", "").lower() in ("test", "testing")
+                max_idle_polls = 240  # 120s max idle wait while RUNNING
+                max_queued_polls = 1 if is_test_env else 20  # bounded wait if still unclaimed in QUEUED
 
-                # Save assistant message after stream completes
+                queued_banner = f"*Queued durable coding task `{queued_task_id}` for workspace `{ws.name}`.*\n"
+                full_response += queued_banner
+                yield f"data: {json.dumps({'token': queued_banner, 'provider': 'sakura_code', 'coding_task_id': queued_task_id, 'coding_job_id': queued_job_id, 'phase': 'QUEUED', 'events_stream_url': f'/api/v1/coding/tasks/{queued_task_id}/events/stream'})}\n\n"
+
                 from database.db import get_db_context
+                while not is_terminal and idle_count < max_idle_polls:
+                    with get_db_context() as db_ctx:
+                        evts = (
+                            db_ctx.query(CodingTaskEvent)
+                            .join(CodingJob, CodingTaskEvent.job_id == CodingJob.id)
+                            .filter(
+                                CodingTaskEvent.task_id == queued_task_id,
+                                CodingTaskEvent.sequence_number > current_seq,
+                                CodingJob.user_id == owner_id,
+                                CodingJob.workspace_id == ws_uuid,
+                            )
+                            .order_by(CodingTaskEvent.sequence_number.asc())
+                            .all()
+                        )
+                        if evts:
+                            idle_count = 0
+                            queued_idle_count = 0
+                            for evt in evts:
+                                current_seq = evt.sequence_number
+                                chunk_msg = ""
+                                if evt.tool_name and evt.event_type == "tool_start":
+                                    chunk_msg = f"\n`[{evt.phase}: {evt.tool_name}]`\n"
+                                elif is_terminal_coding_status(evt.phase):
+                                    chunk_msg = f"\n\n### Coding Task Result: {evt.phase}\n\n{evt.message or evt.stdout_preview or ''}"
+                                elif evt.message:
+                                    chunk_msg = f"*{evt.message}*\n"
+                                if chunk_msg:
+                                    full_response += chunk_msg
+                                    yield f"data: {json.dumps({'token': chunk_msg, 'provider': 'sakura_code', 'coding_task_id': queued_task_id, 'coding_job_id': queued_job_id, 'sequence_number': evt.sequence_number, 'phase': evt.phase, 'tool': evt.tool_name})}\n\n"
+                                if is_terminal_coding_status(evt.phase):
+                                    is_terminal = True
+                                    break
+                        else:
+                            idle_count += 1
+                            job_rec = db_ctx.query(CodingJob).filter(
+                                CodingJob.task_id == queued_task_id,
+                                CodingJob.user_id == owner_id,
+                            ).first()
+                            if not job_rec or is_terminal_coding_status(job_rec.status):
+                                is_terminal = True
+                            elif job_rec.status == "QUEUED":
+                                queued_idle_count += 1
+                                if queued_idle_count >= max_queued_polls:
+                                    break
+
+                    if not is_terminal:
+                        await asyncio.sleep(0.05 if is_test_env else 0.5)
+
+                # Save assistant message referencing durable coding task
                 with get_db_context() as db_ctx:
                     assistant_msg = Message(
-                        conversation_id=conv.id,
+                        conversation_id=conv_id_val,
                         role="assistant",
                         content=full_response,
-                        metadata_json={"provider": "sakura_code", "coding_task_id": str(coding_task.id)}
+                        metadata_json={
+                            "provider": "sakura_code",
+                            "coding_task_id": queued_task_id,
+                            "coding_job_id": queued_job_id,
+                        },
                     )
                     db_ctx.add(assistant_msg)
-                    c = db_ctx.query(Conversation).filter_by(id=conv.id).first()
+                    c = db_ctx.query(Conversation).filter_by(id=conv_id_val).first()
                     if c:
                         if c.title.startswith("Chat with"):
-                            c.title = req.message[:50] + ("..." if len(req.message) > 50 else "")
+                            c.title = req_msg_preview
                         c.updated_at = utc_now()
                     db_ctx.commit()
 
@@ -978,8 +1188,7 @@ async def system_status_broadcast_loop():
             pass
 
 _status_broadcast_task = None
- 
-@router.on_event("startup")
+
 async def startup_event():
     global _status_broadcast_task
     env_str = os.getenv("ENVIRONMENT", "").lower()
@@ -991,7 +1200,6 @@ async def startup_event():
     await ws_manager.initialize()
     _status_broadcast_task = asyncio.create_task(system_status_broadcast_loop())
 
-@router.on_event("shutdown")
 async def shutdown_event():
     global _status_broadcast_task
     if _status_broadcast_task:
@@ -1008,48 +1216,25 @@ def system_status(current_user: User = Depends(AuthManager.get_current_user)):
     user_id = str(current_user.id)
     return get_system_telemetry(user_id, current_user.id)
 
-# WebSocket route
+# WebSocket route (short-lived single-use tickets ONLY; query-string JWT tokens are forbidden)
 @router.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
     ticket: Optional[str] = None,
-    token: Optional[str] = None
 ):
-    user_id = None
     if not ticket:
         ticket = websocket.query_params.get("ticket")
-    if not token:
-        token = websocket.query_params.get("token")
 
-    if ticket:
-        user_uuid = AuthManager.consume_ws_ticket(ticket)
-        if user_uuid:
-            user_id = str(user_uuid)
-        else:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-    elif token:
-        try:
-            from jose import jwt
-            from auth.manager import SECRET_KEY, ALGORITHM
-            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-            username: str = payload.get("sub")
-            if username is None:
-                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-                return
-            from database.db import get_db_context
-            with get_db_context() as db:
-                user = db.query(User).filter(User.username == username).first()
-                if not user:
-                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-                    return
-                user_id = str(user.id)
-        except Exception:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-    else:
+    # Explicitly reject query-string JWT token fallback
+    if not ticket or websocket.query_params.get("token"):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
+
+    user_uuid = await asyncio.to_thread(AuthManager.consume_ws_ticket, ticket)
+    if not user_uuid:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    user_id = str(user_uuid)
 
     await ws_manager.connect(user_id, websocket)
     try:
@@ -1126,6 +1311,13 @@ async def retry_task(task_id: str, current_user: User = Depends(AuthManager.get_
         raise HTTPException(status_code=404, detail="Task not found")
     return task.to_dict()
 
+@router.delete("/tasks/clear_completed")
+async def clear_completed_tasks(current_user: User = Depends(AuthManager.get_current_user)):
+    TaskManager.clear_completed_tasks(current_user.id)
+    user_tasks = [t.to_dict() for t in TaskManager.list_tasks(current_user.id)]
+    await ws_manager.send_to_user(str(current_user.id), {"type": "tasks_list", "data": user_tasks})
+    return {"status": "cleared"}
+
 @router.delete("/tasks/{task_id}")
 async def delete_task(task_id: str, current_user: User = Depends(AuthManager.get_current_user)):
     try:
@@ -1140,13 +1332,6 @@ async def delete_task(task_id: str, current_user: User = Depends(AuthManager.get
     user_tasks = [t.to_dict() for t in TaskManager.list_tasks(current_user.id)]
     await ws_manager.send_to_user(str(current_user.id), {"type": "tasks_list", "data": user_tasks})
     return {"status": "deleted"}
-
-@router.delete("/tasks/clear_completed")
-async def clear_completed_tasks(current_user: User = Depends(AuthManager.get_current_user)):
-    TaskManager.clear_completed_tasks(current_user.id)
-    user_tasks = [t.to_dict() for t in TaskManager.list_tasks(current_user.id)]
-    await ws_manager.send_to_user(str(current_user.id), {"type": "tasks_list", "data": user_tasks})
-    return {"status": "cleared"}
 
 
 # ─── Image Generation & Editing Endpoints ─────────────────────────────────────
@@ -1253,6 +1438,130 @@ async def api_upscale_image(
         return {"status": "success", "image": res}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+class ImageJobCreateRequest(BaseModel):
+    prompt: str
+    requested_pipeline: Optional[str] = "auto"
+    aspect_ratio: Optional[str] = "1:1"
+    intensity: Optional[str] = "medium"
+    conversation_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
+@router.post("/images/jobs", status_code=202)
+def api_create_image_job(
+    req: ImageJobCreateRequest,
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Creates a durable worker-backed ImageGenerationJob in QUEUED state."""
+    from media.image_worker import create_image_generation_job
+    if not (req.prompt or "").strip():
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+    if req.conversation_id:
+        try:
+            uuid.UUID(str(req.conversation_id))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid conversation ID format.")
+
+    job, created = create_image_generation_job(
+        db=db,
+        user_id=current_user.id,
+        prompt=req.prompt,
+        requested_pipeline=req.requested_pipeline or "auto",
+        parameters={
+            "aspect_ratio": req.aspect_ratio or "1:1",
+            "intensity": req.intensity or "medium",
+            "conversation_id": req.conversation_id,
+        },
+        idempotency_key=req.idempotency_key,
+    )
+    payload = job.to_dict()
+    payload["idempotent_replay"] = not created
+    return payload
+
+
+@router.get("/images/jobs")
+def api_list_image_jobs(
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Lists durable image generation jobs owned by the authenticated user."""
+    from database.models import ImageGenerationJob
+    jobs = db.query(ImageGenerationJob).filter(
+        ImageGenerationJob.user_id == current_user.id
+    ).order_by(ImageGenerationJob.created_at.desc()).limit(50).all()
+    return [j.to_dict() for j in jobs]
+
+
+@router.get("/images/jobs/{job_id}")
+def api_get_image_job(
+    job_id: str,
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Returns owner-verified status of a durable ImageGenerationJob."""
+    from database.models import ImageGenerationJob, GeneratedImage
+    try:
+        j_uuid = uuid.UUID(str(job_id).strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid job ID format.")
+
+    job = db.query(ImageGenerationJob).filter(
+        ImageGenerationJob.id == j_uuid,
+        ImageGenerationJob.user_id == current_user.id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Image generation job not found.")
+
+    data = job.to_dict()
+    if job.output_image_id:
+        img = db.query(GeneratedImage).filter(
+            GeneratedImage.id == job.output_image_id,
+            GeneratedImage.user_id == current_user.id,
+        ).first()
+        if img:
+            data["output_image_url"] = img.image_url
+    return data
+
+
+@router.post("/images/jobs/{job_id}/cancel")
+def api_cancel_image_job(
+    job_id: str,
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Cancels a queued or running ImageGenerationJob without overwriting terminal states."""
+    from database.models import ImageGenerationJob, ImageGenerationJobStatus
+    try:
+        j_uuid = uuid.UUID(str(job_id).strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid job ID format.")
+
+    job = db.query(ImageGenerationJob).filter(
+        ImageGenerationJob.id == j_uuid,
+        ImageGenerationJob.user_id == current_user.id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Image generation job not found.")
+
+    if job.status in (
+        ImageGenerationJobStatus.COMPLETED,
+        ImageGenerationJobStatus.FAILED,
+        ImageGenerationJobStatus.CANCELLED,
+    ):
+        return job.to_dict()
+
+    now = utc_now()
+    job.cancel_requested = True
+    if job.status == ImageGenerationJobStatus.QUEUED:
+        job.status = ImageGenerationJobStatus.CANCELLED
+        job.completed_at = now
+    job.updated_at = now
+    db.commit()
+    db.refresh(job)
+    return job.to_dict()
+
 
 @router.get("/images/{image_id}/metadata")
 def api_get_image_metadata(

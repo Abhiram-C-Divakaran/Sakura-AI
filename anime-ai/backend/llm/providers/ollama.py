@@ -10,16 +10,17 @@ class OllamaProvider(OpenAIProvider):
     """
 
     def __init__(self, base_url: Optional[str] = None, model: str = "llama3"):
-        base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        
+        base_url = base_url or os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST") or "http://localhost:11434"
+
         # Format suffix for OpenAI API client route compatibility
         if not base_url.endswith("/v1"):
             base_url = f"{base_url.rstrip('/')}/v1"
 
+        timeout_secs = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "60.0"))
         self.client = AsyncOpenAI(
             api_key="ollama",  # Dummy value for client library assertion checks
             base_url=base_url,
-            timeout=2.0,
+            timeout=timeout_secs,
             max_retries=0
         )
         self.model = model

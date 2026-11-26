@@ -37,14 +37,25 @@ HARD_OUTPUT_LIMIT_BYTES = int(os.getenv("SAKURA_HARD_OUTPUT_LIMIT_BYTES", str(5 
 MAX_OUTPUT_BYTES = CAPTURE_LIMIT_BYTES
 import tempfile
 
+def _is_dir_writable(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+    probe = os.path.join(path, f".sakura_probe_{uuid.uuid4().hex[:8]}")
+    try:
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
 default_ws_root = os.getenv("SAKURA_WORKSPACE_ROOT")
 if not default_ws_root:
-    if os.path.exists("/workspaces") and os.access("/workspaces", os.W_OK):
+    if os.name != "nt" and _is_dir_writable("/workspaces"):
         default_ws_root = "/workspaces"
-    elif os.name != "nt" and not os.access("/", os.W_OK):
-        default_ws_root = os.path.join(tempfile.gettempdir(), "sakura_workspaces")
     else:
-        default_ws_root = "/workspaces"
+        default_ws_root = os.path.join(tempfile.gettempdir(), "sakura_workspaces")
 WORKSPACE_ROOT = os.path.realpath(os.path.abspath(default_ws_root))
 WORKSPACES_VOLUME = os.getenv("SAKURA_WORKSPACES_VOLUME", "")
 
@@ -54,6 +65,7 @@ except (PermissionError, OSError):
     pass
 
 _readiness_cache: Dict[str, Any] = {"last_check": 0.0, "result": None}
+_ACTIVE_EXECUTIONS: Dict[str, Tuple[str, Any]] = {}
 
 
 def check_docker_operational() -> bool:
@@ -146,6 +158,7 @@ class ExecuteRequest(BaseModel):
     allow_network: bool = False
     network_authorization_id: Optional[str] = None
     network_capability: Optional[str] = None
+    execution_id: Optional[str] = None
     read_only: bool = False
     tool_name: str = "run_command"
 
@@ -295,11 +308,15 @@ async def readiness():
                     pass
 
     ws_root_ok = os.path.isdir(WORKSPACE_ROOT)
+    configured_vol = os.getenv("SAKURA_WORKSPACES_VOLUME", WORKSPACES_VOLUME).strip()
+    volume_ok = True
+    if configured_vol:
+        volume_ok = get_volume_host_mountpoint(configured_vol) is not None if docker_ok else False
 
     if is_prod:
-        is_ready = docker_ok and image_ok and container_can_start and non_root and all(binaries.values()) and ws_root_ok
+        is_ready = docker_ok and image_ok and container_can_start and non_root and all(binaries.values()) and ws_root_ok and volume_ok
     else:
-        is_ready = docker_ok and image_ok and ws_root_ok
+        is_ready = docker_ok and image_ok and container_can_start and non_root and ws_root_ok and volume_ok
 
     payload = {
         "ready": is_ready,
@@ -309,6 +326,8 @@ async def readiness():
         "non_root_execution": non_root,
         "binaries": binaries,
         "workspace_root_available": ws_root_ok,
+        "workspace_volume_available": volume_ok,
+        "workspace_volume": configured_vol or None,
         "workspace_root": WORKSPACE_ROOT,
         "image": SANDBOX_IMAGE,
         "timestamp": now
@@ -435,8 +454,9 @@ async def clone_repository(
         env_args.extend(["-e", f"{k}={v}"])
 
     docker_run_cmd = [
-        "docker", "run",
+        "docker", "run", "--rm",
         "--name", container_name,
+        "--user", "1001:1001",
         "--network", "bridge",
         "--security-opt", "no-new-privileges:true",
         "--cap-drop", "ALL",
@@ -636,16 +656,32 @@ async def execute_command(
             }
 
     # 4. Validate network authorization policy via cryptographically signed capability
+    # Strictly requires a signed 'network_exec' capability (never raw authorization UUIDs or clone tokens)
     network_flag = "none"
     if req.allow_network:
         is_authorized = False
-        cap_token = req.network_capability or req.network_authorization_id
+        cap_token = req.network_capability
+        if not canonical_ws_id:
+            return {
+                "success": False,
+                "tool": req.tool_name,
+                "command": cmd_display,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "Security Error: Outbound network access blocked. A valid workspace_id and signed network_exec capability are required.",
+                "duration_ms": 0,
+                "timed_out": False,
+                "blocked": True,
+                "isolation_unavailable": False,
+                "output_truncated": False,
+                "output_limit_exceeded": False
+            }
         if cap_token:
             from coding.capabilities import verify_and_consume_capability, CapabilityError
             try:
                 verify_and_consume_capability(
                     capability_token=cap_token,
-                    expected_scope=["network_exec", "repository_clone"],
+                    expected_scope="network_exec",
                     expected_workspace_id=canonical_ws_id,
                     expected_command=req.command
                 )
@@ -665,7 +701,7 @@ async def execute_command(
                     "output_truncated": False,
                     "output_limit_exceeded": False
                 }
-            except Exception as e:
+            except Exception:
                 is_authorized = False
 
         if not is_authorized:
@@ -785,12 +821,14 @@ async def execute_command(
     stdout_drainer = None
     stderr_drainer = None
 
+    exec_id = (req.execution_id or uuid.uuid4().hex).strip()
     try:
         proc = await asyncio.create_subprocess_exec(
             *docker_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
+        _ACTIVE_EXECUTIONS[exec_id] = (container_name, proc)
 
         def kill_runaway_container():
             nonlocal output_limit_exceeded
@@ -888,6 +926,7 @@ async def execute_command(
             "output_limit_exceeded": False
         }
     finally:
+        _ACTIVE_EXECUTIONS.pop(exec_id, None)
         # Idempotent cleanup: unconditionally ensure execution container is removed from Docker
         try:
             subprocess.run(
@@ -899,6 +938,35 @@ async def execute_command(
             )
         except Exception:
             pass
+
+
+@app.post("/executions/{execution_id}/cancel")
+async def cancel_execution(
+    execution_id: str,
+    _auth: bool = Depends(verify_service_token)
+):
+    """Terminates an active sandbox execution container by execution_id."""
+    entry = _ACTIVE_EXECUTIONS.pop(execution_id.strip(), None)
+    if not entry:
+        return {"cancelled": False, "execution_id": execution_id, "reason": "not_running"}
+
+    container_name, proc = entry
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False
+        )
+    except Exception:
+        pass
+    if proc is not None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    return {"cancelled": True, "execution_id": execution_id, "container_name": container_name}
 
 
 @app.post("/tests")

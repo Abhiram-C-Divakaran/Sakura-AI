@@ -601,8 +601,20 @@ class Agent:
         then streams the final LLM response.
         """
         from ml_pipeline import IntentClassifier
+        from llm.router import PrivateModelUnavailableError
         intent = IntentClassifier().classify(user_message)
-        provider_name, provider = self.llm_router.get_provider(intent)
+        try:
+            provider_name, provider = self.llm_router.get_provider(intent)
+        except PrivateModelUnavailableError as e:
+            yield {
+                "token": (
+                    f"Private local mode is currently unavailable: {str(e)} "
+                    "Your message was not sent to any external cloud AI provider."
+                ),
+                "provider": "private_unavailable",
+                "error": str(e),
+            }
+            return
 
         # Map intensity settings to internal request parameters & system instructions
         if self.intensity == "low":

@@ -164,5 +164,82 @@ class TestWorkspaceTopologyE2E(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(sec, child_env, f"Secret {sec} was not scrubbed from child environment!")
 
 
+@unittest.skipUnless(
+    os.getenv("SAKURA_SANDBOX_E2E", "0") == "1",
+    "Remote Docker shared-volume topology E2E disabled (set SAKURA_SANDBOX_E2E=1)"
+)
+class TestRealRemoteWorkspaceTopologyE2E(unittest.IsolatedAsyncioTestCase):
+    """
+    Proves real shared-volume topology using RemoteHttpSandboxRuntime + Docker child containers:
+    Backend/application writes file -> Remote executor reads it -> Docker child modifies it
+    -> Backend/application reads the modification, plus cross-workspace isolation.
+    Never substitutes LocalRestrictedSandboxRuntime.
+    """
+
+    async def test_shared_volume_roundtrip_and_isolation_via_remote_executor(self):
+        import httpx
+
+        sandbox_url = os.getenv("SAKURA_SANDBOX_URL", "http://localhost:9000").rstrip("/")
+        service_token = os.getenv("SAKURA_SANDBOX_SERVICE_TOKEN", "ci_test_sandbox_token_abc123")
+        shared_root = os.getenv("SAKURA_SHARED_WORKSPACE_ROOT") or os.getenv("SAKURA_WORKSPACE_ROOT")
+        self.assertTrue(
+            shared_root and os.path.isdir(shared_root),
+            f"SAKURA_WORKSPACE_ROOT ({shared_root}) must point to the actual shared volume mount for E2E topology test."
+        )
+
+        ws_a_id = str(uuid.uuid4())
+        ws_b_id = str(uuid.uuid4())
+        headers = {"X-Sandbox-Token": service_token}
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r_ready = await client.get(f"{sandbox_url}/readiness", headers=headers)
+            self.assertEqual(r_ready.status_code, 200, f"Remote executor readiness failed: {r_ready.text}")
+            self.assertEqual((await client.post(f"{sandbox_url}/workspaces/{ws_a_id}", headers=headers)).status_code, 200)
+            self.assertEqual((await client.post(f"{sandbox_url}/workspaces/{ws_b_id}", headers=headers)).status_code, 200)
+
+        ws_a_dir = os.path.join(shared_root, ws_a_id)
+        ws_b_dir = os.path.join(shared_root, ws_b_id)
+        os.makedirs(ws_a_dir, exist_ok=True)
+        os.makedirs(ws_b_dir, exist_ok=True)
+
+        # 1. Backend/application writes file into shared volume for Workspace A
+        app_file = os.path.join(ws_a_dir, "topology_probe.txt")
+        with open(app_file, "w", encoding="utf-8") as f:
+            f.write("WRITTEN_BY_BACKEND\n")
+
+        remote_a = RemoteHttpSandboxRuntime(
+            workspace_root=ws_a_dir,
+            service_url=sandbox_url,
+            service_token=service_token,
+            workspace_id=ws_a_id,
+        )
+        remote_b = RemoteHttpSandboxRuntime(
+            workspace_root=ws_b_dir,
+            service_url=sandbox_url,
+            service_token=service_token,
+            workspace_id=ws_b_id,
+        )
+
+        # 2. Remote executor reads the file inside Docker child container
+        read_res = await remote_a.run_command("cat /workspace/topology_probe.txt")
+        self.assertTrue(read_res.get("success"), f"Remote read failed: {read_res}")
+        self.assertIn("WRITTEN_BY_BACKEND", read_res.get("stdout", ""))
+
+        # 3. Docker child modifies the file
+        mod_res = await remote_a.run_command("echo 'MODIFIED_BY_DOCKER_CHILD' >> /workspace/topology_probe.txt")
+        self.assertTrue(mod_res.get("success"), f"Remote modify failed: {mod_res}")
+
+        # 4. Backend/application reads the modification from the shared volume
+        with open(app_file, "r", encoding="utf-8") as f:
+            final_text = f.read()
+        self.assertIn("WRITTEN_BY_BACKEND", final_text)
+        self.assertIn("MODIFIED_BY_DOCKER_CHILD", final_text)
+
+        # 5. Cross-workspace isolation: Workspace B child container cannot read Workspace A's file
+        iso_res = await remote_b.run_command("cat /workspace/topology_probe.txt")
+        self.assertFalse(iso_res.get("success"))
+        self.assertNotIn("WRITTEN_BY_BACKEND", iso_res.get("stdout", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

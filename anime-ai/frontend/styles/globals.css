@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Outfit:wght@300;400;500;600;700;800;900&family=Inter:wght@300;400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Outfit:wght@300;400;500;600;700;800;900&family=Inter:wght@300;400;500;600&family=Caveat:wght@400;600;700&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -155,9 +155,10 @@
   }
 
   ::selection {
-    background: rgba(0, 245, 255, 0.3);
+    background: rgba(255, 95, 143, 0.28);
     color: #fff;
   }
+
 
   [data-theme="light"] ::selection {
     background: rgba(37, 99, 235, 0.2);
@@ -287,4 +288,33 @@
 @keyframes pulseGlow {
   0%, 100% { box-shadow: 0 0 4px currentColor; }
   50%       { box-shadow: 0 0 12px currentColor, 0 0 20px currentColor; }
+}
+
+/* ─── Sakura Landing Custom Utilities ─── */
+.font-handwriting {
+  font-family: 'Caveat', cursive;
+}
+
+@keyframes petalDrift {
+  0% {
+    transform: translateY(-20px) translateX(0) rotate(0deg);
+    opacity: 0;
+  }
+  15% {
+    opacity: 0.85;
+  }
+  85% {
+    opacity: 0.7;
+  }
+  100% {
+    transform: translateY(105vh) translateX(120px) rotate(360deg);
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-petal {
+    animation: none !important;
+    display: none !important;
+  }
 }

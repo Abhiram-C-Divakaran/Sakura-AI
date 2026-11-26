@@ -164,12 +164,19 @@ class AuthManager:
 
         # Also store in Redis if available
         redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        client = None
         try:
             import redis
             client = redis.from_url(redis_url, socket_connect_timeout=0.5, socket_timeout=0.5)
             client.set(f"sakura:ws_ticket:{ticket_str}", str(uid), ex=ttl_seconds)
         except Exception:
             pass
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
         return {
             "ticket": ticket_str,
@@ -181,7 +188,8 @@ class AuthManager:
     def consume_ws_ticket(ticket_str: str, db: Optional[Session] = None) -> Optional[Any]:
         """
         Validates and atomically consumes a single-use WebSocket ticket.
-        Returns the user_id if valid and successfully consumed, or None.
+        Enforces both consumed_at IS NULL and expires_at > now inside the CAS UPDATE
+        so concurrent or expired consumption attempts never succeed twice.
         """
         if not ticket_str or not isinstance(ticket_str, str) or not ticket_str.startswith("wst_"):
             return None
@@ -203,11 +211,13 @@ class AuthManager:
             user_id = ticket_rec.user_id
             rows = session.query(WebSocketTicket).filter(
                 WebSocketTicket.ticket == ticket_str,
-                WebSocketTicket.consumed_at.is_(None)
-            ).update({WebSocketTicket.consumed_at: now})
+                WebSocketTicket.consumed_at.is_(None),
+                WebSocketTicket.expires_at > now
+            ).update({WebSocketTicket.consumed_at: now}, synchronize_session=False)
             session.commit()
 
-            if rows > 0:
+            if rows == 1:
+                client = None
                 try:
                     import redis
                     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -215,6 +225,12 @@ class AuthManager:
                     client.delete(f"sakura:ws_ticket:{ticket_str}")
                 except Exception:
                     pass
+                finally:
+                    if client is not None:
+                        try:
+                            client.close()
+                        except Exception:
+                            pass
                 return user_id
             return None
 

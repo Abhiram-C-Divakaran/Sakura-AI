@@ -42,7 +42,14 @@ class TestCapabilitiesTruthfulness(unittest.TestCase):
 
     def test_image_generation_capability_truthful(self):
         """Image generation capability must reflect actual runtime (Pollinations/Flux/Turbo), not DALL-E 3."""
-        resp = self.client.get("/api/v1/capabilities")
+        mock_status = {
+            "status": "AVAILABLE",
+            "provider": "pollinations",
+            "models": ["flux", "turbo"],
+            "health_verified_at": "2026-11-26T00:00:00Z",
+        }
+        with patch("media.image_engine.ImageGenerationEngine.get_status", return_value=mock_status):
+            resp = self.client.get("/api/v1/capabilities")
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
         image_cap = data.get("image_generation", {})

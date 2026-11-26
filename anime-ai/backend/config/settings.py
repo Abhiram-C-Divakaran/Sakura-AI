@@ -21,6 +21,7 @@ KNOWN_DEV_SECRETS = {
     "12345678",
     "sakura_dev_secret_local_only_1234567890",
     "sakura_dev_integration_key_local_only_1234567890",
+    "sakura_dev_capability_signing_key_32_chars_ok!",
 }
 
 class Settings(BaseSettings):
@@ -87,6 +88,21 @@ class Settings(BaseSettings):
     # Media
     stability_api_key: Optional[str] = Field(default=None, alias="STABILITY_API_KEY")
     replicate_api_token: Optional[str] = Field(default=None, alias="REPLICATE_API_TOKEN")
+
+    # Email / Password Reset Delivery (explicitly configured provider required)
+    smtp_host: Optional[str] = Field(default=None, alias="SMTP_HOST")
+    smtp_port: int = Field(default=587, alias="SMTP_PORT")
+    smtp_user: Optional[str] = Field(default=None, alias="SMTP_USER")
+    smtp_password: Optional[str] = Field(default=None, alias="SMTP_PASSWORD")
+    smtp_from_email: Optional[str] = Field(default=None, alias="SMTP_FROM_EMAIL")
+    smtp_use_tls: bool = Field(default=True, alias="SMTP_USE_TLS")
+    public_app_url: Optional[str] = Field(default=None, alias="PUBLIC_APP_URL")
+
+    # OAuth Login Providers (only enabled when explicitly configured)
+    google_client_id: Optional[str] = Field(default=None, alias="GOOGLE_CLIENT_ID")
+    google_client_secret: Optional[str] = Field(default=None, alias="GOOGLE_CLIENT_SECRET")
+    github_client_id: Optional[str] = Field(default=None, alias="GITHUB_CLIENT_ID")
+    github_client_secret: Optional[str] = Field(default=None, alias="GITHUB_CLIENT_SECRET")
 
     @property
     def cors_origins_list(self) -> List[str]:

@@ -9,6 +9,7 @@ is unavailable or for local testing.
 
 import os
 import time
+import uuid
 import shutil
 import asyncio
 import subprocess
@@ -55,9 +56,10 @@ class DockerSandboxRuntime(BaseSandboxRuntime):
     DEFAULT_PIDS_LIMIT = int(os.getenv("SAKURA_SANDBOX_PIDS", "64"))
     MAX_OUTPUT_CHARS = 100000
 
-    def __init__(self, workspace_root: str, default_timeout_seconds: int = 60):
+    def __init__(self, workspace_root: str, default_timeout_seconds: int = 60, workspace_id: Optional[str] = None):
         self.workspace_root = os.path.realpath(os.path.abspath(workspace_root))
         self.default_timeout_seconds = default_timeout_seconds
+        self.workspace_id = workspace_id or os.path.basename(self.workspace_root)
 
     async def run_command(
         self,
@@ -67,7 +69,10 @@ class DockerSandboxRuntime(BaseSandboxRuntime):
         tool_name: str = "run_command",
         allow_network: bool = False,
         network_authorization_id: Optional[str] = None,
-        network_capability: Optional[str] = None
+        network_capability: Optional[str] = None,
+        expected_scope: str = "network_exec",
+        expected_repository_url: Optional[str] = None,
+        expected_branch: Optional[str] = None
     ) -> Dict[str, Any]:
         start_time = time.time()
         timeout = timeout_seconds or self.default_timeout_seconds
@@ -84,21 +89,61 @@ class DockerSandboxRuntime(BaseSandboxRuntime):
         else:
             cmd_args = ["sh", "-c", command]
 
-        network_flag = "bridge" if allow_network else "none"
+        network_flag = "none"
+        if allow_network:
+            if not network_capability:
+                return {
+                    "success": False,
+                    "tool": tool_name,
+                    "command": " ".join(cmd_args) if isinstance(cmd_args, list) else str(cmd_args),
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": "Security Error: Outbound network access blocked. Valid signed capability token is required.",
+                    "duration_ms": 0,
+                    "timed_out": False,
+                    "blocked": True
+                }
+            from coding.capabilities import verify_and_consume_capability, CapabilityError
+            try:
+                verify_and_consume_capability(
+                    capability_token=network_capability,
+                    expected_scope=expected_scope,
+                    expected_workspace_id=self.workspace_id,
+                    expected_command=command,
+                    expected_repository_url=expected_repository_url,
+                    expected_branch=expected_branch
+                )
+            except CapabilityError as e:
+                return {
+                    "success": False,
+                    "tool": tool_name,
+                    "command": " ".join(cmd_args) if isinstance(cmd_args, list) else str(cmd_args),
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"Security Error: Outbound network access blocked ({str(e)}).",
+                    "duration_ms": 0,
+                    "timed_out": False,
+                    "blocked": True
+                }
+            network_flag = "bridge"
 
+        container_name = f"sakura-local-exec-{uuid.uuid4().hex[:12]}"
         docker_cmd = [
             "docker", "run", "--rm",
+            "--name", container_name,
             "--user", "1001:1001",
             "--network", network_flag,
             f"--cpus={self.DEFAULT_CPU_LIMIT}",
             f"--memory={self.DEFAULT_MEMORY_MB}m",
             f"--pids-limit={self.DEFAULT_PIDS_LIMIT}",
             "--security-opt", "no-new-privileges:true",
+            "--cap-drop", "ALL",
             "-v", f"{self.workspace_root}:/workspace:rw",
             "-w", container_workdir,
             self.DEFAULT_IMAGE
         ] + cmd_args
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *docker_cmd,
@@ -125,10 +170,19 @@ class DockerSandboxRuntime(BaseSandboxRuntime):
                     "duration_ms": duration_ms,
                     "timed_out": False
                 }
+            except asyncio.CancelledError:
+                subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                if proc is not None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                raise
             except asyncio.TimeoutError:
+                subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                 try:
                     proc.kill()
-                    await proc.communicate()
+                    await asyncio.wait_for(proc.wait(), timeout=2)
                 except Exception:
                     pass
                 duration_ms = int((time.time() - start_time) * 1000)
@@ -142,6 +196,8 @@ class DockerSandboxRuntime(BaseSandboxRuntime):
                     "duration_ms": duration_ms,
                     "timed_out": True
                 }
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
             return {
@@ -188,6 +244,7 @@ class RemoteHttpSandboxRuntime(BaseSandboxRuntime):
         network_capability: Optional[str] = None
     ) -> Dict[str, Any]:
         timeout = timeout_seconds or self.default_timeout_seconds
+        execution_id = uuid.uuid4().hex
         payload = {
             "command": command,
             "timeout_seconds": timeout,
@@ -195,8 +252,8 @@ class RemoteHttpSandboxRuntime(BaseSandboxRuntime):
             "workspace_path": self.workspace_root,
             "cwd_relative": cwd_relative,
             "allow_network": allow_network,
-            "network_authorization_id": network_authorization_id,
-            "network_capability": network_capability or network_authorization_id,
+            "network_capability": network_capability,
+            "execution_id": execution_id,
             "tool_name": tool_name
         }
         headers = {}
@@ -221,6 +278,16 @@ class RemoteHttpSandboxRuntime(BaseSandboxRuntime):
                         f"Sandbox executor container isolation unavailable: {data.get('stderr')}"
                     )
                 return data
+        except asyncio.CancelledError:
+            try:
+                async with httpx.AsyncClient(timeout=3.0) as cancel_client:
+                    await cancel_client.post(
+                        f"{self.service_url}/executions/{execution_id}/cancel",
+                        headers=headers
+                    )
+            except Exception:
+                pass
+            raise
         except SandboxUnavailableError:
             raise
         except Exception as e:
@@ -234,6 +301,50 @@ class RemoteHttpSandboxRuntime(BaseSandboxRuntime):
                 "exit_code": -1,
                 "stdout": "",
                 "stderr": f"Sandbox service connection error: {str(e)}",
+                "duration_ms": int((time.time() - start_time) * 1000),
+                "timed_out": False
+            }
+
+    async def clone_repository(
+        self,
+        repository_url: str,
+        branch: str,
+        capability_token: str,
+        timeout_seconds: int = 120
+    ) -> Dict[str, Any]:
+        """Invokes the dedicated /workspaces/{workspace_id}/clone endpoint with a repository_clone capability."""
+        headers = {}
+        if self.service_token:
+            headers["X-Sandbox-Token"] = self.service_token
+
+        payload = {
+            "repository_url": repository_url,
+            "branch": branch,
+            "capability_token": capability_token,
+            "timeout_seconds": timeout_seconds
+        }
+        start_time = time.time()
+        try:
+            async with httpx.AsyncClient(timeout=float(timeout_seconds + 15)) as client:
+                await client.post(f"{self.service_url}/workspaces/{self.workspace_id}", headers=headers)
+                resp = await client.post(
+                    f"{self.service_url}/workspaces/{self.workspace_id}/clone",
+                    json=payload,
+                    headers=headers
+                )
+                if resp.status_code == 401:
+                    raise SandboxUnavailableError("Sandbox executor authentication failed: invalid service token.")
+                if resp.status_code != 200:
+                    raise SandboxUnavailableError(f"Sandbox clone returned HTTP {resp.status_code}: {resp.text}")
+                return resp.json()
+        except SandboxUnavailableError:
+            raise
+        except Exception as e:
+            return {
+                "success": False,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Sandbox clone connection error: {str(e)}",
                 "duration_ms": int((time.time() - start_time) * 1000),
                 "timed_out": False
             }
@@ -354,11 +465,26 @@ class LocalRestrictedSandboxRuntime(BaseSandboxRuntime):
                     "duration_ms": duration_ms,
                     "timed_out": False
                 }
-            except asyncio.TimeoutError:
-                # Force kill process tree
+            except asyncio.CancelledError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
                 self._kill_process_tree(proc.pid)
                 try:
-                    await proc.communicate()
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except Exception:
+                    pass
+                raise
+            except asyncio.TimeoutError:
+                # Terminate process directly first, then sweep child tree with bounded timeout
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                self._kill_process_tree(proc.pid)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2)
                 except Exception:
                     pass
                 duration_ms = int((time.time() - start_time) * 1000)
@@ -372,6 +498,8 @@ class LocalRestrictedSandboxRuntime(BaseSandboxRuntime):
                     "duration_ms": duration_ms,
                     "timed_out": True
                 }
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
             return {
@@ -393,6 +521,7 @@ class LocalRestrictedSandboxRuntime(BaseSandboxRuntime):
                     ["taskkill", "/F", "/T", "/PID", str(pid)],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    timeout=2,
                     check=False
                 )
             else:
@@ -513,7 +642,7 @@ class SandboxManager:
 
         if pref == "docker":
             if cls.is_docker_available():
-                return DockerSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
+                return DockerSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds, workspace_id=workspace_id)
             raise SandboxUnavailableError("Docker sandbox runtime was explicitly requested but Docker is not available.")
 
         if pref == "auto":
@@ -526,7 +655,7 @@ class SandboxManager:
                     workspace_id=workspace_id
                 )
             if cls.is_docker_available():
-                return DockerSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
+                return DockerSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds, workspace_id=workspace_id)
 
         return LocalRestrictedSandboxRuntime(workspace_root, default_timeout_seconds=timeout_seconds)
 

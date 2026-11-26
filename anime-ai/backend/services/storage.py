@@ -17,6 +17,7 @@ Guarantees:
 
 import os
 import io
+import re
 import uuid
 import shutil
 import logging
@@ -284,6 +285,21 @@ class LocalFilesystemStorage(StorageBackend):
             logger.warning(f"Error deleting storage object '{storage_key}': {e}")
             return False
 
+    def list_keys(self, prefix: str = "") -> list[str]:
+        """Lists canonical relative storage keys under the given prefix."""
+        clean_prefix = prefix.replace("\\", "/").lstrip("/")
+        base_dir = self._resolve_key_path(clean_prefix) if clean_prefix else self.root_dir
+        if not os.path.exists(base_dir):
+            return []
+        keys: list[str] = []
+        for root, _dirs, files in os.walk(base_dir):
+            for fname in files:
+                abs_path = os.path.join(root, fname)
+                rel = os.path.relpath(abs_path, self.root_dir).replace("\\", "/")
+                if not clean_prefix or rel.startswith(clean_prefix):
+                    keys.append(rel)
+        return keys
+
     def get_size(self, storage_key: str) -> int:
         file_path = self._resolve_key_path(storage_key)
         if not os.path.exists(file_path):
@@ -357,7 +373,9 @@ class S3CompatibleStorage(StorageBackend):
 
             cfg = Config(
                 signature_version="s3v4",
-                retries={"max_attempts": 3, "mode": "standard"},
+                connect_timeout=3,
+                read_timeout=10,
+                retries={"max_attempts": 2, "mode": "standard"},
                 s3={"addressing_style": "path"} if self.endpoint_url else {}
             )
             self._client = boto3.client(
@@ -495,6 +513,18 @@ class S3CompatibleStorage(StorageBackend):
             logger.warning(f"Error deleting object '{norm_key}' from S3: {e}")
             return False
 
+    def list_keys(self, prefix: str = "") -> list[str]:
+        """Lists S3 keys under the given prefix using pagination."""
+        client = self._get_client()
+        clean_prefix = prefix.replace("\\", "/").lstrip("/")
+        keys: list[str] = []
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket_name, Prefix=clean_prefix):
+            for obj in page.get("Contents", []):
+                if obj.get("Key"):
+                    keys.append(obj["Key"])
+        return keys
+
     def get_size(self, storage_key: str) -> int:
         meta = self.get_metadata(storage_key)
         return meta.get("storage_size", 0)
@@ -532,10 +562,11 @@ class S3CompatibleStorage(StorageBackend):
                 for chunk in body.iter_chunks(chunk_size=64 * 1024):
                     yield chunk
 
+            safe_filename = re.sub(r'[\r\n"\\]', "_", str(filename or "download"))
             return StreamingResponse(
                 chunk_generator(),
                 media_type=mime_type or s3_obj.get("ContentType", "application/octet-stream"),
-                headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+                headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'}
             )
         except Exception as e:
             raise StorageObjectNotFoundError(f"Object '{norm_key}' download error: {e}")

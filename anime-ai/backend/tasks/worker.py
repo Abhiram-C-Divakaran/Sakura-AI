@@ -342,22 +342,43 @@ class DurableTaskWorker:
                 pass
 
     async def run(self, max_iterations: Optional[int] = None):
-        """Main worker loop."""
+        """Main worker loop processing background tasks, durable image jobs, and storage deletion outbox."""
+        from media.image_worker import ImageJobWorker
+        from services.documents import process_storage_deletion_outbox
+
         self._running = True
+        image_worker = ImageJobWorker(worker_id=f"{self.worker_id}_img")
         self.recover_stale_tasks()
+        image_worker.recover_stale_jobs()
         logger.info(f"Sakura Durable Task Worker {self.worker_id} online and listening for jobs...")
 
         iteration = 0
+        last_housekeeping = asyncio.get_running_loop().time()
         while self._running:
             if max_iterations is not None and iteration >= max_iterations:
                 break
             iteration += 1
 
             try:
+                now_mono = asyncio.get_running_loop().time()
+                if now_mono - last_housekeeping >= 30.0:
+                    self.recover_stale_tasks()
+                    image_worker.recover_stale_jobs()
+                    process_storage_deletion_outbox(limit=25)
+                    last_housekeeping = now_mono
+
+                did_work = False
                 task = self.claim_next_task()
                 if task:
+                    did_work = True
                     await self.execute_task(task)
-                else:
+
+                img_job = image_worker.claim_next_job()
+                if img_job:
+                    did_work = True
+                    await image_worker.execute_job(img_job)
+
+                if not did_work:
                     await asyncio.sleep(1.0)
             except asyncio.CancelledError:
                 break

@@ -1,4 +1,5 @@
 import json
+from sqlalchemy.exc import IntegrityError
 from database.db import engine, Base, get_db_context
 from database.models import Character
 
@@ -49,8 +50,12 @@ def seed_characters():
                 config=sakura_config_v2
             )
             db.add(sakura)
-            db.commit()
-            print("Sakura seeded successfully (v2).")
+            try:
+                db.commit()
+                print("Sakura seeded successfully (v2).")
+            except IntegrityError:
+                db.rollback()
+                print("Sakura already seeded by concurrent worker.")
         else:
             current_config = sakura.config or {}
             cfg_version = current_config.get("version", 1)

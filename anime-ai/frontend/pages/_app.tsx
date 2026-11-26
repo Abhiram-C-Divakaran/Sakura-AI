@@ -1,6 +1,7 @@
 import type { AppProps } from 'next/app'
 import Head from 'next/head'
 import '../styles/globals.css'
+import '../styles/marketing.css'
 import { ThemeProvider } from '../components/ThemeContext'
 
 export default function App({ Component, pageProps }: AppProps) {

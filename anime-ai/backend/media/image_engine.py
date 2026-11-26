@@ -500,95 +500,107 @@ class ImageGenerationEngine:
         failover_used = (actual_model != "flux")
         attempt_count = successful_attempt
 
-        # Store in durable storage backend
+        # Store in durable storage backend and clean up temp download file
         storage = get_storage_backend()
         storage_key = build_image_storage_key(str(self.user_id), str(image_id))
         with open(storage_path, "rb") as f:
             image_bytes = f.read()
-        storage.put(storage_key, image_bytes, content_type="image/png")
+        put_res = storage.put(storage_key, image_bytes, content_type="image/png", user_id=self.user_id)
         file_size = len(image_bytes)
+        canonical_storage_path = put_res.get("storage_path") or storage_key
+        if os.path.exists(storage_path) and os.path.realpath(storage_path) != os.path.realpath(canonical_storage_path):
+            try:
+                os.remove(storage_path)
+            except Exception:
+                pass
 
-        # 1. Register Document in Sakura Library
-        doc = Document(
-            id=image_id,
-            user_id=self.user_id,
-            filename=filename,
-            mime_type="image/png",
-            storage_path=storage_path,
-            storage_backend=storage.backend_type,
-            storage_key=storage_key,
-            storage_size=file_size,
-            is_knowledge_base=False,
-            indexing_status="NOT_INDEXED",
-            metadata_json={
-                "status": "READY",
-                "indexing_status": "NOT_INDEXED",
-                "size": file_size,
-                "category": "images",
-                "source": "image_generation",
-                "prompt": clean_prompt,
-                "enhanced_prompt": enhanced_prompt,
-                "pipeline": pipeline.value,
-                "aspect_ratio": ratio,
-                "width": width,
-                "height": height,
-                "provider": actual_provider,
-                "model": actual_model,
-                "requested_provider": requested_provider,
-                "requested_model": requested_model,
-                "failover_used": failover_used,
-                "attempt_count": attempt_count,
-                "image_conditioned_edit": False,
-                "true_upscale": False,
-                "seed": actual_seed,
-                "workflow": workflow,
-                "is_knowledge_base": False,
-                "modified_at": datetime.utcnow().isoformat(),
-                "chunks": 0
-            }
-        )
-        self.db.add(doc)
-        self.db.commit()
+        # Atomically register Document + GeneratedImage; compensate storage on DB failure
+        try:
+            doc = Document(
+                id=image_id,
+                user_id=self.user_id,
+                filename=filename,
+                mime_type="image/png",
+                storage_path=canonical_storage_path,
+                storage_backend=storage.backend_type,
+                storage_key=storage_key,
+                storage_size=file_size,
+                is_knowledge_base=False,
+                indexing_status="NOT_INDEXED",
+                metadata_json={
+                    "status": "READY",
+                    "indexing_status": "NOT_INDEXED",
+                    "size": file_size,
+                    "category": "images",
+                    "source": "image_generation",
+                    "prompt": clean_prompt,
+                    "enhanced_prompt": enhanced_prompt,
+                    "pipeline": pipeline.value,
+                    "aspect_ratio": ratio,
+                    "width": width,
+                    "height": height,
+                    "provider": actual_provider,
+                    "model": actual_model,
+                    "requested_provider": requested_provider,
+                    "requested_model": requested_model,
+                    "failover_used": failover_used,
+                    "attempt_count": attempt_count,
+                    "image_conditioned_edit": False,
+                    "true_upscale": False,
+                    "seed": actual_seed,
+                    "workflow": workflow,
+                    "is_knowledge_base": False,
+                    "modified_at": datetime.utcnow().isoformat(),
+                    "chunks": 0
+                }
+            )
+            self.db.add(doc)
 
-        # 2. Register GeneratedImage record
-        gen_image = GeneratedImage(
-            id=image_id,
-            user_id=self.user_id,
-            conversation_id=conversation_id,
-            document_id=doc.id,
-            prompt=clean_prompt,
-            enhanced_prompt=enhanced_prompt,
-            aspect_ratio=ratio,
-            width=width,
-            height=height,
-            model=actual_model,
-            seed=actual_seed,
-            workflow=workflow,
-            parent_image_id=valid_parent_id,
-            lineage_depth=lineage_depth,
-            storage_path=storage_path,
-            storage_backend=storage.backend_type,
-            storage_key=storage_key,
-            storage_size=file_size,
-            image_url=public_image_url,
-            metadata_json={
-                "provider": actual_provider,
-                "actual_model": actual_model,
-                "requested_provider": requested_provider,
-                "requested_model": requested_model,
-                "failover_used": failover_used,
-                "attempt_count": attempt_count,
-                "intensity": intensity,
-                "pipeline": pipeline.value,
-                "negative_prompt": negative_prompt,
-                "file_size": file_size,
-                "image_conditioned_edit": False,
-                "true_upscale": False,
-                "created_at": datetime.utcnow().isoformat()
-            }
-        )
-        self.db.add(gen_image)
-        self.db.commit()
+            gen_image = GeneratedImage(
+                id=image_id,
+                user_id=self.user_id,
+                conversation_id=conversation_id,
+                document_id=doc.id,
+                prompt=clean_prompt,
+                enhanced_prompt=enhanced_prompt,
+                aspect_ratio=ratio,
+                width=width,
+                height=height,
+                model=actual_model,
+                seed=actual_seed,
+                workflow=workflow,
+                parent_image_id=valid_parent_id,
+                lineage_depth=lineage_depth,
+                storage_path=canonical_storage_path,
+                storage_backend=storage.backend_type,
+                storage_key=storage_key,
+                storage_size=file_size,
+                image_url=public_image_url,
+                metadata_json={
+                    "provider": actual_provider,
+                    "actual_model": actual_model,
+                    "requested_provider": requested_provider,
+                    "requested_model": requested_model,
+                    "failover_used": failover_used,
+                    "attempt_count": attempt_count,
+                    "intensity": intensity,
+                    "pipeline": pipeline.value,
+                    "negative_prompt": negative_prompt,
+                    "file_size": file_size,
+                    "image_conditioned_edit": False,
+                    "true_upscale": False,
+                    "created_at": datetime.utcnow().isoformat()
+                }
+            )
+            self.db.add(gen_image)
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            try:
+                storage.delete(storage_key)
+            except Exception:
+                pass
+            raise
 
         # 3. Broadcast real-time library synchronization
         from api.routes import ws_manager

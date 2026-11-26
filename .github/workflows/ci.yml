@@ -26,6 +26,15 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     defaults:
       run:
@@ -35,9 +44,11 @@ jobs:
       INTEGRATION_ENCRYPTION_KEY: "test_integration_key_32_chars_ok!"
       SAKURA_SANDBOX_SERVICE_TOKEN: "test_sandbox_service_token_ci"
       SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY: "test_capability_signing_key_32chars"
+      REDIS_URL: "redis://localhost:6379/0"
       ENVIRONMENT: "test"
       SAKURA_EMBEDDED_WORKER: "false"
       SAKURA_EMBEDDED_SCHEDULER: "false"
+      SAKURA_EMBEDDED_CODING_WORKER: "false"
       SAKURA_WORKSPACE_ROOT: "/tmp/sakura_workspaces"
 
     steps:
@@ -91,7 +102,7 @@ jobs:
         run: |
           python -m unittest tests/test_frontend_api_routing.py -v
 
-      - name: Validate Docker Compose Configuration
+      - name: Validate Docker Compose Production Configuration
         working-directory: anime-ai
         env:
           POSTGRES_PASSWORD: "ci_test_postgres_password"
@@ -102,7 +113,12 @@ jobs:
         run: |
           docker compose -f docker-compose.prod.yml config
 
-      - name: Run Backend Test Suite
+      - name: Build Production Backend Docker Image
+        working-directory: anime-ai/backend
+        run: |
+          docker build -t sakura-backend:test -f Dockerfile .
+
+      - name: Run Full Backend Test Suite
         env:
           DATABASE_URL: "sqlite:///./ci_test.db"
           PYTHONUNBUFFERED: "1"
@@ -110,6 +126,7 @@ jobs:
           ENVIRONMENT: "test"
           SAKURA_EMBEDDED_WORKER: "false"
           SAKURA_EMBEDDED_SCHEDULER: "false"
+          SAKURA_EMBEDDED_CODING_WORKER: "false"
           SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY: "test_capability_signing_key_32chars"
         run: |
           python -m unittest discover -s tests -p "test_*.py" -v
@@ -166,17 +183,24 @@ jobs:
         run: |
           docker build -t sakura-sandbox-executor:latest -f anime-ai/backend/Dockerfile.sandbox-executor anime-ai/backend
 
-      - name: Create Workspaces Volume and Start Executor
+      - name: Start Redis and Sandbox Executor with Shared Workspace Volume
         env:
           POSTGRES_PASSWORD: "ci_secret_super_secret_pg_pwd"
           JWT_SECRET: "ci_secret_super_secret_jwt_key_32c"
           HOST_SENSITIVE_SECRET: "very_sensitive_host_secret_should_never_leak"
           SAKURA_SANDBOX_SERVICE_TOKEN: "ci_test_sandbox_token_abc123"
+          SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY: "ci_test_capability_signing_key_32chars"
         run: |
+          docker network create sakura_ci_net
+          docker run -d --name sakura-ci-redis --network sakura_ci_net -p 6379:6379 redis:7-alpine
           docker volume create sakura_workspaces_vol
+          VOL_PATH=$(docker volume inspect sakura_workspaces_vol --format '{{ .Mountpoint }}')
+          echo "SAKURA_VOL_MOUNT=$VOL_PATH" >> $GITHUB_ENV
           docker run -d --name sakura-sandbox-executor \
+            --network sakura_ci_net \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v sakura_workspaces_vol:/workspaces \
+            -e REDIS_URL=redis://sakura-ci-redis:6379/0 \
             -e SAKURA_SANDBOX_SERVICE_TOKEN=ci_test_sandbox_token_abc123 \
             -e SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY=ci_test_capability_signing_key_32chars \
             -e SAKURA_SANDBOX_IMAGE=sakura-sandbox:latest \
@@ -189,9 +213,10 @@ jobs:
             -p 9000:9000 \
             sakura-sandbox-executor:latest
 
-      - name: Wait for Executor Service Readiness
+      - name: Wait for Executor /readiness (Fail if Not Ready)
         run: |
-          timeout 60 bash -c 'until curl -sf http://localhost:9000/health; do echo "Waiting for sandbox executor..."; sleep 2; done'
+          timeout 60 bash -c 'until curl -sf http://localhost:9000/readiness | grep -q "\"ready\":true"; do echo "Waiting for sandbox executor /readiness..."; sleep 2; done'
+          curl -sf http://localhost:9000/readiness
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -204,18 +229,37 @@ jobs:
         working-directory: anime-ai/backend
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install -r requirements.txt
 
-      - name: Run Sandbox E2E Docker Integration Test
+      - name: Run Real Docker Sandbox E2E & Topology Tests (Zero Skips Allowed)
         working-directory: anime-ai/backend
         env:
           SAKURA_SANDBOX_E2E: "1"
           SAKURA_SANDBOX_URL: "http://localhost:9000"
           SAKURA_SANDBOX_SERVICE_TOKEN: "ci_test_sandbox_token_abc123"
           SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY: "ci_test_capability_signing_key_32chars"
+          SAKURA_WORKSPACE_ROOT: "${{ env.SAKURA_VOL_MOUNT }}"
+          REDIS_URL: "redis://localhost:6379/0"
           POSTGRES_PASSWORD: "ci_secret_super_secret_pg_pwd"
           JWT_SECRET: "ci_secret_super_secret_jwt_key_32c"
           HOST_SENSITIVE_SECRET: "very_sensitive_host_secret_should_never_leak"
         run: |
-          python -m unittest tests/test_sandbox_e2e_docker.py -v
-
+          sudo chmod 777 "$SAKURA_WORKSPACE_ROOT" || true
+          python - <<'PY'
+          import sys, unittest
+          loader = unittest.TestLoader()
+          suite = unittest.TestSuite()
+          suite.addTests(loader.loadTestsFromName("tests.test_sandbox_e2e_docker"))
+          suite.addTests(loader.loadTestsFromName("tests.test_workspace_topology_e2e"))
+          runner = unittest.TextTestRunner(verbosity=2)
+          result = runner.run(suite)
+          if result.testsRun == 0:
+              print("ERROR: Zero E2E tests executed!", file=sys.stderr)
+              sys.exit(1)
+          if len(result.skipped) > 0:
+              print(f"ERROR: E2E tests silently skipped: {result.skipped}", file=sys.stderr)
+              sys.exit(1)
+          if not result.wasSuccessful():
+              sys.exit(1)
+          print(f"SUCCESS: Executed {result.testsRun} Docker E2E tests with 0 skips.")
+          PY
