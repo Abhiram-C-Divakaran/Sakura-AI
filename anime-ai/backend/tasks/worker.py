@@ -305,6 +305,13 @@ class DurableTaskWorker:
                 await execute_scheduled_task_job(task_id, user_id, payload, self.router, ctx=ctx)
             elif task_type == "document_index":
                 await execute_document_index(task_id, user_id, payload, self.worker_id, attempt_id, ctx=ctx)
+            elif task_type == "user_data_export":
+                from services.account import build_and_store_user_export
+                export_id_raw = payload.get("export_id")
+                if not export_id_raw:
+                    raise ValueError("Missing export_id in user_data_export payload")
+                res = await asyncio.to_thread(build_and_store_user_export, uuid.UUID(str(export_id_raw)), user_id)
+                await update_task_state(task_id, "Completed", 100, result=json.dumps(res), ctx=ctx)
             else:
                 await update_task_state(task_id, "Failed", 100, error=f"Unknown task type: {task_type}", ctx=ctx)
 

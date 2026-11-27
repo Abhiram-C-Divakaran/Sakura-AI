@@ -73,19 +73,20 @@ jobs:
 
       - name: Validate Alembic Migrations on PostgreSQL
         env:
-          DATABASE_URL: "postgresql://sakura_ci:sakura_ci_password@localhost:5432/sakura_ci_db"
+          DATABASE_URL: "postgresql+psycopg2://sakura_ci:sakura_ci_password@localhost:5432/sakura_ci_db"
         run: |
           python -m alembic upgrade head
+          python -m alembic current
 
       - name: Run Schema Parity Test on PostgreSQL
         env:
-          DATABASE_URL: "postgresql://sakura_ci:sakura_ci_password@localhost:5432/sakura_ci_db"
+          DATABASE_URL: "postgresql+psycopg2://sakura_ci:sakura_ci_password@localhost:5432/sakura_ci_db"
         run: |
           python -m unittest tests/test_schema_parity.py -v
 
       - name: Run PostgreSQL Scheduler Concurrency Test
         env:
-          DATABASE_URL: "postgresql://sakura_ci:sakura_ci_password@localhost:5432/sakura_ci_db"
+          DATABASE_URL: "postgresql+psycopg2://sakura_ci:sakura_ci_password@localhost:5432/sakura_ci_db"
           SAKURA_POSTGRES_TEST: "1"
         run: |
           python -m unittest tests/test_scheduler_resilience.py -v
@@ -162,6 +163,15 @@ jobs:
       - name: Production Build
         run: npm run build
 
+      - name: Install Playwright Chromium & Run Landing Page Browser Smoke Tests
+        run: |
+          npx playwright install --with-deps chromium
+          npx next start -H 127.0.0.1 -p 3000 &
+          NEXT_PID=$!
+          trap "kill $NEXT_PID || true" EXIT
+          timeout 30 bash -c 'until curl -sf http://127.0.0.1:3000/ >/dev/null; do sleep 1; done'
+          PLAYWRIGHT_BASE_URL=http://127.0.0.1:3000 npm run test:e2e
+
       - name: Build and Validate Production Frontend Docker Image
         run: |
           docker build -t sakura-frontend:test -f Dockerfile .
@@ -215,8 +225,45 @@ jobs:
 
       - name: Wait for Executor /readiness (Fail if Not Ready)
         run: |
-          timeout 60 bash -c 'until curl -sf http://localhost:9000/readiness | grep -q "\"ready\":true"; do echo "Waiting for sandbox executor /readiness..."; sleep 2; done'
-          curl -sf http://localhost:9000/readiness
+          set -e
+          READY=0
+          for i in $(seq 1 30); do
+            BODY=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" http://localhost:9000/readiness || true)
+            STATUS=$(echo "$BODY" | tail -n1 | sed 's/HTTP_STATUS://')
+            JSON=$(echo "$BODY" | sed '$d')
+            echo "[attempt $i/30] HTTP $STATUS -> $JSON"
+            if [ "$STATUS" = "200" ] && echo "$JSON" | grep -q '"ready":true'; then
+              READY=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$READY" != "1" ]; then
+            echo "ERROR: Sandbox executor did not become ready within 60s."
+            exit 1
+          fi
+
+      - name: Collect Sandbox Executor Diagnostics on Failure
+        if: failure()
+        run: |
+          echo "=== docker ps -a ==="
+          docker ps -a || true
+          echo "=== docker logs sakura-sandbox-executor ==="
+          docker logs sakura-sandbox-executor || true
+          echo "=== docker version & info inside sakura-sandbox-executor ==="
+          docker exec sakura-sandbox-executor which docker || true
+          docker exec sakura-sandbox-executor docker version || true
+          docker exec sakura-sandbox-executor docker info || true
+          echo "=== docker image inspect sakura-sandbox:latest ==="
+          docker image inspect sakura-sandbox:latest --format '{{.Id}} {{.RepoTags}} User={{.Config.User}}' || true
+          echo "=== docker volume inspect sakura_workspaces_vol ==="
+          docker volume inspect sakura_workspaces_vol || true
+          echo "=== executor process health (/health) ==="
+          curl -i -sS http://localhost:9000/health || true
+          echo ""
+          echo "=== executor full /readiness response ==="
+          curl -i -sS http://localhost:9000/readiness || true
+          echo ""
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5

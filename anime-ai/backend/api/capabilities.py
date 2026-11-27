@@ -131,10 +131,11 @@ async def get_system_capabilities(
     image_model = img_status.get("models", ["flux"])[0]
 
     # Auth & Email capabilities (truthful reporting for frontend auth UX)
-    from services.email import is_email_configured
-    password_reset_enabled = is_email_configured()
-    google_oauth_enabled = bool(os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET"))
-    github_oauth_enabled = bool(github_client_id and github_client_secret)
+    from services.email import is_password_reset_enabled
+    password_reset_enabled = is_password_reset_enabled()
+    # OAuth authorize/callback login routes are not implemented; never advertise broken OAuth links.
+    google_oauth_enabled = False
+    github_oauth_enabled = False
     private_local_configured = bool(
         os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST") or os.getenv("OLLAMA_MODEL")
     )

@@ -704,3 +704,66 @@ class PasswordResetToken(Base):
     consumed_at = Column(DateTime(timezone=True), nullable=True)
 
     user = relationship("User")
+
+
+class UserUsageQuota(Base):
+    """Durable, multi-worker-safe per-user usage counter per category and UTC day window."""
+    __tablename__ = "user_usage_quotas"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    category = Column(String(64), nullable=False, index=True)
+    window_key = Column(String(32), nullable=False, index=True)
+    usage_count = Column(Integer, default=0, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+    user = relationship("User")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "category", "window_key", name="uq_user_usage_quota_window"),
+    )
+
+
+class UserDataExport(Base):
+    """Durable user-isolated async account data export artifact record."""
+    __tablename__ = "user_data_exports"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(32), default="QUEUED", nullable=False, index=True)  # QUEUED, RUNNING, COMPLETED, FAILED
+    storage_backend = Column(String(50), nullable=True)
+    storage_key = Column(String(1024), nullable=True)
+    storage_size = Column(Integer, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+
+    user = relationship("User")
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "export_id": str(self.id),
+            "user_id": str(self.user_id),
+            "status": self.status,
+            "storage_size": self.storage_size,
+            "error": self.error,
+            "download_url": f"/api/v1/auth/me/export/{self.id}/download" if self.status == "COMPLETED" else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+        }
+
+
+class AccountAuditEvent(Base):
+    """Durable non-sensitive audit log for account lifecycle events (survives account deletion)."""
+    __tablename__ = "account_audit_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    subject_user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    event_type = Column(String(64), nullable=False, index=True)
+    details_json = Column(JSON, default=dict, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)

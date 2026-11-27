@@ -20,7 +20,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database.models import Base
-from database.db import DATABASE_URL
+from database.db import DATABASE_URL, normalize_database_url
 
 target_metadata = Base.metadata
 
@@ -42,13 +42,13 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    url = DATABASE_URL or config.get_main_option("sqlalchemy.url")
+    url = normalize_database_url(DATABASE_URL or config.get_main_option("sqlalchemy.url") or "")
     context.configure(
         url=url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
-        render_as_batch=True,
+        render_as_batch=url.startswith("sqlite"),
     )
 
     with context.begin_transaction():
@@ -69,7 +69,8 @@ def run_migrations_online() -> None:
             context.run_migrations()
         return
 
-    custom_url = config.get_main_option("sqlalchemy.url") or os.getenv("DATABASE_URL")
+    raw_custom_url = config.get_main_option("sqlalchemy.url") or os.getenv("DATABASE_URL")
+    custom_url = normalize_database_url(raw_custom_url) if raw_custom_url else ""
     if custom_url and custom_url != "driver://user:pass@localhost/dbname":
         from sqlalchemy import create_engine
         connectable = create_engine(custom_url)

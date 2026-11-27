@@ -56,7 +56,7 @@ class TestSandboxDockerE2E(unittest.TestCase):
         return ws_id
 
     def test_readiness_reports_full_container_runtime_health(self):
-        """Readiness must verify Docker, image, child start, binaries, volume, and non-root execution."""
+        """Readiness must verify Docker, image, child start, binaries, volume, Redis, and non-root execution."""
         p = self.readiness_payload
         self.assertTrue(p.get("ready"), f"Readiness payload not ready: {p}")
         self.assertTrue(p.get("docker_available"))
@@ -65,9 +65,26 @@ class TestSandboxDockerE2E(unittest.TestCase):
         self.assertTrue(p.get("non_root_execution"))
         self.assertTrue(p.get("workspace_root_available"))
         self.assertTrue(p.get("workspace_volume_available"))
+        self.assertTrue(p.get("redis_available"))
         binaries = p.get("binaries", {})
         for req_bin in ("python", "git", "node", "npm"):
             self.assertTrue(binaries.get(req_bin), f"Required binary '{req_bin}' missing in sandbox image: {binaries}")
+
+    def test_network_disabled_by_default_in_child_container(self):
+        """By default (allow_network=False), child containers must run with --network none (loopback only)."""
+        ws_id = self._provision_workspace()
+        res = requests.post(
+            f"{SANDBOX_URL}/execute",
+            headers=self.headers,
+            json={
+                "command": "python3 -c \"import socket; s=socket.socket(); s.settimeout(2); s.connect(('1.1.1.1', 80))\"",
+                "workspace_id": ws_id,
+                "allow_network": False
+            },
+            timeout=15
+        ).json()
+        self.assertFalse(res.get("success"), f"Outbound network unexpectedly succeeded with allow_network=False: {res}")
+        self.assertNotEqual(res.get("exit_code"), 0)
 
     def test_volume_isolation_between_workspaces(self):
         """Files created in Workspace A must be completely inaccessible and invisible from Workspace B."""

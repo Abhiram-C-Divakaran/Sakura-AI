@@ -4,12 +4,10 @@ import {
   Bot, RefreshCw, AlertCircle
 } from 'lucide-react';
 import { ChatMessage } from '../../hooks/useConversation';
+import { CodingTaskState, mapCodingStatusToActivity } from '../../hooks/useCodingTaskStream';
 import { ChatComposer, ChatSubmitPayload } from '../ChatComposer';
 import { EmptyConversation } from './EmptyConversation';
 import { CodingActivity } from '../coding/CodingActivity';
-import { ToolExecution } from '../coding/ToolExecution';
-import { DiffViewer } from '../coding/DiffViewer';
-import { VerificationSummary } from '../coding/VerificationSummary';
 import { SakuraLogo } from '../SakuraLogo';
 
 export interface ConversationViewProps {
@@ -17,6 +15,9 @@ export interface ConversationViewProps {
   streamingResponse: string;
   streamingProvider: string;
   loadingResponse: boolean;
+  codingTasks?: Record<string, CodingTaskState>;
+  activeCodingTask?: CodingTaskState | null;
+  onCancelCodingTask?: (taskId: string) => void;
   onSendMessage: (payload: ChatSubmitPayload) => void;
   onStopGeneration: () => void;
   onCopyMessage: (content: string, idx: number) => void;
@@ -34,6 +35,9 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
   streamingResponse,
   streamingProvider,
   loadingResponse,
+  codingTasks = {},
+  activeCodingTask = null,
+  onCancelCodingTask,
   onSendMessage,
   onStopGeneration,
   onCopyMessage,
@@ -102,14 +106,35 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
                   >
                     <div className="whitespace-pre-wrap break-words">{msg.content}</div>
 
-                    {/* Integrated Coding Activity */}
-                    {msg.metadata?.tool_calls && msg.metadata.tool_calls.length > 0 && (
-                      <CodingActivity
-                        status="completed"
-                        tools={msg.metadata.tool_calls}
-                        diffText={msg.metadata.diff}
-                        verification={msg.metadata.verification}
-                      />
+                    {/* Integrated Durable Coding Task Activity (live SSE + reconnect + history recovery) */}
+                    {msg.metadata?.coding_task_id && codingTasks[msg.metadata.coding_task_id] ? (
+                      (() => {
+                        const ct = codingTasks[msg.metadata!.coding_task_id!];
+                        return (
+                          <CodingActivity
+                            taskId={ct.taskId}
+                            status={mapCodingStatusToActivity(ct.status)}
+                            title={ct.title || 'Sakura Code Task'}
+                            step={ct.phase}
+                            workspaceName={ct.workspaceName || msg.metadata?.workspace_name}
+                            tools={ct.tools}
+                            diffText={ct.diffText}
+                            verification={ct.verification}
+                            reconnecting={ct.reconnecting}
+                            error={ct.error}
+                            onCancel={onCancelCodingTask ? () => onCancelCodingTask(ct.taskId) : undefined}
+                          />
+                        );
+                      })()
+                    ) : (
+                      msg.metadata?.tool_calls && msg.metadata.tool_calls.length > 0 && (
+                        <CodingActivity
+                          status="completed"
+                          tools={msg.metadata.tool_calls}
+                          diffText={msg.metadata.diff}
+                          verification={msg.metadata.verification}
+                        />
+                      )
                     )}
                   </div>
 
@@ -168,6 +193,22 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
                       <span className="w-2 h-2 rounded-full bg-[#ff7597] animate-pulse" />
                       <span>Thinking...</span>
                     </div>
+                  )}
+
+                  {activeCodingTask && !messages.some((m) => m.metadata?.coding_task_id === activeCodingTask.taskId) && (
+                    <CodingActivity
+                      taskId={activeCodingTask.taskId}
+                      status={mapCodingStatusToActivity(activeCodingTask.status)}
+                      title={activeCodingTask.title || 'Sakura Code Task'}
+                      step={activeCodingTask.phase}
+                      workspaceName={activeCodingTask.workspaceName || undefined}
+                      tools={activeCodingTask.tools}
+                      diffText={activeCodingTask.diffText}
+                      verification={activeCodingTask.verification}
+                      reconnecting={activeCodingTask.reconnecting}
+                      error={activeCodingTask.error}
+                      onCancel={onCancelCodingTask ? () => onCancelCodingTask(activeCodingTask.taskId) : undefined}
+                    />
                   )}
                 </div>
               </div>

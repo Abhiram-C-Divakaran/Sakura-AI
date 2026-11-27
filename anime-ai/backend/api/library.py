@@ -227,6 +227,8 @@ async def upload_library_file(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
+    from services.quotas import enforce_user_quota
+    enforce_user_quota(db, current_user.id, "file_upload")
     doc = await docs_svc.upload_document(
         file=file,
         user_id=current_user.id,
@@ -284,29 +286,48 @@ async def create_document(
 class GenerateImageRequest(BaseModel):
     prompt: str
     filename: Optional[str] = None
+    requested_pipeline: Optional[str] = "auto"
+    aspect_ratio: Optional[str] = "1:1"
+    idempotency_key: Optional[str] = None
 
 
-@router.post("/generate-image")
+@router.post("/generate-image", status_code=202)
 async def generate_image_to_library(
     req: GenerateImageRequest,
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Generates an image via canonical ImageGenerationEngine and saves it as a real library file."""
-    prompt = req.prompt.strip()
+    """Enqueues a durable worker-backed ImageGenerationJob that saves the completed asset to the user's Library."""
+    from media.image_worker import create_image_generation_job
+    from services.quotas import enforce_user_quota
+    prompt = (req.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Image prompt cannot be empty")
+    enforce_user_quota(db, current_user.id, "image_generation")
 
-    from media.image_engine import ImageGenerationEngine
-    engine = ImageGenerationEngine(db, current_user.id)
     try:
-        res = await engine.generate_image(
+        job, created = create_image_generation_job(
+            db=db,
+            user_id=current_user.id,
             prompt=prompt,
-            aspect_ratio="1:1"
+            requested_pipeline=req.requested_pipeline or "auto",
+            parameters={
+                "aspect_ratio": req.aspect_ratio or "1:1",
+                "filename": req.filename,
+                "source": "library",
+            },
+            idempotency_key=req.idempotency_key,
         )
-        return {"status": "success", "file": res}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    job_dict = job.to_dict()
+    job_dict["idempotent_replay"] = not created
+    return {
+        "status": "queued",
+        "job_id": str(job.id),
+        "status_url": f"/api/v1/images/jobs/{job.id}",
+        "job": job_dict,
+    }
 
 
 class RenameFileRequest(BaseModel):

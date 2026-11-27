@@ -281,6 +281,22 @@ async def create_and_run_task(
     ws = _resolve_owned_workspace(db, workspace_id, current_user.id)
     effective_idem = req.idempotency_key or idempotency_key
 
+    # Check if this is an idempotent replay before consuming daily coding quota
+    is_replay = False
+    if effective_idem and effective_idem.strip():
+        is_replay = (
+            db.query(CodingJob)
+            .filter(
+                CodingJob.user_id == current_user.id,
+                CodingJob.idempotency_key == effective_idem.strip()[:128],
+            )
+            .first()
+            is not None
+        )
+    if not is_replay:
+        from services.quotas import enforce_user_quota
+        enforce_user_quota(db, current_user.id, "coding_task")
+
     task, job, created = create_and_enqueue_coding_job(
         db=db,
         user=current_user,

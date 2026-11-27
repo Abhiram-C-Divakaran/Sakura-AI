@@ -23,6 +23,8 @@ build/
 dist/
 .npm
 *.tsbuildinfo
+test-results/
+playwright-report/
 
 # Uploads and temporary data
 uploaded_documents/

@@ -60,6 +60,9 @@ export const AppShell: React.FC<AppShellProps> = ({ currentUser, onLogout }) => 
     streamingProvider,
     loadingResponse,
     feedbackState,
+    codingTasks,
+    activeCodingTask,
+    cancelCodingTask,
     fetchConversations,
     selectConversation,
     createNewConversation,
@@ -180,6 +183,9 @@ export const AppShell: React.FC<AppShellProps> = ({ currentUser, onLogout }) => 
                 streamingResponse={streamingResponse}
                 streamingProvider={streamingProvider}
                 loadingResponse={loadingResponse}
+                codingTasks={codingTasks}
+                activeCodingTask={activeCodingTask}
+                onCancelCodingTask={cancelCodingTask}
                 onSendMessage={(payload) => {
                   sendMessage({
                     ...payload,

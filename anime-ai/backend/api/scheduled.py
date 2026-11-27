@@ -71,6 +71,9 @@ def create_scheduled_task(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
+    from services.quotas import enforce_user_quota
+    enforce_user_quota(db, current_user.id, "scheduled_job")
+
     task = ScheduledTask(
         id=uuid.uuid4(),
         user_id=current_user.id,

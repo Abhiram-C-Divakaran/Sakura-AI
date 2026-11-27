@@ -1,18 +1,23 @@
 """
-Sakura AI — Sliding-Window Rate Limiter
-Provides Redis-backed rate limiting with a thread-safe in-memory fallback for
-single-node dev/test environments.
+Sakura AI — Proxy-Aware Sliding-Window Rate Limiter
+Provides Redis-backed rate limiting with:
+- Strict trusted-proxy CIDR handling for X-Forwarded-For (never trusts spoofed headers)
+- Fail-closed behavior in production when Redis is unavailable on security-sensitive endpoints
+- Thread-safe in-memory fallback strictly for development/test environments
 """
 
 import os
 import time
+import ipaddress
 import threading
 from collections import deque
-from typing import Dict, Deque
+from typing import Dict, Deque, List, Union
 from fastapi import HTTPException, Request, status
 
 _LOCAL_BUCKETS: Dict[str, Deque[float]] = {}
 _LOCAL_LOCK = threading.Lock()
+
+IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
 
 def reset_rate_limits() -> None:
@@ -21,18 +26,63 @@ def reset_rate_limits() -> None:
         _LOCAL_BUCKETS.clear()
 
 
+def _parse_trusted_proxy_cidrs() -> List[IPNetwork]:
+    raw = (os.getenv("TRUSTED_PROXY_CIDRS") or "").strip()
+    if not raw:
+        return []
+    networks: List[IPNetwork] = []
+    for entry in raw.split(","):
+        item = entry.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            continue
+    return networks
+
+
+def _ip_in_networks(ip_str: str, networks: List[IPNetwork]) -> bool:
+    if not ip_str or not networks:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip_str.strip())
+    except ValueError:
+        return False
+    return any(addr in net for net in networks)
+
+
 def get_client_ip(request: Request) -> str:
-    """Extracts client IP cleanly without trusting unbounded headers."""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip() or "unknown"
-    if request.client and request.client.host:
-        return request.client.host
-    return "unknown"
+    """
+    Extracts canonical client IP safely:
+    - Only trusts X-Forwarded-For when request.client.host belongs to TRUSTED_PROXY_CIDRS.
+    - When trusted, walks X-Forwarded-For right-to-left skipping trusted proxy hops so
+      attacker-prepended spoofed IPs are ignored.
+    - When TRUSTED_PROXY_CIDRS is unset or peer is untrusted, ignores X-Forwarded-For completely.
+    """
+    peer_ip = (request.client.host if request.client and request.client.host else "").strip()
+    trusted_nets = _parse_trusted_proxy_cidrs()
+
+    if peer_ip and trusted_nets and _ip_in_networks(peer_ip, trusted_nets):
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            hops = [part.strip() for part in forwarded.split(",") if part.strip()]
+            # Walk right-to-left (nearest proxy -> furthest), returning first non-trusted IP
+            for candidate in reversed(hops):
+                try:
+                    ipaddress.ip_address(candidate)
+                except ValueError:
+                    continue
+                if not _ip_in_networks(candidate, trusted_nets):
+                    return candidate
+            if hops:
+                return hops[0]
+
+    return peer_ip or "unknown"
 
 
 def _check_redis_limit(redis_key: str, limit: int, window_seconds: int):
-    redis_url = os.getenv("REDIS_URL", "")
+    redis_url = (os.getenv("REDIS_URL") or "").strip()
     if not redis_url:
         return None
     client = None
@@ -54,10 +104,19 @@ def _check_redis_limit(redis_key: str, limit: int, window_seconds: int):
                 pass
 
 
-def enforce_rate_limit(bucket: str, identifier: str, limit: int, window_seconds: int) -> None:
+def enforce_rate_limit(
+    bucket: str,
+    identifier: str,
+    limit: int,
+    window_seconds: int,
+    *,
+    fail_closed_in_prod: bool = False,
+) -> None:
     """
     Enforces a bounded request rate for (bucket, identifier).
-    Raises HTTP 429 when the limit is exceeded.
+    - Raises HTTP 429 when the limit is exceeded.
+    - In production, when fail_closed_in_prod=True and Redis is unavailable,
+      raises HTTP 503 rather than silently downgrading to per-worker local memory.
     """
     if os.getenv("SAKURA_DISABLE_RATE_LIMITS", "false").lower() == "true":
         return
@@ -70,6 +129,14 @@ def enforce_rate_limit(bucket: str, identifier: str, limit: int, window_seconds:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many requests. Please wait before trying again.",
+        )
+
+    env = os.getenv("ENVIRONMENT", "development").strip().lower()
+    is_prod = env in ("production", "prod")
+    if is_prod and fail_closed_in_prod:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Rate limiting backend is temporarily unavailable. Please retry shortly.",
         )
 
     now = time.monotonic()

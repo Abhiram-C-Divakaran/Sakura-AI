@@ -19,13 +19,17 @@ os.environ["ENVIRONMENT"] = "test"
 os.environ["SAKURA_EMBEDDED_WORKER"] = "false"
 os.environ["SAKURA_EMBEDDED_SCHEDULER"] = "false"
 
+from database.db import normalize_database_url
 from database.models import (
     Base, User, Document, DocumentChunk, Conversation, Message,
     MessageFeedback, ConversationShare, UserMemory, Character,
     GeneratedImage, Project, ProjectRepository, ProjectFile,
     ProjectConversation, ScheduledTask, ScheduledTaskRun,
     UserIntegration, RepositoryWorkspace, CodingTask, ToolExecution,
-    BackgroundTask, utc_now
+    BackgroundTask, CodingJob, CodingTaskEvent, WebSocketTicket,
+    ImageGenerationJob, StorageDeletionOutbox, PasswordResetToken,
+    UserUsageQuota, UserDataExport, AccountAuditEvent,
+    utc_now
 )
 
 
@@ -37,7 +41,7 @@ class TestSchemaParity(unittest.TestCase):
         cls.db_path = os.path.join(cls.temp_dir, "clean_parity.db")
         env_url = os.getenv("DATABASE_URL", "")
         if env_url and not env_url.startswith("sqlite"):
-            cls.test_url = env_url
+            cls.test_url = normalize_database_url(env_url)
         else:
             cls.test_url = f"sqlite:///{cls.db_path}"
 
@@ -321,6 +325,30 @@ class TestSchemaParity(unittest.TestCase):
             db.add(gi)
             db.commit()
 
+            # 19. UserUsageQuota, UserDataExport, AccountAuditEvent
+            uq = UserUsageQuota(
+                id=uuid.uuid4(),
+                user_id=user.id,
+                category="chat",
+                window_key="2026-11-26",
+                usage_count=1,
+            )
+            db.add(uq)
+            exp = UserDataExport(
+                id=uuid.uuid4(),
+                user_id=user.id,
+                status="QUEUED",
+            )
+            db.add(exp)
+            aud = AccountAuditEvent(
+                id=uuid.uuid4(),
+                subject_user_id=user.id,
+                event_type="DATA_EXPORT_REQUESTED",
+                details_json={"export_id": str(exp.id)},
+            )
+            db.add(aud)
+            db.commit()
+
             # Verify reads
             self.assertEqual(db.query(User).filter(User.id == user.id).count(), 1)
             self.assertEqual(db.query(Conversation).filter(Conversation.id == conv.id).count(), 1)
@@ -329,6 +357,9 @@ class TestSchemaParity(unittest.TestCase):
             self.assertEqual(db.query(GeneratedImage).filter(GeneratedImage.id == gi.id).count(), 1)
             self.assertEqual(db.query(BackgroundTask).filter(BackgroundTask.id == bg.id).count(), 1)
             self.assertEqual(db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == sch_run.id).count(), 1)
+            self.assertEqual(db.query(UserUsageQuota).filter(UserUsageQuota.id == uq.id).count(), 1)
+            self.assertEqual(db.query(UserDataExport).filter(UserDataExport.id == exp.id).count(), 1)
+            self.assertEqual(db.query(AccountAuditEvent).filter(AccountAuditEvent.id == aud.id).count(), 1)
 
     def test_downgrade_and_upgrade_cycle(self):
         """Verifies migration rollback of the latest revision and re-upgrade to head."""

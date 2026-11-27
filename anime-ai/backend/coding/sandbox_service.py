@@ -68,22 +68,53 @@ _readiness_cache: Dict[str, Any] = {"last_check": 0.0, "result": None}
 _ACTIVE_EXECUTIONS: Dict[str, Tuple[str, Any]] = {}
 
 
-def check_docker_operational() -> bool:
-    """Checks if the Docker CLI and daemon are operational on host."""
+def check_docker_status() -> Tuple[bool, Optional[str]]:
+    """Checks if the Docker CLI and daemon are operational, returning (ok, error_detail)."""
     docker_path = shutil.which("docker")
     if not docker_path:
-        return False
+        return False, "docker CLI binary not found in PATH"
     try:
         res = subprocess.run(
-            ["docker", "info"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=3,
+            ["docker", "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
             check=False
         )
-        return res.returncode == 0
-    except Exception:
-        return False
+        if res.returncode == 0:
+            return True, None
+        err = (res.stderr or res.stdout or f"exit code {res.returncode}").strip()
+        return False, err[:300]
+    except Exception as e:
+        return False, str(e)[:300]
+
+
+def check_docker_operational() -> bool:
+    """Checks if the Docker CLI and daemon are operational on host."""
+    ok, _ = check_docker_status()
+    return ok
+
+
+def check_redis_status() -> Tuple[bool, Optional[str]]:
+    """Checks Redis connectivity for capability nonce replay protection."""
+    redis_url = os.getenv("REDIS_URL", "").strip()
+    if not redis_url:
+        return False, "REDIS_URL not configured"
+    client = None
+    try:
+        import redis
+        client = redis.from_url(redis_url, socket_connect_timeout=2, socket_timeout=2)
+        if client.ping():
+            return True, None
+        return False, "Redis ping returned false"
+    except Exception as e:
+        return False, str(e)[:300]
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 def get_volume_host_mountpoint(volume_name: str) -> Optional[str]:
@@ -238,39 +269,53 @@ async def readiness():
     - Image can start and execute code
     - Execution user is non-root
     - Expected binaries exist (python, git, node, npm)
-    - Workspace storage available
+    - Workspace storage & configured Docker volume available
+    - Redis reachable (required in production for capability replay protection)
     """
     now = time.time()
+    # Only cache positive readiness checks so transient startup delays recover immediately
     if _readiness_cache["result"] is not None and (now - _readiness_cache["last_check"] < 30):
         is_ready, payload = _readiness_cache["result"]
-        if not is_ready:
-            return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=payload)
-        return payload
+        if is_ready:
+            return payload
 
     env = os.getenv("ENVIRONMENT", "development").lower()
     is_prod = env in ("production", "prod")
 
-    docker_ok = check_docker_operational()
+    docker_ok, docker_error = check_docker_status()
+    redis_ok, redis_error = check_redis_status()
     image_ok = False
+    image_error = None
     container_can_start = False
     non_root = False
+    smoke_returncode = None
+    smoke_stderr = None
     binaries = {"python": False, "git": False, "node": False, "npm": False}
 
     if docker_ok:
         try:
             inspect_res = subprocess.run(
                 ["docker", "image", "inspect", SANDBOX_IMAGE],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=3,
+                capture_output=True,
+                text=True,
+                timeout=5,
                 check=False
             )
             image_ok = (inspect_res.returncode == 0)
-        except Exception:
+            if not image_ok:
+                image_error = (inspect_res.stderr or inspect_res.stdout or f"exit {inspect_res.returncode}").strip()[:300]
+        except Exception as e:
             image_ok = False
+            image_error = str(e)[:300]
 
         if image_ok:
             smoke_name = f"sakura-smoke-{uuid.uuid4().hex[:8]}"
+            smoke_script = (
+                'echo "UID=$(id -u)"; '
+                'for b in python3 python git node npm; do '
+                'if command -v "$b" >/dev/null 2>&1; then echo "BIN:$b=1"; else echo "BIN:$b=0"; fi; '
+                'done'
+            )
             try:
                 smoke_res = subprocess.run(
                     [
@@ -281,29 +326,36 @@ async def readiness():
                         "--cap-drop", "ALL",
                         SANDBOX_IMAGE,
                         "sh", "-c",
-                        "id -u && which python3 python git node npm"
+                        smoke_script
                     ],
                     capture_output=True,
                     text=True,
-                    timeout=5,
+                    timeout=15,
                     check=False
                 )
+                smoke_returncode = smoke_res.returncode
+                if smoke_res.stderr:
+                    smoke_stderr = smoke_res.stderr.strip()[:300]
                 if smoke_res.returncode == 0:
                     container_can_start = True
-                    lines = smoke_res.stdout.strip().splitlines()
-                    if lines:
-                        uid_str = lines[0].strip()
-                        non_root = (uid_str != "0")
-                        out_text = smoke_res.stdout
-                        binaries["python"] = ("python" in out_text)
-                        binaries["git"] = ("git" in out_text)
-                        binaries["node"] = ("node" in out_text)
-                        binaries["npm"] = ("npm" in out_text)
-            except Exception:
-                pass
+                    out_lines = [ln.strip() for ln in smoke_res.stdout.splitlines() if ln.strip()]
+                    found_bins: Dict[str, bool] = {}
+                    for ln in out_lines:
+                        if ln.startswith("UID="):
+                            uid_str = ln.split("=", 1)[1].strip()
+                            non_root = (uid_str.isdigit() and uid_str != "0")
+                        elif ln.startswith("BIN:") and "=" in ln:
+                            bname, bval = ln[4:].split("=", 1)
+                            found_bins[bname.strip()] = (bval.strip() == "1")
+                    binaries["python"] = bool(found_bins.get("python3") or found_bins.get("python"))
+                    binaries["git"] = bool(found_bins.get("git"))
+                    binaries["node"] = bool(found_bins.get("node"))
+                    binaries["npm"] = bool(found_bins.get("npm"))
+            except Exception as e:
+                smoke_stderr = str(e)[:300]
             finally:
                 try:
-                    subprocess.run(["docker", "rm", "-f", smoke_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+                    subprocess.run(["docker", "rm", "-f", smoke_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
                 except Exception:
                     pass
 
@@ -313,27 +365,49 @@ async def readiness():
     if configured_vol:
         volume_ok = get_volume_host_mountpoint(configured_vol) is not None if docker_ok else False
 
+    redis_required = is_prod or bool(os.getenv("REDIS_URL", "").strip())
+    redis_gate_ok = redis_ok if redis_required else True
+
     if is_prod:
-        is_ready = docker_ok and image_ok and container_can_start and non_root and all(binaries.values()) and ws_root_ok and volume_ok
+        is_ready = (
+            docker_ok
+            and image_ok
+            and container_can_start
+            and non_root
+            and all(binaries.values())
+            and ws_root_ok
+            and volume_ok
+            and redis_gate_ok
+        )
     else:
         is_ready = docker_ok and image_ok and container_can_start and non_root and ws_root_ok and volume_ok
 
     payload = {
         "ready": is_ready,
         "docker_available": docker_ok,
+        "docker_error": docker_error,
         "image_available": image_ok,
+        "image_error": image_error,
         "container_can_start": container_can_start,
         "non_root_execution": non_root,
+        "smoke_returncode": smoke_returncode,
+        "smoke_stderr": smoke_stderr,
         "binaries": binaries,
         "workspace_root_available": ws_root_ok,
         "workspace_volume_available": volume_ok,
         "workspace_volume": configured_vol or None,
         "workspace_root": WORKSPACE_ROOT,
+        "redis_available": redis_ok,
+        "redis_error": redis_error if not redis_ok else None,
         "image": SANDBOX_IMAGE,
         "timestamp": now
     }
-    _readiness_cache["last_check"] = now
-    _readiness_cache["result"] = (is_ready, payload)
+    if is_ready:
+        _readiness_cache["last_check"] = now
+        _readiness_cache["result"] = (True, payload)
+    else:
+        _readiness_cache["last_check"] = 0.0
+        _readiness_cache["result"] = None
 
     if not is_ready:
         return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=payload)

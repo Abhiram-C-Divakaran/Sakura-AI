@@ -6,9 +6,27 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", 
-    "postgresql+psycopg2://postgres:postgres@localhost:5432/anime_ai"
+def normalize_database_url(url: str) -> str:
+    """
+    Ensures PostgreSQL connection URLs consistently select the installed
+    psycopg2 driver (postgresql+psycopg2://) rather than defaulting to
+    an uninstalled psycopg v3 driver.
+    """
+    if not url:
+        return url
+    trimmed = url.strip()
+    if trimmed.startswith("postgres://"):
+        return "postgresql+psycopg2://" + trimmed[len("postgres://"):]
+    if trimmed.startswith("postgresql://"):
+        return "postgresql+psycopg2://" + trimmed[len("postgresql://"):]
+    return trimmed
+
+
+DATABASE_URL = normalize_database_url(
+    os.getenv(
+        "DATABASE_URL",
+        "postgresql+psycopg2://postgres:postgres@localhost:5432/anime_ai"
+    )
 )
 
 # Connect engine. Setup pool for production-grade throughput

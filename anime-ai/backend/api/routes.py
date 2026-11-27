@@ -79,6 +79,10 @@ class PasswordResetConfirmBody(BaseModel):
     token: str
     new_password: str
 
+class AccountDeleteBody(BaseModel):
+    password: str
+    confirm: str
+
 class ChatRequest(BaseModel):
     conversation_id: str
     message: str
@@ -95,11 +99,12 @@ class ChatRequest(BaseModel):
 @router.get("/auth/config")
 def get_auth_config():
     """Returns truthful authentication capabilities for the login/registration UI."""
-    from services.email import is_email_configured
+    from services.email import is_password_reset_enabled
     return {
-        "password_reset_enabled": is_email_configured(),
-        "google_oauth_enabled": bool(os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET")),
-        "github_oauth_enabled": bool(os.getenv("GITHUB_CLIENT_ID") and os.getenv("GITHUB_CLIENT_SECRET")),
+        "password_reset_enabled": is_password_reset_enabled(),
+        # OAuth login authorize/callback routes are not implemented; never advertise broken links.
+        "google_oauth_enabled": False,
+        "github_oauth_enabled": False,
     }
 
 
@@ -107,7 +112,7 @@ def get_auth_config():
 def register(user_data: UserRegister, request: Request, db: Session = Depends(get_db)):
     from services.rate_limit import enforce_rate_limit, get_client_ip
     client_ip = get_client_ip(request)
-    enforce_rate_limit("auth_register", client_ip, limit=15, window_seconds=900)
+    enforce_rate_limit("auth_register", client_ip, limit=15, window_seconds=900, fail_closed_in_prod=True)
 
     clean_username = (user_data.username or "").strip()
     if not clean_username or len(clean_username) > 100:
@@ -132,8 +137,14 @@ def register(user_data: UserRegister, request: Request, db: Session = Depends(ge
 def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     from services.rate_limit import enforce_rate_limit, get_client_ip
     client_ip = get_client_ip(request)
-    enforce_rate_limit("auth_login_ip", client_ip, limit=30, window_seconds=900)
-    enforce_rate_limit("auth_login_user", f"{client_ip}:{(form_data.username or '').strip().lower()}", limit=15, window_seconds=900)
+    enforce_rate_limit("auth_login_ip", client_ip, limit=30, window_seconds=900, fail_closed_in_prod=True)
+    enforce_rate_limit(
+        "auth_login_user",
+        f"{client_ip}:{(form_data.username or '').strip().lower()}",
+        limit=15,
+        window_seconds=900,
+        fail_closed_in_prod=True,
+    )
 
     user = db.query(User).filter(User.username == form_data.username).first()
     if not user or not AuthManager.verify_password(form_data.password, user.hashed_password):
@@ -151,23 +162,29 @@ def request_password_reset(
 ):
     """
     Real password reset initiation:
-    - Fails honestly with HTTP 503 if no email provider is configured (never simulates success).
-    - Rate limited per IP and identifier.
+    - Fails honestly with HTTP 503 if SMTP or canonical production PUBLIC_APP_URL is unconfigured.
+    - Rate limited per IP and identifier (fail-closed in production if Redis is down).
     - Enumeration-safe identical response whether or not the account exists.
     - Stores only SHA-256 hashed single-use token with 30-minute expiry.
+    - Deletes the token if SMTP delivery fails so no orphaned valid tokens remain.
     """
     import hashlib
     import secrets
     from datetime import timedelta
     from urllib.parse import quote
-    from services.email import is_email_configured, send_password_reset_email
+    from services.email import (
+        is_password_reset_enabled,
+        get_canonical_public_app_url,
+        send_password_reset_email,
+    )
     from services.rate_limit import enforce_rate_limit, get_client_ip
     from database.models import PasswordResetToken
 
-    if not is_email_configured():
+    base_url = get_canonical_public_app_url()
+    if not is_password_reset_enabled() or not base_url:
         raise HTTPException(
             status_code=503,
-            detail="Password reset is disabled on this deployment because no email delivery provider is configured.",
+            detail="Password reset is disabled on this deployment because SMTP delivery or canonical HTTPS PUBLIC_APP_URL is not configured.",
         )
 
     client_ip = get_client_ip(request)
@@ -175,8 +192,8 @@ def request_password_reset(
     if not clean_id:
         raise HTTPException(status_code=400, detail="Email or username is required.")
 
-    enforce_rate_limit("auth_pw_reset_ip", client_ip, limit=10, window_seconds=900)
-    enforce_rate_limit("auth_pw_reset_id", clean_id.lower(), limit=5, window_seconds=900)
+    enforce_rate_limit("auth_pw_reset_ip", client_ip, limit=10, window_seconds=900, fail_closed_in_prod=True)
+    enforce_rate_limit("auth_pw_reset_id", clean_id.lower(), limit=5, window_seconds=900, fail_closed_in_prod=True)
 
     generic_response = {
         "message": "If an account exists for this email or username, a password reset link has been sent."
@@ -206,9 +223,17 @@ def request_password_reset(
     db.add(reset_record)
     db.commit()
 
-    base_url = (os.getenv("PUBLIC_APP_URL") or "http://localhost:3000").rstrip("/")
-    reset_url = f"{base_url}/login?reset_token={quote(raw_token)}"
-    send_password_reset_email(target_email, reset_url)
+    reset_url = f"{base_url.rstrip('/')}/login?reset_token={quote(raw_token)}"
+    try:
+        send_password_reset_email(target_email, reset_url)
+    except Exception:
+        # Never leave a live reset token persisted when email delivery fails
+        db.query(PasswordResetToken).filter(PasswordResetToken.id == reset_record.id).delete(synchronize_session=False)
+        db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to deliver password reset email at this time. Please retry later.",
+        )
     return generic_response
 
 
@@ -226,7 +251,7 @@ def confirm_password_reset(
     from database.models import PasswordResetToken
 
     client_ip = get_client_ip(request)
-    enforce_rate_limit("auth_pw_confirm_ip", client_ip, limit=15, window_seconds=900)
+    enforce_rate_limit("auth_pw_confirm_ip", client_ip, limit=15, window_seconds=900, fail_closed_in_prod=True)
 
     raw_token = (req_body.token or "").strip()
     if not raw_token:
@@ -261,6 +286,144 @@ def confirm_password_reset(
     user.hashed_password = AuthManager.hash_password(req_body.new_password)
     db.commit()
     return {"message": "Password updated successfully."}
+
+
+@router.get("/auth/me/quotas")
+def get_my_quotas(
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Returns current UTC-day per-user usage quota counts and configured limits."""
+    from services.quotas import get_user_quota_summary
+    return get_user_quota_summary(db, current_user.id)
+
+
+@router.delete("/auth/me")
+def delete_my_account(
+    body: AccountDeleteBody,
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Self-service authenticated account deletion.
+    Requires explicit confirmation ('DELETE') and current password verification.
+    Cancels active jobs, purges workspaces & storage objects, removes DB data, and writes an audit record.
+    """
+    from services.account import delete_user_account
+
+    if (body.confirm or "").strip() != "DELETE":
+        raise HTTPException(status_code=400, detail="Explicit confirmation 'DELETE' is required.")
+    if not AuthManager.verify_password(body.password or "", current_user.hashed_password):
+        raise HTTPException(status_code=403, detail="Current password verification failed.")
+
+    return delete_user_account(db, current_user)
+
+
+@router.post("/auth/me/export", status_code=202)
+def request_my_data_export(
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Queues an asynchronous, user-isolated account data export job."""
+    from database.models import UserDataExport, AccountAuditEvent
+
+    now = utc_now()
+    exp = UserDataExport(
+        id=uuid.uuid4(),
+        user_id=current_user.id,
+        status="QUEUED",
+        created_at=now,
+    )
+    db.add(exp)
+    db.add(
+        AccountAuditEvent(
+            id=uuid.uuid4(),
+            subject_user_id=current_user.id,
+            event_type="DATA_EXPORT_REQUESTED",
+            details_json={"export_id": str(exp.id)},
+            created_at=now,
+        )
+    )
+    db.commit()
+    db.refresh(exp)
+
+    bg_task = TaskManager.create_task(
+        user_id=current_user.id,
+        task_type="user_data_export",
+        title="Account Data Export",
+        payload={"export_id": str(exp.id)},
+    )
+    data = exp.to_dict()
+    data["task_id"] = str(bg_task.id)
+    return data
+
+
+@router.get("/auth/me/exports")
+def list_my_data_exports(
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Lists data export jobs owned by the authenticated user."""
+    from database.models import UserDataExport
+    rows = db.query(UserDataExport).filter(
+        UserDataExport.user_id == current_user.id
+    ).order_by(UserDataExport.created_at.desc()).limit(20).all()
+    return [r.to_dict() for r in rows]
+
+
+@router.get("/auth/me/export/{export_id}")
+def get_my_data_export(
+    export_id: str,
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Returns owner-verified status of a user data export."""
+    from database.models import UserDataExport
+    try:
+        exp_uuid = uuid.UUID(str(export_id).strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid export ID.")
+    exp = db.query(UserDataExport).filter(
+        UserDataExport.id == exp_uuid,
+        UserDataExport.user_id == current_user.id,
+    ).first()
+    if not exp:
+        raise HTTPException(status_code=404, detail="Data export not found.")
+    return exp.to_dict()
+
+
+@router.get("/auth/me/export/{export_id}/download")
+def download_my_data_export(
+    export_id: str,
+    current_user: User = Depends(AuthManager.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Downloads a completed user-isolated data export archive."""
+    from database.models import UserDataExport
+    from services.storage import get_storage_backend, assert_user_storage_key
+
+    try:
+        exp_uuid = uuid.UUID(str(export_id).strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid export ID.")
+    exp = db.query(UserDataExport).filter(
+        UserDataExport.id == exp_uuid,
+        UserDataExport.user_id == current_user.id,
+    ).first()
+    if not exp:
+        raise HTTPException(status_code=404, detail="Data export not found.")
+    if exp.status != "COMPLETED" or not exp.storage_key:
+        raise HTTPException(status_code=409, detail=f"Data export is not ready (status: {exp.status}).")
+
+    assert_user_storage_key(current_user.id, exp.storage_key)
+    storage = get_storage_backend(exp.storage_backend or "local")
+    if not storage.exists(exp.storage_key):
+        raise HTTPException(status_code=404, detail="Export archive not found in storage.")
+    return storage.generate_download_response(
+        exp.storage_key,
+        filename=f"sakura_export_{str(exp.id)[:8]}.zip",
+        mime_type="application/zip",
+    )
 
 
 @router.post("/auth/ws-ticket")
@@ -724,6 +887,8 @@ async def upload_document(
     db: Session = Depends(get_db)
 ):
     """Uploads document to durable StorageBackend and enqueues durable document_index worker task."""
+    from services.quotas import enforce_user_quota
+    enforce_user_quota(db, current_user.id, "file_upload")
     import services.documents as docs_svc
     doc = await docs_svc.upload_document(
         file=file,
@@ -833,6 +998,9 @@ async def chat_stream(
     conv = db.query(Conversation).filter(Conversation.id == conv_uuid, Conversation.user_id == current_user.id).first()
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
+
+    from services.quotas import enforce_user_quota
+    enforce_user_quota(db, current_user.id, "chat")
 
     # 2. Load conversation history with intelligent token budget (max ~7,500 chars, ~1,800 tokens)
     past_messages = db.query(Message).filter(Message.conversation_id == conv.id).order_by(Message.created_at.desc()).limit(12).all()
@@ -958,6 +1126,21 @@ async def chat_stream(
                 is_terminal_coding_status,
             )
             from database.models import CodingJob, CodingTaskEvent
+            from services.quotas import enforce_user_quota
+
+            is_replay = False
+            if req.idempotency_key and req.idempotency_key.strip():
+                is_replay = (
+                    db.query(CodingJob)
+                    .filter(
+                        CodingJob.user_id == current_user.id,
+                        CodingJob.idempotency_key == req.idempotency_key.strip()[:128],
+                    )
+                    .first()
+                    is not None
+                )
+            if not is_replay:
+                enforce_user_quota(db, current_user.id, "coding_task")
 
             coding_task, coding_job, _created = create_and_enqueue_coding_job(
                 db=db,
@@ -972,12 +1155,38 @@ async def chat_stream(
             queued_task_id = str(coding_task.id)
             queued_job_id = str(coding_job.id)
             ws_uuid = ws.id
+            ws_id_str = str(ws.id)
+            ws_name = ws.name
             owner_id = current_user.id
             conv_id_val = conv.id
             req_msg_preview = req.message[:50] + ("..." if len(req.message) > 50 else "")
+            events_stream_url = f"/api/v1/coding/tasks/{queued_task_id}/events/stream"
+            queued_banner = f"*Queued durable coding task `{queued_task_id}` for workspace `{ws_name}`.*\n"
+
+            # Persist the assistant message referencing the durable coding task immediately
+            # so a page refresh or disconnect mid-task can recover and reconnect seamlessly.
+            assistant_msg_rec = Message(
+                conversation_id=conv_id_val,
+                role="assistant",
+                content=queued_banner,
+                metadata_json={
+                    "provider": "sakura_code",
+                    "coding_task_id": queued_task_id,
+                    "coding_job_id": queued_job_id,
+                    "workspace_id": ws_id_str,
+                    "workspace_name": ws_name,
+                    "events_stream_url": events_stream_url,
+                },
+            )
+            db.add(assistant_msg_rec)
+            if conv.title.startswith("Chat with"):
+                conv.title = req_msg_preview
+            conv.updated_at = utc_now()
+            db.commit()
+            assistant_msg_id = assistant_msg_rec.id
 
             async def coding_stream_generator():
-                full_response = ""
+                full_response = queued_banner
                 current_seq = 0
                 is_terminal = False
                 idle_count = 0
@@ -986,78 +1195,70 @@ async def chat_stream(
                 max_idle_polls = 240  # 120s max idle wait while RUNNING
                 max_queued_polls = 1 if is_test_env else 20  # bounded wait if still unclaimed in QUEUED
 
-                queued_banner = f"*Queued durable coding task `{queued_task_id}` for workspace `{ws.name}`.*\n"
-                full_response += queued_banner
-                yield f"data: {json.dumps({'token': queued_banner, 'provider': 'sakura_code', 'coding_task_id': queued_task_id, 'coding_job_id': queued_job_id, 'phase': 'QUEUED', 'events_stream_url': f'/api/v1/coding/tasks/{queued_task_id}/events/stream'})}\n\n"
+                yield f"data: {json.dumps({'token': queued_banner, 'provider': 'sakura_code', 'coding_task_id': queued_task_id, 'coding_job_id': queued_job_id, 'workspace_id': ws_id_str, 'workspace_name': ws_name, 'phase': 'QUEUED', 'events_stream_url': events_stream_url})}\n\n"
 
                 from database.db import get_db_context
-                while not is_terminal and idle_count < max_idle_polls:
-                    with get_db_context() as db_ctx:
-                        evts = (
-                            db_ctx.query(CodingTaskEvent)
-                            .join(CodingJob, CodingTaskEvent.job_id == CodingJob.id)
-                            .filter(
-                                CodingTaskEvent.task_id == queued_task_id,
-                                CodingTaskEvent.sequence_number > current_seq,
-                                CodingJob.user_id == owner_id,
-                                CodingJob.workspace_id == ws_uuid,
+                try:
+                    while not is_terminal and idle_count < max_idle_polls:
+                        with get_db_context() as db_ctx:
+                            evts = (
+                                db_ctx.query(CodingTaskEvent)
+                                .join(CodingJob, CodingTaskEvent.job_id == CodingJob.id)
+                                .filter(
+                                    CodingTaskEvent.task_id == queued_task_id,
+                                    CodingTaskEvent.sequence_number > current_seq,
+                                    CodingJob.user_id == owner_id,
+                                    CodingJob.workspace_id == ws_uuid,
+                                )
+                                .order_by(CodingTaskEvent.sequence_number.asc())
+                                .all()
                             )
-                            .order_by(CodingTaskEvent.sequence_number.asc())
-                            .all()
-                        )
-                        if evts:
-                            idle_count = 0
-                            queued_idle_count = 0
-                            for evt in evts:
-                                current_seq = evt.sequence_number
-                                chunk_msg = ""
-                                if evt.tool_name and evt.event_type == "tool_start":
-                                    chunk_msg = f"\n`[{evt.phase}: {evt.tool_name}]`\n"
-                                elif is_terminal_coding_status(evt.phase):
-                                    chunk_msg = f"\n\n### Coding Task Result: {evt.phase}\n\n{evt.message or evt.stdout_preview or ''}"
-                                elif evt.message:
-                                    chunk_msg = f"*{evt.message}*\n"
-                                if chunk_msg:
-                                    full_response += chunk_msg
-                                    yield f"data: {json.dumps({'token': chunk_msg, 'provider': 'sakura_code', 'coding_task_id': queued_task_id, 'coding_job_id': queued_job_id, 'sequence_number': evt.sequence_number, 'phase': evt.phase, 'tool': evt.tool_name})}\n\n"
-                                if is_terminal_coding_status(evt.phase):
+                            if evts:
+                                idle_count = 0
+                                queued_idle_count = 0
+                                for evt in evts:
+                                    current_seq = evt.sequence_number
+                                    chunk_msg = ""
+                                    if evt.tool_name and evt.event_type == "tool_start":
+                                        chunk_msg = f"\n`[{evt.phase}: {evt.tool_name}]`\n"
+                                    elif is_terminal_coding_status(evt.phase):
+                                        chunk_msg = f"\n\n### Coding Task Result: {evt.phase}\n\n{evt.message or evt.stdout_preview or ''}"
+                                    elif evt.message:
+                                        chunk_msg = f"*{evt.message}*\n"
+                                    if chunk_msg:
+                                        full_response += chunk_msg
+                                        yield f"data: {json.dumps({'token': chunk_msg, 'provider': 'sakura_code', 'coding_task_id': queued_task_id, 'coding_job_id': queued_job_id, 'workspace_id': ws_id_str, 'workspace_name': ws_name, 'sequence_number': evt.sequence_number, 'phase': evt.phase, 'tool': evt.tool_name})}\n\n"
+                                    if is_terminal_coding_status(evt.phase):
+                                        is_terminal = True
+                                        break
+                            else:
+                                idle_count += 1
+                                job_rec = db_ctx.query(CodingJob).filter(
+                                    CodingJob.task_id == queued_task_id,
+                                    CodingJob.user_id == owner_id,
+                                ).first()
+                                if not job_rec or is_terminal_coding_status(job_rec.status):
                                     is_terminal = True
-                                    break
-                        else:
-                            idle_count += 1
-                            job_rec = db_ctx.query(CodingJob).filter(
-                                CodingJob.task_id == queued_task_id,
-                                CodingJob.user_id == owner_id,
-                            ).first()
-                            if not job_rec or is_terminal_coding_status(job_rec.status):
-                                is_terminal = True
-                            elif job_rec.status == "QUEUED":
-                                queued_idle_count += 1
-                                if queued_idle_count >= max_queued_polls:
-                                    break
+                                elif job_rec.status == "QUEUED":
+                                    queued_idle_count += 1
+                                    if queued_idle_count >= max_queued_polls:
+                                        break
 
-                    if not is_terminal:
-                        await asyncio.sleep(0.05 if is_test_env else 0.5)
-
-                # Save assistant message referencing durable coding task
-                with get_db_context() as db_ctx:
-                    assistant_msg = Message(
-                        conversation_id=conv_id_val,
-                        role="assistant",
-                        content=full_response,
-                        metadata_json={
-                            "provider": "sakura_code",
-                            "coding_task_id": queued_task_id,
-                            "coding_job_id": queued_job_id,
-                        },
-                    )
-                    db_ctx.add(assistant_msg)
-                    c = db_ctx.query(Conversation).filter_by(id=conv_id_val).first()
-                    if c:
-                        if c.title.startswith("Chat with"):
-                            c.title = req_msg_preview
-                        c.updated_at = utc_now()
-                    db_ctx.commit()
+                        if not is_terminal:
+                            await asyncio.sleep(0.05 if is_test_env else 0.5)
+                finally:
+                    # Update the persisted assistant message with streamed output & latest sequence
+                    with get_db_context() as db_ctx:
+                        msg_row = db_ctx.query(Message).filter_by(id=assistant_msg_id).first()
+                        if msg_row:
+                            msg_row.content = full_response
+                            meta = dict(msg_row.metadata_json or {})
+                            meta["last_sequence"] = current_seq
+                            msg_row.metadata_json = meta
+                        c = db_ctx.query(Conversation).filter_by(id=conv_id_val).first()
+                        if c:
+                            c.updated_at = utc_now()
+                        db_ctx.commit()
 
             return StreamingResponse(coding_stream_generator(), media_type="text/event-stream")
 
@@ -1341,12 +1542,15 @@ class ImageGenerateAPIRequest(BaseModel):
     conversation_id: Optional[str] = None
     aspect_ratio: Optional[str] = "1:1"
     intensity: Optional[str] = "medium"
+    requested_pipeline: Optional[str] = "auto"
+    idempotency_key: Optional[str] = None
 
 class ImageEditAPIRequest(BaseModel):
     parent_image_id: str
     edit_instruction: str
     conversation_id: Optional[str] = None
     intensity: Optional[str] = "medium"
+    idempotency_key: Optional[str] = None
 
 class ImageVariationAPIRequest(BaseModel):
     parent_image_id: str
@@ -1357,87 +1561,183 @@ class ImageUpscaleAPIRequest(BaseModel):
     parent_image_id: str
     scale: Optional[int] = 2
     conversation_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
-@router.post("/images/generate")
+@router.post("/images/generate", status_code=202)
 async def api_generate_image(
     req: ImageGenerateAPIRequest,
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    from media.image_engine import ImageGenerationEngine
-    conv_id = uuid.UUID(req.conversation_id) if req.conversation_id else None
-    engine = ImageGenerationEngine(db, current_user.id)
+    """Enqueues a durable worker-backed ImageGenerationJob (never executes generation inline)."""
+    from media.image_worker import create_image_generation_job
+    from services.quotas import enforce_user_quota
+    from database.models import ImageGenerationJob
+    if req.conversation_id:
+        try:
+            uuid.UUID(str(req.conversation_id))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid conversation ID format.")
+    is_replay = bool(
+        req.idempotency_key
+        and req.idempotency_key.strip()
+        and db.query(ImageGenerationJob).filter(
+            ImageGenerationJob.user_id == current_user.id,
+            ImageGenerationJob.idempotency_key == req.idempotency_key.strip()[:128],
+        ).first()
+    )
+    if not is_replay:
+        enforce_user_quota(db, current_user.id, "image_generation")
     try:
-        res = await engine.generate_image(
+        job, created = create_image_generation_job(
+            db=db,
+            user_id=current_user.id,
             prompt=req.prompt,
-            conversation_id=conv_id,
-            aspect_ratio=req.aspect_ratio,
-            intensity=req.intensity or "medium"
+            requested_pipeline=req.requested_pipeline or "auto",
+            parameters={
+                "aspect_ratio": req.aspect_ratio or "1:1",
+                "intensity": req.intensity or "medium",
+                "conversation_id": req.conversation_id,
+                "workflow": "TEXT_TO_IMAGE",
+            },
+            idempotency_key=req.idempotency_key,
         )
-        return {"status": "success", "image": res}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    job_dict = job.to_dict()
+    job_dict["idempotent_replay"] = not created
+    return {
+        "status": "queued",
+        "job_id": str(job.id),
+        "status_url": f"/api/v1/images/jobs/{job.id}",
+        "job": job_dict,
+    }
 
-@router.post("/images/edit")
+@router.post("/images/edit", status_code=202)
 async def api_edit_image(
     req: ImageEditAPIRequest,
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    from media.image_engine import ImageGenerationEngine
-    conv_id = uuid.UUID(req.conversation_id) if req.conversation_id else None
-    parent_id = uuid.UUID(req.parent_image_id)
-    engine = ImageGenerationEngine(db, current_user.id)
+    """Enqueues a durable worker-backed prompt-variation ImageGenerationJob."""
+    from media.image_worker import create_image_generation_job
     try:
-        res = await engine.edit_image(
-            parent_image_id=parent_id,
-            edit_instruction=req.edit_instruction,
-            conversation_id=conv_id,
-            intensity=req.intensity or "medium"
+        parent_id = uuid.UUID(req.parent_image_id)
+        if req.conversation_id:
+            uuid.UUID(req.conversation_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid UUID format.")
+    try:
+        job, created = create_image_generation_job(
+            db=db,
+            user_id=current_user.id,
+            prompt=req.edit_instruction,
+            requested_pipeline="edit",
+            parameters={
+                "parent_image_id": str(parent_id),
+                "edit_instruction": req.edit_instruction,
+                "conversation_id": req.conversation_id,
+                "intensity": req.intensity or "medium",
+                "workflow": "PROMPT_VARIATION",
+            },
+            idempotency_key=req.idempotency_key,
         )
-        return {"status": "success", "image": res}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    job_dict = job.to_dict()
+    job_dict["idempotent_replay"] = not created
+    return {
+        "status": "queued",
+        "job_id": str(job.id),
+        "status_url": f"/api/v1/images/jobs/{job.id}",
+        "job": job_dict,
+    }
 
-@router.post("/images/variation")
+@router.post("/images/variation", status_code=202)
 async def api_variation_image(
     req: ImageVariationAPIRequest,
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    from media.image_engine import ImageGenerationEngine
-    conv_id = uuid.UUID(req.conversation_id) if req.conversation_id else None
-    parent_id = uuid.UUID(req.parent_image_id)
-    engine = ImageGenerationEngine(db, current_user.id)
+    """Enqueues durable worker-backed prompt-variation ImageGenerationJobs."""
+    from media.image_worker import create_image_generation_job
     try:
-        res = await engine.create_variations(
-            parent_image_id=parent_id,
-            count=req.count or 2,
-            conversation_id=conv_id
-        )
-        return {"status": "success", "variations": res}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        parent_id = uuid.UUID(req.parent_image_id)
+        if req.conversation_id:
+            uuid.UUID(req.conversation_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid UUID format.")
 
-@router.post("/images/upscale")
+    parent = db.query(GeneratedImage).filter(
+        GeneratedImage.id == parent_id,
+        GeneratedImage.user_id == current_user.id,
+    ).first()
+    if not parent:
+        raise HTTPException(status_code=404, detail="Parent image not found.")
+
+    count = max(1, min(int(req.count or 2), 4))
+    jobs = []
+    for i in range(count):
+        job, _ = create_image_generation_job(
+            db=db,
+            user_id=current_user.id,
+            prompt=f"{parent.prompt} (variation {i + 1})",
+            requested_pipeline="auto",
+            parameters={
+                "parent_image_id": str(parent_id),
+                "aspect_ratio": parent.aspect_ratio or "1:1",
+                "conversation_id": req.conversation_id,
+                "workflow": "VARIATION",
+            },
+        )
+        jobs.append(job.to_dict())
+    return {"status": "queued", "jobs": jobs}
+
+@router.post("/images/upscale", status_code=202)
 async def api_upscale_image(
     req: ImageUpscaleAPIRequest,
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    from media.image_engine import ImageGenerationEngine
-    conv_id = uuid.UUID(req.conversation_id) if req.conversation_id else None
-    parent_id = uuid.UUID(req.parent_image_id)
-    engine = ImageGenerationEngine(db, current_user.id)
+    """Enqueues a durable worker-backed high-resolution regeneration ImageGenerationJob."""
+    from media.image_worker import create_image_generation_job
     try:
-        res = await engine.upscale_image(
-            parent_image_id=parent_id,
-            scale=req.scale or 2,
-            conversation_id=conv_id
-        )
-        return {"status": "success", "image": res}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        parent_id = uuid.UUID(req.parent_image_id)
+        if req.conversation_id:
+            uuid.UUID(req.conversation_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid UUID format.")
+
+    parent = db.query(GeneratedImage).filter(
+        GeneratedImage.id == parent_id,
+        GeneratedImage.user_id == current_user.id,
+    ).first()
+    if not parent:
+        raise HTTPException(status_code=404, detail="Target image for regeneration not found.")
+
+    job, created = create_image_generation_job(
+        db=db,
+        user_id=current_user.id,
+        prompt=parent.prompt,
+        requested_pipeline="upscale",
+        parameters={
+            "parent_image_id": str(parent_id),
+            "scale": req.scale or 2,
+            "aspect_ratio": parent.aspect_ratio or "1:1",
+            "conversation_id": req.conversation_id,
+            "intensity": "high",
+            "workflow": "HIGH_RES_REGENERATION",
+        },
+        idempotency_key=req.idempotency_key,
+    )
+    job_dict = job.to_dict()
+    job_dict["idempotent_replay"] = not created
+    return {
+        "status": "queued",
+        "job_id": str(job.id),
+        "status_url": f"/api/v1/images/jobs/{job.id}",
+        "job": job_dict,
+    }
 
 class ImageJobCreateRequest(BaseModel):
     prompt: str
@@ -1456,6 +1756,8 @@ def api_create_image_job(
 ):
     """Creates a durable worker-backed ImageGenerationJob in QUEUED state."""
     from media.image_worker import create_image_generation_job
+    from services.quotas import enforce_user_quota
+    from database.models import ImageGenerationJob
     if not (req.prompt or "").strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
     if req.conversation_id:
@@ -1464,18 +1766,32 @@ def api_create_image_job(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid conversation ID format.")
 
-    job, created = create_image_generation_job(
-        db=db,
-        user_id=current_user.id,
-        prompt=req.prompt,
-        requested_pipeline=req.requested_pipeline or "auto",
-        parameters={
-            "aspect_ratio": req.aspect_ratio or "1:1",
-            "intensity": req.intensity or "medium",
-            "conversation_id": req.conversation_id,
-        },
-        idempotency_key=req.idempotency_key,
+    is_replay = bool(
+        req.idempotency_key
+        and req.idempotency_key.strip()
+        and db.query(ImageGenerationJob).filter(
+            ImageGenerationJob.user_id == current_user.id,
+            ImageGenerationJob.idempotency_key == req.idempotency_key.strip()[:128],
+        ).first()
     )
+    if not is_replay:
+        enforce_user_quota(db, current_user.id, "image_generation")
+
+    try:
+        job, created = create_image_generation_job(
+            db=db,
+            user_id=current_user.id,
+            prompt=req.prompt,
+            requested_pipeline=req.requested_pipeline or "auto",
+            parameters={
+                "aspect_ratio": req.aspect_ratio or "1:1",
+                "intensity": req.intensity or "medium",
+                "conversation_id": req.conversation_id,
+            },
+            idempotency_key=req.idempotency_key,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     payload = job.to_dict()
     payload["idempotent_replay"] = not created
     return payload

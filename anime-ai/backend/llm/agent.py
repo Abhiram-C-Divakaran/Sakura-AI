@@ -327,11 +327,9 @@ class Agent:
         return result.get("formatted", f"No results found for '{query}'.")
 
     async def _tool_create_image(self, prompt: str, aspect_ratio: Optional[str] = None) -> str:
-        """Generates an image via ImageGenerationEngine and embeds interactive metadata."""
-        from media.image_engine import ImageGenerationEngine
-        from database.models import GeneratedImage
-        import uuid as _uuid
-        engine = ImageGenerationEngine(self.db, self.user_id)
+        """Creates a durable worker-backed ImageGenerationJob and waits cleanly for completion."""
+        from media.image_worker import create_image_generation_job, wait_for_image_job
+        from database.models import GeneratedImage, ImageGenerationJobStatus
 
         # Check if the prompt is an edit instruction for an existing image in this conversation
         p_lower = prompt.lower()
@@ -356,25 +354,57 @@ class Agent:
                 return await self._tool_edit_image(prompt, image_id=str(latest_img.id))
 
         try:
-            res = await engine.generate_image(
+            job, _ = create_image_generation_job(
+                db=self.db,
+                user_id=self.user_id,
                 prompt=prompt,
-                conversation_id=self.conversation_id,
-                aspect_ratio=aspect_ratio,
-                intensity=self.intensity,
-                workflow="TEXT_TO_IMAGE"
+                requested_pipeline="auto",
+                parameters={
+                    "conversation_id": str(self.conversation_id) if self.conversation_id else None,
+                    "aspect_ratio": aspect_ratio or "1:1",
+                    "intensity": self.intensity,
+                    "workflow": "TEXT_TO_IMAGE",
+                    "source": "chat_tool",
+                },
             )
-            meta_json = json.dumps(res)
-            img_snippet = f"![{res['filename']}]({res['url']})\n\n<!-- SAKURA_IMAGE_DATA:{meta_json} -->\n\n*Prompt:* \"{res['prompt']}\" | *Aspect Ratio:* {res['aspect_ratio']} | *Resolution:* {res['width']}×{res['height']}"
-            self.pending_image_markdowns.append(img_snippet)
-            return (
-                f"Generated artwork successfully.\n\n"
-                f"{img_snippet}\n\n"
-                f"CRITICAL SYSTEM DIRECTIVE: You MUST display the generated image by including the exact markdown image tag and SAKURA_IMAGE_DATA comment block in your response to the user."
+            is_test_env = os.getenv("ENVIRONMENT", "").lower() in ("test", "testing")
+            wait_budget = 0.5 if is_test_env else 45.0
+            job_state, res = await wait_for_image_job(
+                job.id,
+                self.user_id,
+                timeout_seconds=wait_budget,
+                poll_interval=0.05 if is_test_env else 0.4,
             )
+
+            if job_state and job_state.get("status") == ImageGenerationJobStatus.COMPLETED and res:
+                meta_json = json.dumps(res)
+                img_snippet = f"![{res['filename']}]({res['url']})\n\n<!-- SAKURA_IMAGE_DATA:{meta_json} -->\n\n*Prompt:* \"{res['prompt']}\" | *Aspect Ratio:* {res['aspect_ratio']} | *Resolution:* {res['width']}×{res['height']}"
+                self.pending_image_markdowns.append(img_snippet)
+                return (
+                    f"Generated artwork successfully.\n\n"
+                    f"{img_snippet}\n\n"
+                    f"CRITICAL SYSTEM DIRECTIVE: You MUST display the generated image by including the exact markdown image tag and SAKURA_IMAGE_DATA comment block in your response to the user."
+                )
+
+            if job_state and job_state.get("status") in (ImageGenerationJobStatus.QUEUED, ImageGenerationJobStatus.RUNNING):
+                job_info = json.dumps({
+                    "job_id": str(job.id),
+                    "status": job_state.get("status"),
+                    "status_url": f"/api/v1/images/jobs/{job.id}",
+                    "prompt": prompt,
+                })
+                return (
+                    f"Image generation job `{job.id}` is currently **{job_state.get('status')}** in the durable worker queue.\n\n"
+                    f"You can track progress at `/api/v1/images/jobs/{job.id}`; the completed image will also appear automatically in your Library.\n\n"
+                    f"<!-- SAKURA_IMAGE_JOB:{job_info} -->"
+                )
+
+            err_detail = (job_state or {}).get("error") or "The generation service took too long to respond."
+            raise RuntimeError(err_detail)
         except Exception as e:
             err_json = json.dumps({
                 "error": "timeout" if "timed out" in str(e).lower() or "timeout" in str(e).lower() else "transient_error",
-                "message": "The generation service took too long to respond.",
+                "message": str(e) or "The generation service took too long to respond.",
                 "prompt": prompt,
                 "aspect_ratio": aspect_ratio or "1:1",
                 "intensity": self.intensity,
@@ -388,11 +418,10 @@ class Agent:
             )
 
     async def _tool_edit_image(self, edit_instruction: str, image_id: Optional[str] = None) -> str:
-        """Edits an existing image preserving prior context and establishing edit lineage."""
-        from media.image_engine import ImageGenerationEngine
-        from database.models import GeneratedImage
+        """Creates a durable worker-backed prompt-variation ImageGenerationJob with edit lineage."""
+        from media.image_worker import create_image_generation_job, wait_for_image_job
+        from database.models import GeneratedImage, ImageGenerationJobStatus
         import uuid as _uuid
-        engine = ImageGenerationEngine(self.db, self.user_id)
 
         parent_uuid = None
         if image_id:
@@ -417,32 +446,58 @@ class Agent:
                 parent_uuid = latest_img.id
 
         try:
-            if parent_uuid:
-                res = await engine.edit_image(
-                    parent_image_id=parent_uuid,
-                    edit_instruction=edit_instruction,
-                    conversation_id=self.conversation_id,
-                    intensity=self.intensity
-                )
-            else:
-                res = await engine.generate_image(
-                    prompt=edit_instruction,
-                    conversation_id=self.conversation_id,
-                    intensity=self.intensity,
-                    workflow="EDIT_IMAGE"
-                )
-            meta_json = json.dumps(res)
-            img_snippet = f"![{res['filename']}]({res['url']})\n\n<!-- SAKURA_IMAGE_DATA:{meta_json} -->\n\n*Instruction:* \"{edit_instruction}\" | *Lineage:* Version {res['lineage_depth'] + 1}"
-            self.pending_image_markdowns.append(img_snippet)
-            return (
-                f"Updated image with requested changes.\n\n"
-                f"{img_snippet}\n\n"
-                f"CRITICAL SYSTEM DIRECTIVE: You MUST display the generated image by including the exact markdown image tag and SAKURA_IMAGE_DATA comment block in your response to the user."
+            job, _ = create_image_generation_job(
+                db=self.db,
+                user_id=self.user_id,
+                prompt=edit_instruction,
+                requested_pipeline="edit",
+                parameters={
+                    "parent_image_id": str(parent_uuid) if parent_uuid else None,
+                    "edit_instruction": edit_instruction,
+                    "conversation_id": str(self.conversation_id) if self.conversation_id else None,
+                    "intensity": self.intensity,
+                    "workflow": "PROMPT_VARIATION" if parent_uuid else "EDIT_IMAGE",
+                    "source": "chat_tool",
+                },
             )
+            is_test_env = os.getenv("ENVIRONMENT", "").lower() in ("test", "testing")
+            wait_budget = 0.5 if is_test_env else 45.0
+            job_state, res = await wait_for_image_job(
+                job.id,
+                self.user_id,
+                timeout_seconds=wait_budget,
+                poll_interval=0.05 if is_test_env else 0.4,
+            )
+
+            if job_state and job_state.get("status") == ImageGenerationJobStatus.COMPLETED and res:
+                meta_json = json.dumps(res)
+                img_snippet = f"![{res['filename']}]({res['url']})\n\n<!-- SAKURA_IMAGE_DATA:{meta_json} -->\n\n*Instruction:* \"{edit_instruction}\" | *Lineage:* Version {res['lineage_depth'] + 1}"
+                self.pending_image_markdowns.append(img_snippet)
+                return (
+                    f"Updated image with requested changes.\n\n"
+                    f"{img_snippet}\n\n"
+                    f"CRITICAL SYSTEM DIRECTIVE: You MUST display the generated image by including the exact markdown image tag and SAKURA_IMAGE_DATA comment block in your response to the user."
+                )
+
+            if job_state and job_state.get("status") in (ImageGenerationJobStatus.QUEUED, ImageGenerationJobStatus.RUNNING):
+                job_info = json.dumps({
+                    "job_id": str(job.id),
+                    "status": job_state.get("status"),
+                    "status_url": f"/api/v1/images/jobs/{job.id}",
+                    "prompt": edit_instruction,
+                })
+                return (
+                    f"Image variation job `{job.id}` is currently **{job_state.get('status')}** in the durable worker queue.\n\n"
+                    f"Track status at `/api/v1/images/jobs/{job.id}`.\n\n"
+                    f"<!-- SAKURA_IMAGE_JOB:{job_info} -->"
+                )
+
+            err_detail = (job_state or {}).get("error") or "The generation service took too long to respond."
+            raise RuntimeError(err_detail)
         except Exception as e:
             err_json = json.dumps({
                 "error": "timeout" if "timed out" in str(e).lower() or "timeout" in str(e).lower() else "transient_error",
-                "message": "The generation service took too long to respond.",
+                "message": str(e) or "The generation service took too long to respond.",
                 "prompt": edit_instruction,
                 "aspect_ratio": "1:1",
                 "intensity": self.intensity,

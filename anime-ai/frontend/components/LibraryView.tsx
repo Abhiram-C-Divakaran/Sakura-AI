@@ -206,7 +206,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     fetchFiles();
   };
 
-  // Image generator handler
+  // Image generator handler (durable worker-backed job lifecycle)
   const handleGenerateImage = async (prompt: string, filename?: string) => {
     const res = await authFetch(`${apiBase}/api/v1/library/generate-image`, {
       method: 'POST',
@@ -216,8 +216,24 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       body: JSON.stringify({ prompt, filename })
     });
     if (!res.ok) {
-      const err = await res.json();
+      const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || 'Failed to generate image');
+    }
+    const payload = await res.json();
+    if (payload.job_id) {
+      const deadline = Date.now() + 90_000;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const stRes = await authFetch(`${apiBase}/api/v1/images/jobs/${payload.job_id}`);
+        if (!stRes.ok) break;
+        const job = await stRes.json();
+        if (job.status === 'COMPLETED') {
+          break;
+        }
+        if (job.status === 'FAILED' || job.status === 'CANCELLED') {
+          throw new Error(job.error || `Image generation ${String(job.status).toLowerCase()}`);
+        }
+      }
     }
     fetchFiles();
   };

@@ -1,124 +1,133 @@
-# Sakura AI — Production, Operational & Legal Readiness Checklist
+# Sakura AI — Production, Operational & Legal Readiness Package
 
-> **Document Status:** Pre-Launch Engineering & Operations Baseline  
-> **Legal Disclaimer:** All legal policy sections (Privacy Policy and Terms of Service) require formal review and sign-off by qualified legal counsel prior to commercial or public launch. This document does not constitute legal advice or fabricated compliance certifications.
+> **Document Status:** Staging & Production Operations Baseline  
+> **Legal Disclaimer:** Public policy drafts (`/privacy`, `/terms`) require formal review and sign-off by qualified legal counsel before public/commercial launch. This package provides technical operations runbooks, not legal advice.
 
 ---
 
-## 1. Privacy Policy *(Requires Human Legal Review)*
+## 1. Operational Artifacts Included
 
-- Public draft route: `/privacy` ([privacy.tsx](frontend/pages/privacy.tsx))
-- **Required legal review items before public launch:**
-  - Exact legal entity name, registered address, and Data Protection Officer / privacy contact mailbox.
-  - Subprocessor disclosure list (configured LLM providers such as Groq, OpenAI, Anthropic; object storage provider; SMTP provider; Pollinations image endpoint if enabled).
-  - Jurisdictional rights disclosures (GDPR, CCPA/CPRA, etc.) matching target regions.
-  - Confirmation of zero model-training agreements with upstream inference providers.
+| Artifact | Purpose |
+| --- | --- |
+| [`ops/nginx.conf.example`](ops/nginx.conf.example) | TLS 1.2/1.3 reverse proxy, WebSocket `/api/v1/ws` upgrade, SSE `proxy_buffering off`, internal-only `/readiness` |
+| [`ops/scripts/validate_env.py`](ops/scripts/validate_env.py) | Pre-flight environment validator (secrets, driver consistency, `TRUSTED_PROXY_CIDRS`, `PUBLIC_APP_URL`, storage) |
+| [`ops/scripts/backup_postgres.sh`](ops/scripts/backup_postgres.sh) | Compressed custom-format `pg_dump` with SHA-256 checksum and retention pruning |
+| [`ops/scripts/verify_restore.sh`](ops/scripts/verify_restore.sh) | Automated restore verification into a temporary database with Alembic head & table verification |
+| [`docker-compose.prod.yml`](docker-compose.prod.yml) | Production service topology (PostgreSQL+pgvector, Redis AOF, migration, sandbox runtime/executor, API, workers, scheduler, frontend) |
 
-## 2. Terms of Service *(Requires Human Legal Review)*
+---
 
-- Public draft route: `/terms` ([terms.tsx](frontend/pages/terms.tsx))
-- **Required legal review items before public launch:**
-  - Governing law, dispute resolution, and limitation of liability clauses.
-  - Acceptable Use Policy covering sandboxed code execution, AI-generated content, and rate limits.
-  - Intellectual property ownership terms for user prompts, repository code, and generated media.
+## 2. Reverse Proxy, TLS, WebSocket & SSE Requirements
 
-## 3. Support & Contact Channels
+- Terminate TLS 1.2/1.3 at a reverse proxy (see [`ops/nginx.conf.example`](ops/nginx.conf.example)).
+- `docker-compose.prod.yml` binds `backend-api` (`127.0.0.1:8000`) and `frontend` (`127.0.0.1:3000`) strictly to loopback by default so direct unencrypted public traffic cannot bypass the proxy.
+- **WebSocket (`/api/v1/ws`):** Requires HTTP/1.1 `Upgrade` and `Connection: upgrade` headers and long read/send timeouts (`3600s`). Auth uses short-lived single-use tickets (`POST /api/v1/auth/ws-ticket`) — query-string JWT tokens are forbidden.
+- **SSE streaming (`/api/v1/chat/stream`, `/api/v1/coding/tasks/*/events/stream`):** MUST set `proxy_buffering off`, `proxy_cache off`, `X-Accel-Buffering no`, and `proxy_read_timeout 3600s`.
+- **Private Network Boundaries:** `postgres` (`5432`), `redis` (`6379`), and `sandbox-executor` (`9000`) MUST remain exclusively on the private Docker/VPC network with zero public exposure.
 
-- Public contact page: `/contact` ([contact.tsx](frontend/pages/contact.tsx))
-- Configure `NEXT_PUBLIC_SUPPORT_EMAIL` to a monitored support mailbox before deployment.
-- Public issue tracker fallback: repository Issues URL (`https://github.com/Abhiram-C-Divakaran/Sakura-AI/issues`).
-- Never hardcode unverified email addresses in UI or legal notices.
+---
 
-## 4. Account Deletion
+## 3. Trusted Proxies & Canonical Public URL
 
-- Users can delete individual conversations, memories, workspaces, and library files directly via the API/UI.
-- Deleting a `User` row cascades to `conversations`, `messages`, `documents`, `document_chunks`, `projects`, `scheduled_tasks`, `background_tasks`, `user_integrations`, `repository_workspaces`, `coding_tasks`, `coding_jobs`, `image_generation_jobs`, `websocket_tickets`, and `password_reset_tokens`.
-- **Operational requirement before public launch:** Before deleting a user record, run `cleanup_orphaned_storage_objects(user_id, db)` (and flush `storage_deletion_outbox`) so physical S3/disk objects under `users/<user_id>/` and workspace directories under `/workspaces/<workspace_id>` are purged. Add a dedicated self-service account deletion endpoint (`DELETE /api/v1/auth/me`) if operating in GDPR/CCPA jurisdictions.
+- **`TRUSTED_PROXY_CIDRS`:** Comma-separated CIDRs of your reverse proxy/load balancer (e.g., `127.0.0.1/32,10.0.0.0/8,172.16.0.0/12`). `services/rate_limit.py` ignores `X-Forwarded-For` unless `request.client.host` falls inside a configured trusted CIDR, and walks forwarded hops right-to-left to defeat header spoofing.
+- **`PUBLIC_APP_URL`:** Canonical `https://` origin (non-localhost) used to generate password reset links. In production, password reset fails closed (`503`) if `PUBLIC_APP_URL` is missing, non-HTTPS, or points to `localhost`.
+- **`NEXT_PUBLIC_SITE_URL` / `CORS_ALLOWED_ORIGINS`:** Must match your canonical `https://` origin (never `*` in production).
 
-## 5. Data Retention
+---
 
-- **Database records:** Retained until explicitly deleted by the user or workspace administrator.
-- **Ephemeral auth artifacts:**
-  - `websocket_tickets`: 60-second TTL, single-use (`consumed_at` enforced atomically). Schedule periodic pruning of rows where `expires_at < NOW() - INTERVAL '1 day'`.
-  - `password_reset_tokens`: 30-minute TTL, SHA-256 hashed, single-use. Schedule periodic pruning of expired rows.
-  - `sandbox_network_authorizations`: 5-minute default TTL, single-use. Schedule periodic pruning of expired rows.
-- **Storage deletion outbox (`storage_deletion_outbox`):** Audited retention of deletion attempts and errors; completed rows can be archived or pruned after 30–90 days per policy.
+## 4. Environment Variable Checklist & Validation
 
-## 6. User Data Export
+Run `python anime-ai/ops/scripts/validate_env.py` against your deployment environment before starting services.
 
-- Individual library files, generated images, and workspace diffs are downloadable via authenticated API endpoints.
-- **Operational requirement before public launch:** Implement an asynchronous account export job (`GET/POST /api/v1/account/export`) producing a user-scoped JSON/ZIP bundle if subject to GDPR Article 20 portability requirements.
+Mandatory production secrets (never committed to Git; inject via Vault / AWS Secrets Manager / GCP Secret Manager / Docker Secrets):
+- `POSTGRES_PASSWORD` (>= 12 chars)
+- `DATABASE_URL` (`postgresql+psycopg2://...`)
+- `REDIS_URL` (`redis://...` or `rediss://...`)
+- `JWT_SECRET` (>= 32 high-entropy chars)
+- `INTEGRATION_ENCRYPTION_KEY` (>= 32 chars, independent of `JWT_SECRET`)
+- `SAKURA_SANDBOX_SERVICE_TOKEN` (>= 24 chars, shared only by `backend-api`, `coding-worker`, and `sandbox-executor`)
+- `SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY` (>= 32 chars, independent of all other secrets)
+- `SAKURA_STORAGE_BACKEND=s3` + `SAKURA_STORAGE_BUCKET`, `SAKURA_STORAGE_ACCESS_KEY`, `SAKURA_STORAGE_SECRET_KEY` (or single-node durable absolute `SAKURA_STORAGE_ROOT=/data/library`)
+- `SAKURA_EMBEDDED_WORKER=false`, `SAKURA_EMBEDDED_SCHEDULER=false`, `SAKURA_EMBEDDED_CODING_WORKER=false`
 
-## 7. Backup & Recovery
+Optional feature variables:
+- LLM providers: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, or `OLLAMA_BASE_URL` + `OLLAMA_MODEL`
+- Password reset SMTP: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `PUBLIC_APP_URL` (HTTPS)
+- Daily per-user quotas: `SAKURA_QUOTA_CHAT_DAILY`, `SAKURA_QUOTA_IMAGE_DAILY`, `SAKURA_QUOTA_CODING_DAILY`, `SAKURA_QUOTA_UPLOAD_DAILY`, `SAKURA_QUOTA_SCHEDULED_DAILY`
 
-- **PostgreSQL (`sakura_postgres`):**
-  - Enable automated daily `pg_dump` (or managed snapshot + WAL Point-in-Time Recovery) with encrypted off-host storage.
-  - Test full restore + `alembic upgrade head` on a clean database monthly.
-- **Object Storage (`SAKURA_STORAGE_BACKEND=s3`):**
-  - Enable bucket versioning and lifecycle rules on the configured S3/R2/MinIO bucket.
-- **Redis (`sakura_redis`):**
-  - Used for realtime pub/sub, immediate job dispatch hints, rate limits, and capability nonce replay protection (all durable job state lives in PostgreSQL). Enable AOF persistence (`appendonly yes`) so active capability nonces survive brief restarts.
+**Secret Rotation Procedure:**
+1. Rotate `SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY` and `SAKURA_SANDBOX_SERVICE_TOKEN` together across `sandbox-executor`, `coding-worker`, and `backend-api` during a brief maintenance drain (in-flight capability tokens expire within 60–180s).
+2. Rotate `JWT_SECRET` to invalidate all active user sessions (users re-authenticate cleanly).
+3. Rotate `POSTGRES_PASSWORD` in PostgreSQL first, update secret store, and roll services.
 
-## 8. HTTPS & Reverse Proxy Requirements
+---
 
-- Production deployments MUST terminate TLS 1.2+ at a reverse proxy (Nginx, Caddy, Envoy, or cloud load balancer) in front of `frontend` (`:3000`) and `backend-api` (`:8000`).
-- Proxy configuration requirements:
-  - Forward `X-Forwarded-For`, `X-Forwarded-Proto: https`, and `Host`.
-  - Enable HTTP/1.1 WebSocket upgrade (`Upgrade` / `Connection` headers) on `/api/v1/ws`.
-  - Disable response buffering (`proxy_buffering off`) on SSE endpoints (`/api/v1/chat/stream`, `/api/v1/coding/.../events/stream`).
-  - Set `NEXT_PUBLIC_SITE_URL` to the canonical `https://` origin and `CORS_ALLOWED_ORIGINS` strictly to trusted origins (never `*`).
-  - Keep `postgres` (`5432`), `redis` (`6379`), and `sandbox-executor` (`9000`) strictly on the internal private network with zero public exposure.
+## 5. Account Lifecycle, Data Export & Retention
 
-## 9. Secrets Management
+- **Self-service Account Deletion (`DELETE /api/v1/auth/me`):** Requires explicit confirmation (`confirm: "DELETE"`) and current password verification. Atomically cancels queued/running coding, image, and background jobs; removes user workspace directories; purges user-owned storage objects under `users/<user_id>/` (with durable `storage_deletion_outbox` fallback on transient errors); removes DB records; and persists a non-sensitive `account_audit_events` row.
+- **Async User Data Export (`POST /api/v1/auth/me/export`, `GET /api/v1/auth/me/export/{id}`, `GET /api/v1/auth/me/export/{id}/download`):** Durable worker job builds a user-isolated ZIP archive (`users/<user_id>/exports/<export_id>/sakura_export.zip`) containing profile (no password hashes), conversations, messages, memories, projects, documents metadata, images metadata, scheduled tasks, and coding tasks.
+- **Retention Pruning:** Periodically prune expired rows in `websocket_tickets`, `password_reset_tokens`, and `sandbox_network_authorizations` older than 24 hours, and expired `user_data_exports` older than 7 days.
 
-- Never commit `.env` files or production secrets into Git. Inject secrets at runtime via your infrastructure's secret manager (Vault, AWS/GCP Secret Manager, Docker Secrets, or Kubernetes Secrets).
-- Mandatory independent production secrets (enforced by `Settings.validate_production_guards()` and `/readiness`):
-  - `POSTGRES_PASSWORD`
-  - `JWT_SECRET` (>= 32 high-entropy characters)
-  - `INTEGRATION_ENCRYPTION_KEY` (>= 32 chars, independent of `JWT_SECRET`)
-  - `SAKURA_SANDBOX_SERVICE_TOKEN` (shared only between `backend-api`, `coding-worker`, and `sandbox-executor`)
-  - `SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY` (>= 32 chars, independent of `JWT_SECRET`, `INTEGRATION_ENCRYPTION_KEY`, and `SAKURA_SANDBOX_SERVICE_TOKEN`)
-- Optional feature secrets (features fail closed or report `NOT_CONFIGURED` when absent):
-  - LLM providers: `GROQ_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or local `OLLAMA_BASE_URL` + `OLLAMA_MODEL`
-  - Storage: `SAKURA_STORAGE_BUCKET`, `SAKURA_STORAGE_ENDPOINT`, `SAKURA_STORAGE_ACCESS_KEY`, `SAKURA_STORAGE_SECRET_KEY`
-  - Password reset email: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `PUBLIC_APP_URL`
+---
 
-## 10. Rate Limiting
+## 6. Rate Limiting & Durable Per-User Quotas
 
-- Sliding-window rate limiting (`services/rate_limit.py`, Redis-backed with in-memory fallback) is active on:
-  - `POST /api/v1/auth/register` (15 req / 15 min per IP)
-  - `POST /api/v1/auth/token` (30 req / 15 min per IP; 15 req / 15 min per IP+username)
-  - `POST /api/v1/auth/password-reset/request` (10 req / 15 min per IP; 5 req / 15 min per identifier)
-  - `POST /api/v1/auth/password-reset/confirm` (15 req / 15 min per IP)
-- Complement application limits with edge/reverse-proxy rate limits (`limit_req_zone` / WAF) on `/api/v1/chat/stream`, `/api/v1/images/jobs`, and `/api/v1/coding/*`.
+- **Auth Rate Limiting (`services/rate_limit.py`):** Redis-backed sliding window on `/auth/register`, `/auth/token`, `/auth/password-reset/request`, `/auth/password-reset/confirm`. Fails closed (`HTTP 503`) in production if Redis is unavailable on security-sensitive auth routes.
+- **Per-User Daily Quotas (`services/quotas.py`, `user_usage_quotas` table):** Atomic multi-worker DB-backed UTC daily counters enforced on chat (`chat`), image generation (`image_generation`), Sakura Code tasks (`coding_task`), file uploads (`file_upload`), and scheduled jobs (`scheduled_job`). Inspectable via `GET /api/v1/auth/me/quotas`.
 
-## 11. Usage Quotas
+---
 
-- Enforce upload size caps (50 MB streaming spool limit in `services/upload.py`), sandbox CPU/RAM/PID/timeout/output hard caps (`SAKURA_SANDBOX_CPUS`, `SAKURA_SANDBOX_MEMORY_MB`, `SAKURA_SANDBOX_PIDS`, `SAKURA_HARD_OUTPUT_LIMIT_BYTES`), and bounded retry limits across `coding_jobs`, `image_generation_jobs`, `background_tasks`, and `storage_deletion_outbox`.
-- **Pre-launch operator action:** Configure upstream LLM provider spend caps/alerts and per-user daily token/job quotas before opening self-serve signups.
+## 7. Backup, Restore & Storage Durability
 
-## 12. Monitoring & Alerting
+- **PostgreSQL:** Schedule `ops/scripts/backup_postgres.sh` daily (plus WAL archiving / managed PITR where supported) and run `ops/scripts/verify_restore.sh <dump>` weekly/monthly against an isolated staging PostgreSQL instance.
+- **Object Storage (`SAKURA_STORAGE_BACKEND=s3`):** Enable bucket versioning, server-side encryption, and lifecycle policies. Monitor `storage_deletion_outbox` rows where `status = 'FAILED'` (target: `0`).
+- **Redis (`sakura_redis`):** Runs with `--appendonly yes --appendfsync everysec` in `docker-compose.prod.yml` so active capability replay nonces and rate-limit windows survive restarts. All authoritative job/task state remains in PostgreSQL.
 
-- **Liveness:** `GET /health` (backend-api `:8000`, sandbox-executor `:9000`).
-- **Readiness:** `GET /readiness` (returns HTTP 200 `READY` only when PostgreSQL, Alembic head revision, Redis, secrets, independent capability key, storage backend, and remote sandbox executor + runtime image are all healthy; returns HTTP 503 `NOT_READY` otherwise, without leaking secret values).
-- **Recommended alerts:**
-  - `/readiness` non-200 for > 2 consecutive probes.
-  - `coding_jobs` or `image_generation_jobs` stuck in `QUEUED` > 5 minutes (worker down).
-  - `storage_deletion_outbox` rows in `FAILED` state > 0.
-  - Elevated HTTP 401/403/429/5xx rates or sandbox capability rejection spikes.
-  - Host disk usage on PostgreSQL, workspace volume, and Docker image cache > 80%.
+---
 
-## 13. Incident Response
+## 8. Sandbox Executor Host Isolation & Workspace Disk Security
 
-1. **Detection & Triage:** Correlate via `X-Request-ID` response headers, structured worker logs, and `/readiness` payload.
-2. **Containment:**
-   - Suspected credential leak: rotate `JWT_SECRET` (invalidates all sessions), `INTEGRATION_ENCRYPTION_KEY`, `SAKURA_SANDBOX_SERVICE_TOKEN`, and `SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY` immediately.
-   - Suspected sandbox abuse: cancel active jobs via `/api/v1/coding/tasks/{task_id}/cancel` (triggers `/executions/{execution_id}/cancel` container kill), isolate `sandbox-executor`, and inspect `coding_task_events` / `tool_executions`.
-3. **Recovery & Postmortem:** Restore from verified snapshots if data corruption occurred, run `alembic current` + `/readiness`, document root cause and regression tests before closing.
+- **Docker Socket Isolation:** `sandbox-executor` is the **only** container permitted to mount `/var/run/docker.sock`. Neither `backend-api`, `worker`, `coding-worker`, nor child containers ever mount the Docker socket.
+- **Host Isolation Policy:** For multi-tenant staging/production, deploy `sandbox-executor` on a dedicated hardened host/VM (or rootless Docker / gVisor / Firecracker runtime) isolated from database hosts and cloud instance metadata (`169.254.169.254` blocked via host egress firewall).
+- **Child Container Hardening:** Every child runs non-root (`--user 1001:1001`), `--network none` by default (bridge only with single-use HMAC-signed `network_exec` or `repository_clone` capability validated against Redis), `--cap-drop ALL`, `--security-opt no-new-privileges:true`, CPU/RAM/PID caps, output byte caps, and single-workspace bind mounts (`/workspace` only, never parent `/workspaces`).
+- **Workspace Disk Monitoring:** Alert when `sakura_workspaces` volume or Docker overlay storage exceeds 75% utilization; prune stale unused workspaces and dangling containers (`sakura-exec-*`, `sakura-smoke-*`).
 
-## 14. Exact Infrastructure Deployment Requirements (`docker-compose.prod.yml`)
+---
 
-- Linux host (or container orchestrator) with Docker Engine and Docker Compose v2.
-- Shared persistent volumes: `postgres_data`, `redis_data`, `sakura_workspaces` (mounted by `backend-api`, `worker`, `coding-worker`, and `sandbox-executor`), and S3-compatible object storage (AWS S3, Cloudflare R2, or MinIO).
-- Build order enforced by Compose: `migration` runs `alembic upgrade head` -> `sandbox-runtime` builds `sakura-sandbox:<tag>` -> `sandbox-executor` verifies `/readiness` -> `backend-api`, `worker`, `coding-worker`, `scheduler`, and `frontend` start with healthcheck dependencies.
-- Never run `SAKURA_EMBEDDED_CODING_WORKER=true` or `SAKURA_EMBEDDED_SCHEDULER=true` in production; run the dedicated `coding-worker`, `worker`, and `scheduler` services.
+## 9. Monitoring, Alerting & Queue Health
+
+- **Health & Readiness Probes:**
+  - `GET /health` (liveness on `:8000` and `:9000`)
+  - `GET /readiness` (deep readiness checking PostgreSQL, Alembic head, Redis, secrets, independent signing key, storage backend, and remote sandbox executor + runtime image + non-root smoke test)
+- **Worker & Queue Lag Alerts:**
+  - `coding_jobs`, `image_generation_jobs`, or `background_tasks` remaining `QUEUED` > 5 minutes.
+  - Redis list lengths (`LLEN sakura:tasks:queue`, `LLEN sakura:coding:jobs`, `LLEN sakura:image:jobs`) growing monotonically.
+  - `storage_deletion_outbox` `FAILED` count > 0.
+  - `/readiness` returning non-200 for > 2 consecutive intervals.
+  - Spike in HTTP 401/403/429/503 responses or sandbox capability rejections.
+
+---
+
+## 10. Deployment, Migration Ordering & Rollback Runbook
+
+### Deployment Order
+1. Run `python anime-ai/ops/scripts/validate_env.py`.
+2. Take a verified PostgreSQL backup (`ops/scripts/backup_postgres.sh`).
+3. Build images: `docker compose -f docker-compose.prod.yml build`.
+4. Run database migrations before starting app containers: `docker compose -f docker-compose.prod.yml run --rm migration` (verifies `alembic upgrade head`).
+5. Start infrastructure & sandbox: `postgres`, `redis`, `sandbox-runtime`, `sandbox-executor` -> confirm `sandbox-executor` `/readiness` HTTP 200.
+6. Start workers & scheduler: `worker`, `coding-worker`, `scheduler`.
+7. Start `backend-api` -> confirm `GET http://127.0.0.1:8000/readiness` returns HTTP 200 `READY`.
+8. Start `frontend` and reload reverse proxy.
+
+### Incident & Rollback Procedure
+1. **App-only regression (compatible schema):** Roll back container image tags and restart `backend-api`, `worker`, `coding-worker`, `scheduler`, `frontend`; verify `/readiness`.
+2. **Schema rollback (only if last migration caused breakage):** Stop API & workers -> run `alembic downgrade -1` (or restore from pre-deploy `pg_dump` snapshot if destructive) -> start previous image tags -> verify `/readiness`.
+3. **Credential compromise:** Rotate affected secrets immediately, restart affected services, audit `account_audit_events` and container logs.
+
+---
+
+## 11. Legal Policy Review Checklist *(Requires Human Legal Sign-Off)*
+
+- `/privacy` (`frontend/pages/privacy.tsx`) and `/terms` (`frontend/pages/terms.tsx`) are explicitly labeled as pre-launch drafts requiring legal review before public release.
+- Configure `NEXT_PUBLIC_SUPPORT_EMAIL` for `/contact` before staging/public launch.

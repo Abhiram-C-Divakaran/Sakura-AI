@@ -365,7 +365,8 @@ class ImageGenerationEngine:
         intensity: str = "medium",
         parent_image_id: Optional[uuid.UUID] = None,
         workflow: str = "TEXT_TO_IMAGE",
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
+        requested_pipeline: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Executes real image generation through routed pipeline with quality validation
@@ -375,12 +376,36 @@ class ImageGenerationEngine:
         if not clean_prompt:
             raise ValueError("Image prompt cannot be empty.")
 
-        # Determine pipeline route
-        pipeline = self.router.route_intent(
-            clean_prompt,
-            is_edit=(workflow == "EDIT_IMAGE"),
-            is_upscale=(workflow == "UPSCALE")
-        )
+        # Determine pipeline route (honoring explicit requested_pipeline when specified)
+        explicit_map = {
+            "anime": GenerationPipeline.ANIME,
+            "photorealism": GenerationPipeline.PHOTOREALISM,
+            "photorealistic": GenerationPipeline.PHOTOREALISM,
+            "ui": GenerationPipeline.UI,
+            "text_to_image": GenerationPipeline.TEXT_TO_IMAGE,
+            "edit": GenerationPipeline.EDIT,
+            "upscale": GenerationPipeline.UPSCALE,
+            "high_res_regeneration": GenerationPipeline.UPSCALE,
+        }
+        norm_req_pipeline = (requested_pipeline or "auto").strip().lower()
+        if norm_req_pipeline in ("", "auto"):
+            pipeline = self.router.route_intent(
+                clean_prompt,
+                is_edit=(workflow in ("EDIT_IMAGE", "PROMPT_VARIATION")),
+                is_upscale=(workflow in ("UPSCALE", "HIGH_RES_REGENERATION"))
+            )
+            if pipeline == GenerationPipeline.VECTOR:
+                # Raster provider does not render native SVG vectors; normalize truthfully to TEXT_TO_IMAGE
+                pipeline = GenerationPipeline.TEXT_TO_IMAGE
+            effective_requested_pipeline = "auto"
+        elif norm_req_pipeline in explicit_map:
+            pipeline = explicit_map[norm_req_pipeline]
+            effective_requested_pipeline = pipeline.value.lower()
+        else:
+            raise ValueError(
+                f"Unsupported image generation pipeline '{requested_pipeline}'. "
+                f"Supported pipelines: auto, anime, photorealism, ui, text_to_image, edit, upscale."
+            )
 
         # Determine aspect ratio and dimensions
         ratio, width, height = self.infer_aspect_ratio(clean_prompt, aspect_ratio)
@@ -635,6 +660,7 @@ class ImageGenerationEngine:
             "height": height,
             "model": actual_model,
             "provider": actual_provider,
+            "requested_pipeline": effective_requested_pipeline,
             "pipeline": pipeline.value,
             "seed": actual_seed,
             "workflow": workflow,

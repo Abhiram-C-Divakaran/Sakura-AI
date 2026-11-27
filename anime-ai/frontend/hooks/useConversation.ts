@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { authFetch } from '../lib/auth';
 import { ChatSubmitPayload } from '../components/ChatComposer';
+import { useCodingTaskStream, CodingTaskState } from './useCodingTaskStream';
 
 export interface Conversation {
   id: string;
@@ -25,6 +26,11 @@ export interface ChatMessage {
     tool_calls?: any[];
     diff?: any;
     verification?: any;
+    coding_task_id?: string;
+    coding_job_id?: string;
+    workspace_id?: string;
+    workspace_name?: string;
+    events_stream_url?: string;
   };
 }
 
@@ -38,7 +44,45 @@ export function useConversation() {
   const [feedbackState, setFeedbackState] = useState<Record<string, 'positive' | 'negative'>>({});
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  const {
+    codingTasks,
+    activeCodingTask,
+    attachCodingTask,
+    cancelCodingTask,
+    resetCodingTasks,
+  } = useCodingTaskStream();
+
   const activeConversation = conversations.find(c => c.id === activeConvId) || null;
+
+  const selectConversation = useCallback(async (id: string) => {
+    resetCodingTasks();
+    setActiveConvId(id);
+    setMessages([]);
+    setStreamingResponse('');
+    setStreamingProvider('');
+    try {
+      const res = await authFetch(`/api/v1/conversations/${id}/messages`);
+      if (res.ok) {
+        const msgs: ChatMessage[] = await res.json();
+        setMessages(msgs);
+        // Reconnect / recover any durable coding tasks referenced by saved messages
+        for (const msg of msgs) {
+          const taskId = msg.metadata?.coding_task_id;
+          if (taskId) {
+            attachCodingTask({
+              taskId,
+              jobId: msg.metadata?.coding_job_id,
+              workspaceId: msg.metadata?.workspace_id,
+              workspaceName: msg.metadata?.workspace_name,
+              eventsStreamUrl: msg.metadata?.events_stream_url,
+            });
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`Failed to load messages for conversation ${id}:`, err);
+    }
+  }, [attachCodingTask, resetCodingTasks]);
 
   const fetchConversations = useCallback(async () => {
     try {
@@ -53,30 +97,15 @@ export function useConversation() {
     } catch (err) {
       console.error('Failed to fetch conversations:', err);
     }
-  }, [activeConvId]);
-
-  const selectConversation = useCallback(async (id: string) => {
-    setActiveConvId(id);
-    setMessages([]);
-    setStreamingResponse('');
-    setStreamingProvider('');
-    try {
-      const res = await authFetch(`/api/v1/conversations/${id}/messages`);
-      if (res.ok) {
-        const msgs = await res.json();
-        setMessages(msgs);
-      }
-    } catch (err) {
-      console.error(`Failed to load messages for conversation ${id}:`, err);
-    }
-  }, []);
+  }, [activeConvId, selectConversation]);
 
   const createNewConversation = useCallback(() => {
+    resetCodingTasks();
     setActiveConvId(null);
     setMessages([]);
     setStreamingResponse('');
     setStreamingProvider('');
-  }, []);
+  }, [resetCodingTasks]);
 
   const sendMessage = useCallback(async (payload: ChatSubmitPayload) => {
     if ((!payload.message.trim() && payload.attachments.length === 0) || loadingResponse) return;
@@ -141,6 +170,7 @@ export function useConversation() {
       if (!reader) return;
 
       let buffer = '';
+      const attachedTasks = new Set<string>();
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
@@ -154,6 +184,16 @@ export function useConversation() {
               const data = JSON.parse(trimmed.slice(6));
               if (data.token) setStreamingResponse(prev => prev + data.token);
               if (data.provider) setStreamingProvider(data.provider);
+              if (data.coding_task_id && !attachedTasks.has(data.coding_task_id)) {
+                attachedTasks.add(data.coding_task_id);
+                attachCodingTask({
+                  taskId: data.coding_task_id,
+                  jobId: data.coding_job_id,
+                  workspaceId: data.workspace_id,
+                  workspaceName: data.workspace_name,
+                  eventsStreamUrl: data.events_stream_url,
+                });
+              }
             } catch {}
           }
         }
@@ -168,7 +208,7 @@ export function useConversation() {
       setLoadingResponse(false);
       abortControllerRef.current = null;
     }
-  }, [activeConvId, loadingResponse, selectConversation]);
+  }, [activeConvId, attachCodingTask, loadingResponse, selectConversation]);
 
   const stopGeneration = useCallback(() => {
     if (abortControllerRef.current) {
@@ -243,6 +283,9 @@ export function useConversation() {
     streamingProvider,
     loadingResponse,
     feedbackState,
+    codingTasks,
+    activeCodingTask,
+    cancelCodingTask,
     fetchConversations,
     selectConversation,
     createNewConversation,
