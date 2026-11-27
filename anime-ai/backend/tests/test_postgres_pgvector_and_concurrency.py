@@ -625,6 +625,12 @@ class TestDatabaseContractAndHardening(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(stuck.finished.wait(timeout=2.0))
             db.expire_all()
             self.assertIsNotNone(db.query(Document).filter(Document.id == doc5_id).first())
+            # Clean up test-5 quarantined row so it does not leak into subsequent tests sharing the DB
+            db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == ob5.id).update(
+                {StorageDeletionOutbox.status: "COMPLETED", StorageDeletionOutbox.lease_expires_at: None},
+                synchronize_session=False,
+            )
+            db.commit()
 
         # 6. DB failure after physical deletion -> outbox stays PROCESSING until lease expiry, then worker recovers & deletes DB row
         local_store = LocalFilesystemStorage(root_dir=self.tmp_dir)
@@ -679,11 +685,13 @@ class TestDatabaseContractAndHardening(unittest.IsolatedAsyncioTestCase):
             img_b = uuid.uuid4()
             for iid, prompt in ((img_a, "Legacy A"), (img_b, "Legacy B")):
                 db.add(Document(id=iid, user_id=user.id, filename=f"{iid}.png", mime_type="image/png", storage_path="/tmp/l.png"))
+                db.flush()
                 db.add(GeneratedImage(
                     id=iid, user_id=user.id, document_id=iid, prompt=prompt, enhanced_prompt=prompt,
                     aspect_ratio="1:1", width=1024, height=1024, model="flux",
                     storage_path="/tmp/l.png", image_url=f"/api/v1/library/files/{iid}/download",
                 ))
+            db.flush()
             j1 = ImageGenerationJob(
                 id=uuid.uuid4(), user_id=user.id, prompt="Legacy A (variation 1)",
                 requested_pipeline="auto", status="QUEUED",
@@ -1232,12 +1240,16 @@ class TestPostgresPgvectorAndConcurrency(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res_second.get("already_in_progress"))
         self.assertEqual(res_second["deletion_status"], "DELETING")
 
-        # 2. Independent PG background worker skips locked/active PROCESSING lease
+        # 2. Independent PG background worker skips locked/active PROCESSING lease for doc_id
         with self.PGSession() as s3:
-            w_stats = process_storage_deletion_outbox(
+            process_storage_deletion_outbox(
                 db=s3, limit=20, storage_override=storage, worker_id="pg_racer_worker",
             )
-            self.assertEqual(w_stats["completed"], 0)
+            s3.expire_all()
+            ob_live = s3.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.document_id == doc_id).first()
+            self.assertIsNotNone(ob_live)
+            self.assertEqual(ob_live.status, "PROCESSING")
+            self.assertTrue(str(ob_live.worker_id or "").startswith("api_sync_"))
             self.assertIsNotNone(s3.query(Document).filter(Document.id == doc_id).first())
 
         self.assertEqual(storage.delete_calls, 1, "Physical deletion MUST only execute once under PG concurrency!")
