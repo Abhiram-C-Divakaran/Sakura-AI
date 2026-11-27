@@ -9,6 +9,10 @@ from llm.providers.openai import OpenAIProvider
 from llm.providers.groq import GroqProvider
 from llm.providers.anthropic import AnthropicProvider
 from llm.providers.ollama import OllamaProvider
+from llm.providers.deterministic_test import (
+    DeterministicTestProvider,
+    is_deterministic_test_provider_enabled,
+)
 
 logger = logging.getLogger("sakura.llm.router")
 
@@ -95,6 +99,11 @@ class LLMRouter:
             except Exception as e:
                 print(f"LLM Router: Failed to register Ollama: {e}")
 
+        # 5. Guarded deterministic test provider (strictly ENVIRONMENT=test + opt-in env flag)
+        if is_deterministic_test_provider_enabled():
+            self.providers["deterministic_test"] = DeterministicTestProvider()
+            print("LLM Router: Deterministic test provider enabled (ENVIRONMENT=test).")
+
     def is_private_intent(self, intent: Optional[str]) -> bool:
         return (intent or "general_chat").strip().lower() in PRIVATE_INTENTS
 
@@ -111,6 +120,9 @@ class LLMRouter:
             preferred = ["anthropic", "openai", "groq", "ollama"]
         else:
             preferred = ["groq", "openai", "anthropic", "ollama"]
+
+        if intent_lower not in PRIVATE_INTENTS and "deterministic_test" in self.providers:
+            preferred = ["deterministic_test"] + preferred
 
         ordered = []
         for name in preferred:

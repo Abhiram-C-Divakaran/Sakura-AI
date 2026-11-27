@@ -144,7 +144,9 @@ Required settings before staging/production release:
   - `Backend Tests & Schema Verification`
   - `Frontend Typecheck & Build`
   - `Docker Sandbox E2E Integration`
+  - `Full-Stack Integration Tests`
 - Block force pushes and branch deletions on `main`.
 - Require linear history or signed commits per organizational policy.
 - Dedicated `image-worker` service (`python -m media.image_worker`) runs independently from `worker` (`SAKURA_WORKER_HANDLE_IMAGES=false`) in `docker-compose.prod.yml` so long-running background tasks cannot starve image generation or storage deletion maintenance.
+- PostgreSQL backups (`ops/scripts/backup_postgres.sh`) and restore verifications (`ops/scripts/verify_restore.sh`) MUST run with a client whose major version matches the PostgreSQL server (e.g., official `postgres:15` container for PG 15); both scripts enforce major-version parity and `verify_restore.sh` fails non-zero if `alembic_version`, core tables, `pgvector`, or restored data checks fail.
 

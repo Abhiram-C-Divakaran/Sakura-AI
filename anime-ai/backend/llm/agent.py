@@ -456,6 +456,12 @@ class Agent:
             if latest_img:
                 parent_uuid = latest_img.id
 
+        if not parent_uuid:
+            return (
+                "No previously generated image was found to create a prompt variation from. "
+                "Please generate a new image first (or specify a valid image ID you own)."
+            )
+
         try:
             job, _ = create_image_generation_job(
                 db=self.db,
@@ -463,7 +469,7 @@ class Agent:
                 prompt=edit_instruction,
                 requested_pipeline="edit",
                 parameters={
-                    "parent_image_id": str(parent_uuid) if parent_uuid else None,
+                    "parent_image_id": str(parent_uuid),
                     "edit_instruction": edit_instruction,
                     "conversation_id": str(self.conversation_id) if self.conversation_id else None,
                     "intensity": self.intensity,

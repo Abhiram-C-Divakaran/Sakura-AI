@@ -1,7 +1,18 @@
 /** @type {import('next').NextConfig} */
+const apiProxyTarget = (process.env.SAKURA_API_PROXY_TARGET || '').replace(/\/+$/, '');
+
 const nextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
+  async rewrites() {
+    if (!apiProxyTarget) return [];
+    return [
+      {
+        source: '/api/:path*',
+        destination: `${apiProxyTarget}/api/:path*`,
+      },
+    ];
+  },
   async headers() {
     return [
       {

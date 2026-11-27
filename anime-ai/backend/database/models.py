@@ -658,6 +658,24 @@ class ImageGenerationJob(Base):
         }
 
 
+class ImageVariationBatch(Base):
+    """Idempotent batch record for multi-job image variation requests."""
+    __tablename__ = "image_variation_batches"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    idempotency_key = Column(String(128), nullable=False, index=True)
+    parent_image_id = Column(UUID(as_uuid=True), ForeignKey("generated_images.id", ondelete="SET NULL"), nullable=True)
+    job_ids = Column(JSON, default=list, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    user = relationship("User")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_image_var_batches_user_idem"),
+    )
+
+
 class StorageDeletionOutbox(Base):
     __tablename__ = "storage_deletion_outbox"
 
@@ -667,7 +685,11 @@ class StorageDeletionOutbox(Base):
     storage_backend = Column(String(50), default="local", nullable=False)
     storage_key = Column(String(1024), nullable=False, index=True)
     legacy_path = Column(String(1024), nullable=True)
-    status = Column(String(32), default="PENDING", nullable=False, index=True)  # PENDING, COMPLETED, FAILED
+    status = Column(String(32), default="PENDING", nullable=False, index=True)  # PENDING, PROCESSING, COMPLETED, FAILED
+    worker_id = Column(String(128), nullable=True, index=True)
+    claim_token = Column(UUID(as_uuid=True), nullable=True, index=True)
+    claimed_at = Column(DateTime(timezone=True), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
     attempt_count = Column(Integer, default=0, nullable=False)
     max_attempts = Column(Integer, default=5, nullable=False)
     last_error = Column(Text, nullable=True)
@@ -684,6 +706,9 @@ class StorageDeletionOutbox(Base):
             "storage_backend": self.storage_backend,
             "storage_key": self.storage_key,
             "status": self.status,
+            "worker_id": self.worker_id,
+            "claim_token": str(self.claim_token) if self.claim_token else None,
+            "lease_expires_at": self.lease_expires_at.isoformat() if self.lease_expires_at else None,
             "attempt_count": self.attempt_count,
             "max_attempts": self.max_attempts,
             "last_error": self.last_error,

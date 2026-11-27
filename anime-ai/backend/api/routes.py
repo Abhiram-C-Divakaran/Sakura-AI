@@ -1599,6 +1599,7 @@ class ImageVariationAPIRequest(BaseModel):
     parent_image_id: str
     count: Optional[int] = 2
     conversation_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 class ImageUpscaleAPIRequest(BaseModel):
     parent_image_id: str
@@ -1733,10 +1734,17 @@ async def api_variation_image(
         }
         for i in range(count)
     ]
-    jobs = create_batch_image_generation_jobs(db=db, user_id=current_user.id, job_specs=specs)
+    jobs, created = create_batch_image_generation_jobs(
+        db=db,
+        user_id=current_user.id,
+        job_specs=specs,
+        idempotency_key=req.idempotency_key,
+        parent_image_id=parent_id,
+    )
     return {
         "status": "queued",
         "workflow": "PROMPT_VARIATION",
+        "idempotent_replay": not created,
         "jobs": [j.to_dict() for j in jobs],
     }
 

@@ -78,9 +78,19 @@ def enqueue_task(task_id: uuid.UUID) -> bool:
 class DurableTaskWorker:
     """Long-running worker process consuming tasks from Redis with DB authoritative state."""
 
-    def __init__(self, worker_id: Optional[str] = None):
+    def __init__(
+        self,
+        worker_id: Optional[str] = None,
+        lease_duration: float = LEASE_DURATION_SECONDS,
+        heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
+        max_heartbeat_failures: int = 3,
+    ):
         self.worker_id = worker_id or f"worker_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        self.lease_duration = float(lease_duration)
+        self.heartbeat_interval = max(0.05, float(heartbeat_interval))
+        self.max_heartbeat_failures = max(1, int(max_heartbeat_failures))
         self._running = False
+        self._stop_event: Optional[asyncio.Event] = None
         self.router = LLMRouter()
 
     def recover_stale_tasks(self) -> int:
@@ -140,7 +150,7 @@ class DurableTaskWorker:
                 logger.debug(f"Redis pop error: {e}")
 
         now = utc_now()
-        lease_exp = now + timedelta(seconds=LEASE_DURATION_SECONDS)
+        lease_exp = now + timedelta(seconds=self.lease_duration)
         attempt_id = uuid.uuid4()
 
         # 2. If Redis had a task ID, try to claim it atomically in DB
@@ -256,14 +266,25 @@ class DurableTaskWorker:
         handler_task: Optional[asyncio.Task] = None
 
         async def _heartbeat_loop():
+            loop = asyncio.get_running_loop()
+            last_confirmed = loop.time()
+            consecutive_failures = 0
+            lease_loss_window = max(self.heartbeat_interval * 2.0, self.lease_duration * 0.75)
+
             while not lease_lost_event.is_set():
                 try:
-                    await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
-                    if lease_lost_event.is_set():
-                        break
+                    await asyncio.wait_for(lease_lost_event.wait(), timeout=self.heartbeat_interval)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+
+                if lease_lost_event.is_set():
+                    break
+
+                try:
                     with get_db_context() as db:
                         hb_now = utc_now()
-                        hb_lease = hb_now + timedelta(seconds=LEASE_DURATION_SECONDS)
+                        hb_lease = hb_now + timedelta(seconds=self.lease_duration)
                         rows = db.query(BackgroundTask).filter(
                             BackgroundTask.id == task_id,
                             BackgroundTask.worker_id == self.worker_id,
@@ -283,10 +304,31 @@ class DurableTaskWorker:
                             if handler_task and not handler_task.done():
                                 handler_task.cancel()
                             break
+                        # Confirmed lease renewal resets failure tracking
+                        consecutive_failures = 0
+                        last_confirmed = loop.time()
                 except asyncio.CancelledError:
                     break
                 except Exception as ex:
-                    logger.warning(f"Heartbeat update failed for task {task_id}: {ex}")
+                    consecutive_failures += 1
+                    elapsed_unconfirmed = loop.time() - last_confirmed
+                    logger.warning(
+                        f"Heartbeat DB error ({consecutive_failures}/{self.max_heartbeat_failures}, "
+                        f"unconfirmed={elapsed_unconfirmed:.2f}s) for task {task_id}: {ex}"
+                    )
+                    if (
+                        consecutive_failures >= self.max_heartbeat_failures
+                        or elapsed_unconfirmed >= lease_loss_window
+                    ):
+                        logger.error(
+                            f"Aborting task {task_id}: unable to confirm lease ownership within safe window "
+                            f"(failures={consecutive_failures}, elapsed={elapsed_unconfirmed:.2f}s). "
+                            f"Cancelling handler and suppressing all terminal writes."
+                        )
+                        lease_lost_event.set()
+                        if handler_task and not handler_task.done():
+                            handler_task.cancel()
+                        break
 
         hb_coro = asyncio.create_task(_heartbeat_loop())
 
@@ -348,10 +390,16 @@ class DurableTaskWorker:
             except asyncio.CancelledError:
                 pass
 
-    async def run(self, max_iterations: Optional[int] = None):
+    async def run(
+        self,
+        max_iterations: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+        idle_sleep: float = 0.75,
+        error_sleep: float = 2.0,
+    ):
         """
         Main worker orchestrator running bounded, independent concurrent loops for:
-        1. General BackgroundTasks (bounded concurrency via Semaphore)
+        1. General BackgroundTasks (bounded concurrency via Semaphore with leak-proof permit accounting)
         2. Maintenance loop (stale recovery, StorageDeletionOutbox, expired export/token pruning)
         3. Optional ImageGenerationJob loop when dedicated image-worker service is not split out
            (controlled by SAKURA_WORKER_HANDLE_IMAGES, default true in single-worker dev, false in prod).
@@ -362,9 +410,11 @@ class DurableTaskWorker:
         from services.account import cleanup_expired_exports_and_tokens
 
         self._running = True
+        stop_event = asyncio.Event()
+        self._stop_event = stop_event
         self.recover_stale_tasks()
         handle_images = os.getenv("SAKURA_WORKER_HANDLE_IMAGES", "true").strip().lower() == "true"
-        task_concurrency = max(1, min(int(os.getenv("TASK_WORKER_CONCURRENCY", "2")), 8))
+        task_concurrency = max(1, min(int(max_concurrency or os.getenv("TASK_WORKER_CONCURRENCY", "2")), 8))
         image_worker = ImageJobWorker(worker_id=f"{self.worker_id}_img") if handle_images else None
         if image_worker:
             image_worker.recover_stale_jobs()
@@ -390,21 +440,33 @@ class DurableTaskWorker:
                     if max_iterations is not None and iteration >= max_iterations:
                         break
                     iteration += 1
+                    acquired = False
+                    transferred = False
                     try:
                         await sem.acquire()
+                        acquired = True
                         task = self.claim_next_task()
                         if task:
                             t = asyncio.create_task(_exec_bounded(task))
+                            transferred = True
                             in_flight.add(t)
                             t.add_done_callback(in_flight.discard)
                         else:
                             sem.release()
-                            await asyncio.sleep(0.75)
+                            acquired = False
+                            await asyncio.sleep(idle_sleep)
                     except asyncio.CancelledError:
                         break
                     except Exception as e:
                         logger.error(f"Unexpected error in background task loop: {e}", exc_info=True)
-                        await asyncio.sleep(2.0)
+                        if acquired and not transferred:
+                            sem.release()
+                            acquired = False
+                        await asyncio.sleep(error_sleep)
+                    finally:
+                        if acquired and not transferred:
+                            sem.release()
+                            acquired = False
             finally:
                 if in_flight:
                     await asyncio.gather(*list(in_flight), return_exceptions=True)
@@ -419,7 +481,7 @@ class DurableTaskWorker:
                     self.recover_stale_tasks()
                     if image_worker:
                         image_worker.recover_stale_jobs()
-                    process_storage_deletion_outbox(limit=25)
+                    process_storage_deletion_outbox(limit=25, worker_id=self.worker_id)
                     cleanup_expired_exports_and_tokens()
                 except asyncio.CancelledError:
                     break
@@ -427,7 +489,11 @@ class DurableTaskWorker:
                     logger.error(f"Unexpected error in maintenance loop: {e}", exc_info=True)
                 if max_iterations is not None and iteration >= max_iterations:
                     break
-                await asyncio.sleep(30.0)
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=30.0)
+                    break
+                except asyncio.TimeoutError:
+                    pass
 
         loops = [_background_task_loop(), _maintenance_loop()]
         if image_worker:
@@ -442,6 +508,8 @@ class DurableTaskWorker:
 
     def stop(self):
         self._running = False
+        if self._stop_event is not None:
+            self._stop_event.set()
 
 
 async def main():

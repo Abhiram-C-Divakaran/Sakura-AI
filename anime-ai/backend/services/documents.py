@@ -350,6 +350,8 @@ def delete_document(
             cancelled_tasks += 1
 
     # Idempotent repeated deletion: reuse existing non-completed outbox row for this document
+    inline_claim_token = uuid.uuid4()
+    inline_lease_exp = now + timedelta(seconds=OUTBOX_LEASE_DURATION_SECONDS)
     outbox = db.query(StorageDeletionOutbox).filter(
         StorageDeletionOutbox.document_id == doc.id,
         StorageDeletionOutbox.status != "COMPLETED",
@@ -362,7 +364,11 @@ def delete_document(
             storage_backend=backend_name,
             storage_key=storage_key or (legacy_path or f"document:{doc.id}"),
             legacy_path=legacy_path,
-            status="PENDING",
+            status="PROCESSING",
+            worker_id="api_sync",
+            claim_token=inline_claim_token,
+            claimed_at=now,
+            lease_expires_at=inline_lease_exp,
             attempt_count=0,
             max_attempts=5,
             next_retry_at=now,
@@ -371,7 +377,11 @@ def delete_document(
         )
         db.add(outbox)
     else:
-        outbox.status = "PENDING"
+        outbox.status = "PROCESSING"
+        outbox.worker_id = "api_sync"
+        outbox.claim_token = inline_claim_token
+        outbox.claimed_at = now
+        outbox.lease_expires_at = inline_lease_exp
         outbox.next_retry_at = now
         outbox.updated_at = now
 
@@ -396,6 +406,10 @@ def delete_document(
         if outbox_rec:
             outbox_rec.attempt_count = int(outbox_rec.attempt_count or 0) + 1
             outbox_rec.last_error = err_msg
+            outbox_rec.worker_id = None
+            outbox_rec.claim_token = None
+            outbox_rec.claimed_at = None
+            outbox_rec.lease_expires_at = None
             outbox_rec.updated_at = done_at
             if outbox_rec.attempt_count >= int(outbox_rec.max_attempts or 5):
                 outbox_rec.status = "FAILED"
@@ -438,6 +452,9 @@ def delete_document(
             outbox_rec.attempt_count = int(outbox_rec.attempt_count or 0) + 1
             outbox_rec.status = "COMPLETED"
             outbox_rec.last_error = None
+            outbox_rec.worker_id = None
+            outbox_rec.claim_token = None
+            outbox_rec.lease_expires_at = None
             outbox_rec.completed_at = done_at
             outbox_rec.updated_at = done_at
             outbox_rec.next_retry_at = None
@@ -455,103 +472,376 @@ def delete_document(
     }
 
 
-def process_storage_deletion_outbox(
-    db: Optional[Session] = None,
-    limit: int = 50,
-    storage_override=None,
-) -> Dict[str, int]:
+OUTBOX_LEASE_DURATION_SECONDS = 120
+
+
+def recover_stale_outbox_claims(db: Optional[Session] = None) -> int:
     """
-    Processes due PENDING StorageDeletionOutbox rows with bounded exponential retries.
-    Reconciles both physical object removal and remaining Document/GeneratedImage rows.
+    Atomically recovers StorageDeletionOutbox rows stuck in PROCESSING whose lease has expired.
+    Fences recovery by (id, status='PROCESSING', worker_id, claim_token, expired lease)
+    so an active worker's fresh claim is never disrupted.
     """
     now = utc_now()
-    stats = {"processed": 0, "completed": 0, "retried": 0, "failed": 0}
 
-    def _run(session: Session):
-        entries = session.query(StorageDeletionOutbox).filter(
+    def _run(session: Session) -> int:
+        stale = session.query(StorageDeletionOutbox).filter(
+            StorageDeletionOutbox.status == "PROCESSING",
+            or_(
+                StorageDeletionOutbox.lease_expires_at.is_(None),
+                StorageDeletionOutbox.lease_expires_at < now,
+            ),
+        ).all()
+
+        snaps = [
+            (
+                row.id,
+                row.worker_id,
+                row.claim_token,
+                int(row.attempt_count or 0),
+                int(row.max_attempts or 5),
+                row.last_error,
+            )
+            for row in stale
+        ]
+        recovered = 0
+        for oid, old_worker, old_token, attempts, max_att, prev_err in snaps:
+            filters = [
+                StorageDeletionOutbox.id == oid,
+                StorageDeletionOutbox.status == "PROCESSING",
+                StorageDeletionOutbox.worker_id == old_worker,
+                StorageDeletionOutbox.claim_token == old_token,
+                or_(
+                    StorageDeletionOutbox.lease_expires_at.is_(None),
+                    StorageDeletionOutbox.lease_expires_at < now,
+                ),
+            ]
+            if attempts >= max_att:
+                rows = session.query(StorageDeletionOutbox).filter(*filters).update(
+                    {
+                        StorageDeletionOutbox.status: "FAILED",
+                        StorageDeletionOutbox.worker_id: None,
+                        StorageDeletionOutbox.claim_token: None,
+                        StorageDeletionOutbox.claimed_at: None,
+                        StorageDeletionOutbox.lease_expires_at: None,
+                        StorageDeletionOutbox.next_retry_at: None,
+                        StorageDeletionOutbox.last_error: prev_err or "Outbox lease expired after max attempts.",
+                        StorageDeletionOutbox.updated_at: now,
+                    },
+                    synchronize_session=False,
+                )
+                session.commit() if rows == 1 else session.rollback()
+            else:
+                rows = session.query(StorageDeletionOutbox).filter(*filters).update(
+                    {
+                        StorageDeletionOutbox.status: "PENDING",
+                        StorageDeletionOutbox.worker_id: None,
+                        StorageDeletionOutbox.claim_token: None,
+                        StorageDeletionOutbox.claimed_at: None,
+                        StorageDeletionOutbox.lease_expires_at: None,
+                        StorageDeletionOutbox.next_retry_at: now,
+                        StorageDeletionOutbox.updated_at: now,
+                    },
+                    synchronize_session=False,
+                )
+                if rows == 1:
+                    session.commit()
+                    recovered += 1
+                else:
+                    session.rollback()
+        return recovered
+
+    if db is not None:
+        return _run(db)
+    with get_db_context() as session:
+        return _run(session)
+
+
+def claim_storage_deletion_outbox_entries(
+    session: Session,
+    worker_id: str,
+    limit: int = 50,
+    lease_seconds: int = OUTBOX_LEASE_DURATION_SECONDS,
+) -> List[Dict[str, Any]]:
+    """
+    Atomically claims up to `limit` due PENDING StorageDeletionOutbox rows by transitioning
+    them to PROCESSING with a unique claim_token and lease_expires_at.
+    Uses PostgreSQL FOR UPDATE SKIP LOCKED when on PostgreSQL, and atomic per-row
+    conditional UPDATE on SQLite so concurrent workers never double-claim the same row.
+    """
+    now = utc_now()
+    lease_exp = now + timedelta(seconds=max(5, int(lease_seconds)))
+    is_postgres = bool(session.bind and session.bind.dialect.name == "postgresql")
+    claimed: List[Dict[str, Any]] = []
+
+    if is_postgres:
+        rows = (
+            session.query(StorageDeletionOutbox)
+            .filter(
+                StorageDeletionOutbox.status == "PENDING",
+                or_(
+                    StorageDeletionOutbox.next_retry_at.is_(None),
+                    StorageDeletionOutbox.next_retry_at <= now,
+                ),
+            )
+            .order_by(StorageDeletionOutbox.created_at.asc())
+            .with_for_update(skip_locked=True)
+            .limit(limit)
+            .all()
+        )
+        for row in rows:
+            token = uuid.uuid4()
+            row.status = "PROCESSING"
+            row.worker_id = worker_id
+            row.claim_token = token
+            row.claimed_at = now
+            row.lease_expires_at = lease_exp
+            row.updated_at = now
+            claimed.append({
+                "id": row.id,
+                "user_id": row.user_id,
+                "document_id": row.document_id,
+                "storage_backend": row.storage_backend,
+                "storage_key": row.storage_key,
+                "legacy_path": row.legacy_path,
+                "attempt_count": int(row.attempt_count or 0),
+                "max_attempts": int(row.max_attempts or 5),
+                "claim_token": token,
+            })
+        session.commit()
+        return claimed
+
+    # SQLite / fallback: per-row atomic conditional CAS UPDATE
+    candidates = (
+        session.query(StorageDeletionOutbox)
+        .filter(
             StorageDeletionOutbox.status == "PENDING",
             or_(
                 StorageDeletionOutbox.next_retry_at.is_(None),
                 StorageDeletionOutbox.next_retry_at <= now,
             ),
-        ).order_by(StorageDeletionOutbox.created_at.asc()).limit(limit).all()
+        )
+        .order_by(StorageDeletionOutbox.created_at.asc())
+        .limit(limit)
+        .all()
+    )
+    cand_snaps = [
+        (
+            c.id,
+            c.user_id,
+            c.document_id,
+            c.storage_backend,
+            c.storage_key,
+            c.legacy_path,
+            int(c.attempt_count or 0),
+            int(c.max_attempts or 5),
+        )
+        for c in candidates
+    ]
 
-        for entry in entries:
-            stats["processed"] += 1
-            if entry.storage_backend == "workspace" or (entry.storage_key or "").startswith("workspace:"):
-                ok = True
-                err_msg = None
-                if entry.legacy_path and os.path.exists(entry.legacy_path):
-                    try:
-                        shutil.rmtree(entry.legacy_path)
-                    except Exception as e:
-                        err_msg = str(e)
-                    if os.path.exists(entry.legacy_path):
-                        ok = False
-                        err_msg = err_msg or f"Workspace directory still exists: {entry.legacy_path}"
-            elif (entry.storage_key or "").startswith("prefix_scan:"):
-                scan_prefix = entry.storage_key[len("prefix_scan:"):]
-                storage = storage_override or get_storage_backend(entry.storage_backend or "local")
-                ok = True
-                err_msg = None
+    for cid, uid, doc_id, backend, skey, lpath, attempts, max_att in cand_snaps:
+        token = uuid.uuid4()
+        updated = session.query(StorageDeletionOutbox).filter(
+            StorageDeletionOutbox.id == cid,
+            StorageDeletionOutbox.status == "PENDING",
+            or_(
+                StorageDeletionOutbox.next_retry_at.is_(None),
+                StorageDeletionOutbox.next_retry_at <= now,
+            ),
+        ).update(
+            {
+                StorageDeletionOutbox.status: "PROCESSING",
+                StorageDeletionOutbox.worker_id: worker_id,
+                StorageDeletionOutbox.claim_token: token,
+                StorageDeletionOutbox.claimed_at: now,
+                StorageDeletionOutbox.lease_expires_at: lease_exp,
+                StorageDeletionOutbox.updated_at: now,
+            },
+            synchronize_session=False,
+        )
+        if updated == 1:
+            session.commit()
+            claimed.append({
+                "id": cid,
+                "user_id": uid,
+                "document_id": doc_id,
+                "storage_backend": backend,
+                "storage_key": skey,
+                "legacy_path": lpath,
+                "attempt_count": attempts,
+                "max_attempts": max_att,
+                "claim_token": token,
+            })
+        else:
+            session.rollback()
+    return claimed
+
+
+def _execute_outbox_physical_deletion(entry: Dict[str, Any], storage_override=None) -> tuple[bool, Optional[str]]:
+    """Performs the physical storage/workspace deletion described by a claimed outbox snapshot."""
+    skey = entry.get("storage_key") or ""
+    backend = entry.get("storage_backend") or "local"
+    lpath = entry.get("legacy_path")
+
+    if backend == "workspace" or skey.startswith("workspace:"):
+        ok = True
+        err_msg = None
+        if lpath and os.path.exists(lpath):
+            try:
+                shutil.rmtree(lpath)
+            except Exception as e:
+                err_msg = str(e)
+            if os.path.exists(lpath):
+                ok = False
+                err_msg = err_msg or f"Workspace directory still exists: {lpath}"
+        return ok, err_msg
+
+    if skey.startswith("prefix_scan:"):
+        scan_prefix = skey[len("prefix_scan:"):]
+        storage = storage_override or get_storage_backend(backend)
+        try:
+            remaining_keys = storage.list_keys(prefix=scan_prefix)
+            failed_sub = []
+            for k in remaining_keys:
                 try:
-                    remaining_keys = storage.list_keys(prefix=scan_prefix)
-                    failed_sub = []
-                    for k in remaining_keys:
-                        try:
-                            if not storage.delete(k):
-                                failed_sub.append(k)
-                        except Exception:
-                            failed_sub.append(k)
-                    if failed_sub:
-                        ok = False
-                        err_msg = f"Failed to delete {len(failed_sub)} object(s) under {scan_prefix}"
-                except Exception as e:
-                    ok = False
-                    err_msg = f"Prefix scan retry failed for '{scan_prefix}': {e}"
-            elif (entry.storage_key or "").startswith("legacy:"):
-                ok, err_msg = _delete_physical_object(
-                    storage_backend_name=entry.storage_backend,
-                    storage_key=None,
-                    legacy_path=entry.legacy_path,
-                    storage_override=storage_override,
-                )
-            else:
-                ok, err_msg = _delete_physical_object(
-                    storage_backend_name=entry.storage_backend,
-                    storage_key=entry.storage_key if not entry.storage_key.startswith("document:") else None,
-                    legacy_path=entry.legacy_path,
-                    storage_override=storage_override,
-                )
-            step_now = utc_now()
-            entry.attempt_count = int(entry.attempt_count or 0) + 1
-            entry.updated_at = step_now
+                    if not storage.delete(k):
+                        failed_sub.append(k)
+                except Exception:
+                    failed_sub.append(k)
+            if failed_sub:
+                return False, f"Failed to delete {len(failed_sub)} object(s) under {scan_prefix}"
+            return True, None
+        except Exception as e:
+            return False, f"Prefix scan retry failed for '{scan_prefix}': {e}"
 
-            if ok:
-                if entry.document_id:
-                    session.query(GeneratedImage).filter(
-                        GeneratedImage.document_id == entry.document_id
-                    ).delete(synchronize_session=False)
-                    doc_rec = session.query(Document).filter(Document.id == entry.document_id).first()
-                    if doc_rec:
-                        session.delete(doc_rec)
-                entry.status = "COMPLETED"
-                entry.last_error = None
-                entry.completed_at = step_now
-                entry.next_retry_at = None
-                session.commit()
-                stats["completed"] += 1
-            else:
-                entry.last_error = err_msg
-                if entry.attempt_count >= int(entry.max_attempts or 5):
-                    entry.status = "FAILED"
-                    entry.next_retry_at = None
-                    stats["failed"] += 1
-                else:
-                    backoff = min(60 * (2 ** (entry.attempt_count - 1)), 3600)
-                    entry.next_retry_at = step_now + timedelta(seconds=backoff)
-                    stats["retried"] += 1
-                session.commit()
+    if skey.startswith("legacy:"):
+        return _delete_physical_object(
+            storage_backend_name=backend,
+            storage_key=None,
+            legacy_path=lpath,
+            storage_override=storage_override,
+        )
+
+    return _delete_physical_object(
+        storage_backend_name=backend,
+        storage_key=skey if not skey.startswith("document:") else None,
+        legacy_path=lpath,
+        storage_override=storage_override,
+    )
+
+
+def finalize_claimed_outbox_entry(
+    session: Session,
+    entry: Dict[str, Any],
+    worker_id: str,
+    ok: bool,
+    err_msg: Optional[str],
+) -> str:
+    """
+    Fenced finalization of a claimed StorageDeletionOutbox row.
+    Verifies (id, status='PROCESSING', worker_id, claim_token) before writing so a stale
+    worker whose lease was recovered can NEVER overwrite a newer attempt or delete DB rows.
+    Returns one of: 'completed', 'retried', 'failed', 'stale'.
+    """
+    step_now = utc_now()
+    next_attempts = int(entry["attempt_count"]) + 1
+    max_att = int(entry["max_attempts"] or 5)
+    fence = [
+        StorageDeletionOutbox.id == entry["id"],
+        StorageDeletionOutbox.status == "PROCESSING",
+        StorageDeletionOutbox.worker_id == worker_id,
+        StorageDeletionOutbox.claim_token == entry["claim_token"],
+    ]
+
+    if ok:
+        rows = session.query(StorageDeletionOutbox).filter(*fence).update(
+            {
+                StorageDeletionOutbox.status: "COMPLETED",
+                StorageDeletionOutbox.attempt_count: next_attempts,
+                StorageDeletionOutbox.last_error: None,
+                StorageDeletionOutbox.completed_at: step_now,
+                StorageDeletionOutbox.next_retry_at: None,
+                StorageDeletionOutbox.worker_id: None,
+                StorageDeletionOutbox.claim_token: None,
+                StorageDeletionOutbox.lease_expires_at: None,
+                StorageDeletionOutbox.updated_at: step_now,
+            },
+            synchronize_session=False,
+        )
+        if rows != 1:
+            session.rollback()
+            return "stale"
+
+        if entry.get("document_id"):
+            session.query(GeneratedImage).filter(
+                GeneratedImage.document_id == entry["document_id"]
+            ).delete(synchronize_session=False)
+            doc_rec = session.query(Document).filter(Document.id == entry["document_id"]).first()
+            if doc_rec:
+                session.delete(doc_rec)
+        session.commit()
+        return "completed"
+
+    if next_attempts >= max_att:
+        target_status = "FAILED"
+        next_retry = None
+        outcome = "failed"
+    else:
+        backoff = min(60 * (2 ** (next_attempts - 1)), 3600)
+        target_status = "PENDING"
+        next_retry = step_now + timedelta(seconds=backoff)
+        outcome = "retried"
+
+    rows = session.query(StorageDeletionOutbox).filter(*fence).update(
+        {
+            StorageDeletionOutbox.status: target_status,
+            StorageDeletionOutbox.attempt_count: next_attempts,
+            StorageDeletionOutbox.last_error: err_msg,
+            StorageDeletionOutbox.next_retry_at: next_retry,
+            StorageDeletionOutbox.worker_id: None,
+            StorageDeletionOutbox.claim_token: None,
+            StorageDeletionOutbox.claimed_at: None,
+            StorageDeletionOutbox.lease_expires_at: None,
+            StorageDeletionOutbox.updated_at: step_now,
+        },
+        synchronize_session=False,
+    )
+    if rows != 1:
+        session.rollback()
+        return "stale"
+    session.commit()
+    return outcome
+
+
+def process_storage_deletion_outbox(
+    db: Optional[Session] = None,
+    limit: int = 50,
+    storage_override=None,
+    worker_id: Optional[str] = None,
+    lease_seconds: int = OUTBOX_LEASE_DURATION_SECONDS,
+) -> Dict[str, int]:
+    """
+    Multi-worker-safe processor for StorageDeletionOutbox:
+    1. Recovers any stale PROCESSING claims whose leases expired.
+    2. Atomically claims due PENDING rows with worker_id + claim_token + lease_expires_at.
+    3. Executes physical deletion outside any DB row lock.
+    4. Fences every completion/retry/failure update by (id, PROCESSING, worker_id, claim_token).
+    """
+    effective_worker = worker_id or f"outbox_worker_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    stats = {"recovered": 0, "processed": 0, "completed": 0, "retried": 0, "failed": 0, "stale": 0}
+
+    def _run(session: Session):
+        stats["recovered"] = recover_stale_outbox_claims(session)
+        claimed = claim_storage_deletion_outbox_entries(
+            session=session,
+            worker_id=effective_worker,
+            limit=limit,
+            lease_seconds=lease_seconds,
+        )
+        for entry in claimed:
+            stats["processed"] += 1
+            ok, err_msg = _execute_outbox_physical_deletion(entry, storage_override=storage_override)
+            outcome = finalize_claimed_outbox_entry(session, entry, effective_worker, ok, err_msg)
+            stats[outcome] = stats.get(outcome, 0) + 1
 
     if db is not None:
         _run(db)

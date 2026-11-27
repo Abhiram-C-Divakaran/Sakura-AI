@@ -20,6 +20,7 @@ from database.db import get_db_context
 from database.models import (
     ImageGenerationJob,
     ImageGenerationJobStatus,
+    ImageVariationBatch,
     GeneratedImage,
     utc_now,
 )
@@ -185,23 +186,59 @@ def create_image_generation_job(
     return job, True
 
 
+def _load_batch_jobs(db: Session, user_id: uuid.UUID, batch: ImageVariationBatch) -> list[ImageGenerationJob]:
+    """Loads persisted ImageGenerationJob records belonging to an ImageVariationBatch in original order."""
+    raw_ids = list(batch.job_ids or [])
+    if not raw_ids:
+        return []
+    uuids = []
+    for raw in raw_ids:
+        try:
+            uuids.append(uuid.UUID(str(raw)))
+        except ValueError:
+            continue
+    if not uuids:
+        return []
+    rows = db.query(ImageGenerationJob).filter(
+        ImageGenerationJob.user_id == user_id,
+        ImageGenerationJob.id.in_(uuids),
+    ).all()
+    by_id = {r.id: r for r in rows}
+    return [by_id[u] for u in uuids if u in by_id]
+
+
 def create_batch_image_generation_jobs(
     db: Session,
     user_id: uuid.UUID,
     job_specs: list[Dict[str, Any]],
     enforce_quota: bool = True,
-) -> list[ImageGenerationJob]:
+    idempotency_key: Optional[str] = None,
+    parent_image_id: Optional[uuid.UUID] = None,
+) -> Tuple[list[ImageGenerationJob], bool]:
     """
     Atomically reserves quota for `len(job_specs)` jobs and persists all ImageGenerationJob rows
-    in a single transaction. If quota is exceeded or any insert fails, ALL jobs and the quota
-    reservation roll back cleanly.
+    in a single transaction. When `idempotency_key` is supplied, persists a per-user unique
+    ImageVariationBatch row in the SAME transaction so duplicate or concurrent retries roll back
+    both quota and job inserts on IntegrityError and replay the exact original batch with
+    zero additional quota consumed.
+
+    Returns: (jobs, created)
     """
     if not job_specs:
-        return []
+        return [], False
+
+    clean_idem = idempotency_key.strip()[:128] if idempotency_key and idempotency_key.strip() else None
+    if clean_idem:
+        existing_batch = db.query(ImageVariationBatch).filter(
+            ImageVariationBatch.user_id == user_id,
+            ImageVariationBatch.idempotency_key == clean_idem,
+        ).first()
+        if existing_batch:
+            return _load_batch_jobs(db, user_id, existing_batch), False
 
     now = utc_now()
     jobs: list[ImageGenerationJob] = []
-    for spec in job_specs:
+    for idx, spec in enumerate(job_specs):
         clean_prompt = (spec.get("prompt") or "").strip()
         if not clean_prompt:
             raise ValueError("Image prompt cannot be empty.")
@@ -217,14 +254,29 @@ def create_batch_image_generation_jobs(
                 attempt_count=0,
                 max_attempts=max_att,
                 parameters=dict(spec.get("parameters") or {}),
-                idempotency_key=None,
+                idempotency_key=f"{clean_idem[:112]}:{idx}" if clean_idem else None,
                 cancel_requested=False,
                 created_at=now,
                 updated_at=now,
             )
         )
 
+    batch_row = None
+    if clean_idem:
+        batch_row = ImageVariationBatch(
+            id=uuid.uuid4(),
+            user_id=user_id,
+            idempotency_key=clean_idem,
+            parent_image_id=parent_image_id,
+            job_ids=[str(j.id) for j in jobs],
+            created_at=now,
+        )
+
     try:
+        if batch_row is not None:
+            # Flush unique batch key first so concurrent duplicate fails fast before quota increment
+            db.add(batch_row)
+            db.flush()
         if enforce_quota:
             from services.quotas import reserve_user_quota_in_session
             reserve_user_quota_in_session(db, user_id, "image_generation", amount=len(jobs))
@@ -233,13 +285,23 @@ def create_batch_image_generation_jobs(
         db.commit()
         for job in jobs:
             db.refresh(job)
+    except IntegrityError:
+        db.rollback()
+        if clean_idem:
+            existing_batch = db.query(ImageVariationBatch).filter(
+                ImageVariationBatch.user_id == user_id,
+                ImageVariationBatch.idempotency_key == clean_idem,
+            ).first()
+            if existing_batch:
+                return _load_batch_jobs(db, user_id, existing_batch), False
+        raise
     except Exception:
         db.rollback()
         raise
 
     for job in jobs:
         enqueue_image_job(job.id)
-    return jobs
+    return jobs, True
 
 
 async def wait_for_image_job(
@@ -823,10 +885,16 @@ class ImageJobWorker:
     def stop(self) -> None:
         self._running = False
 
-    async def run(self, max_iterations: Optional[int] = None, max_concurrency: Optional[int] = None) -> None:
+    async def run(
+        self,
+        max_iterations: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+        idle_sleep: float = 0.75,
+        error_sleep: float = 2.0,
+    ) -> None:
         """
         Dedicated bounded-concurrency loop for processing ImageGenerationJob records
-        independently of general background tasks.
+        independently of general background tasks, with leak-proof semaphore permit accounting.
         """
         self._running = True
         concurrency = max(1, min(int(max_concurrency or os.getenv("IMAGE_WORKER_CONCURRENCY", "2")), 8))
@@ -849,6 +917,8 @@ class ImageJobWorker:
                 if max_iterations is not None and iteration >= max_iterations:
                     break
                 iteration += 1
+                acquired = False
+                transferred = False
                 try:
                     now_mono = asyncio.get_running_loop().time()
                     if now_mono - last_recovery >= 30.0:
@@ -856,19 +926,29 @@ class ImageJobWorker:
                         last_recovery = now_mono
 
                     await sem.acquire()
+                    acquired = True
                     job = self.claim_next_job()
                     if job:
                         t = asyncio.create_task(_run_bounded(job))
+                        transferred = True
                         in_flight.add(t)
                         t.add_done_callback(in_flight.discard)
                     else:
                         sem.release()
-                        await asyncio.sleep(0.75)
+                        acquired = False
+                        await asyncio.sleep(idle_sleep)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
                     logger.error(f"Unexpected error in image worker loop: {e}", exc_info=True)
-                    await asyncio.sleep(2.0)
+                    if acquired and not transferred:
+                        sem.release()
+                        acquired = False
+                    await asyncio.sleep(error_sleep)
+                finally:
+                    if acquired and not transferred:
+                        sem.release()
+                        acquired = False
         finally:
             if in_flight:
                 await asyncio.gather(*list(in_flight), return_exceptions=True)

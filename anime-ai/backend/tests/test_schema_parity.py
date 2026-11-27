@@ -27,7 +27,7 @@ from database.models import (
     ProjectConversation, ScheduledTask, ScheduledTaskRun,
     UserIntegration, RepositoryWorkspace, CodingTask, ToolExecution,
     BackgroundTask, CodingJob, CodingTaskEvent, WebSocketTicket,
-    ImageGenerationJob, StorageDeletionOutbox, PasswordResetToken,
+    ImageGenerationJob, ImageVariationBatch, StorageDeletionOutbox, PasswordResetToken,
     UserUsageQuota, UserDataExport, AccountAuditEvent,
     utc_now
 )
@@ -325,7 +325,7 @@ class TestSchemaParity(unittest.TestCase):
             db.add(gi)
             db.commit()
 
-            # 19. UserUsageQuota, UserDataExport, AccountAuditEvent
+            # 19. UserUsageQuota, UserDataExport, AccountAuditEvent, ImageVariationBatch, StorageDeletionOutbox
             uq = UserUsageQuota(
                 id=uuid.uuid4(),
                 user_id=user.id,
@@ -347,6 +347,26 @@ class TestSchemaParity(unittest.TestCase):
                 details_json={"export_id": str(exp.id)},
             )
             db.add(aud)
+            vbatch = ImageVariationBatch(
+                id=uuid.uuid4(),
+                user_id=user.id,
+                idempotency_key=f"batch_{uuid.uuid4().hex[:8]}",
+                parent_image_id=gi.id,
+                job_ids=[],
+            )
+            db.add(vbatch)
+            outbox_rec = StorageDeletionOutbox(
+                id=uuid.uuid4(),
+                user_id=user.id,
+                storage_backend="local",
+                storage_key=f"users/{user.id}/parity_probe.txt",
+                status="PENDING",
+                worker_id="parity_worker",
+                claim_token=uuid.uuid4(),
+                claimed_at=utc_now(),
+                lease_expires_at=utc_now(),
+            )
+            db.add(outbox_rec)
             db.commit()
 
             # Verify reads
@@ -360,6 +380,8 @@ class TestSchemaParity(unittest.TestCase):
             self.assertEqual(db.query(UserUsageQuota).filter(UserUsageQuota.id == uq.id).count(), 1)
             self.assertEqual(db.query(UserDataExport).filter(UserDataExport.id == exp.id).count(), 1)
             self.assertEqual(db.query(AccountAuditEvent).filter(AccountAuditEvent.id == aud.id).count(), 1)
+            self.assertEqual(db.query(ImageVariationBatch).filter(ImageVariationBatch.id == vbatch.id).count(), 1)
+            self.assertEqual(db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == outbox_rec.id).count(), 1)
 
     def test_downgrade_and_upgrade_cycle(self):
         """Verifies migration rollback of the latest revision and re-upgrade to head."""

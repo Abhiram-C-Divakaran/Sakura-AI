@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Sakura AI — PostgreSQL Backup Restore Verification Script
-# Verifies checksum integrity, restores a .dump archive into a temporary database,
-# validates pgvector + schema tables + alembic_version, and drops the temporary DB.
+# Verifies client/server version compatibility and SHA-256 checksum integrity,
+# restores a .dump archive into a temporary database, strictly asserts
+# alembic_version head, required core tables, pgvector extension, and restored data,
+# and always drops the temporary database on exit.
 #
 # Usage:
-#   PGPASSWORD=... ./verify_restore.sh /var/backups/sakura/postgres/sakura_anime_ai_20261126T000000Z.dump
+#   PGPASSWORD=... [EXPECTED_ALEMBIC_HEAD=...] [REQUIRED_MIN_USERS=1] [EXPECTED_USER_USERNAME=...] \
+#     ./verify_restore.sh /var/backups/sakura/postgres/sakura_anime_ai_20261126T000000Z.dump
 
 set -euo pipefail
 
@@ -17,15 +20,43 @@ DUMP_FILE="$1"
 POSTGRES_HOST="${POSTGRES_HOST:-localhost}"
 POSTGRES_PORT="${POSTGRES_PORT:-5432}"
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
-VERIFY_DB="sakura_restore_verify_$(date -u +%Y%m%d%H%M%S)"
+EXPECTED_ALEMBIC_HEAD="${EXPECTED_ALEMBIC_HEAD:-}"
+REQUIRED_MIN_USERS="${REQUIRED_MIN_USERS:-0}"
+EXPECTED_USER_USERNAME="${EXPECTED_USER_USERNAME:-}"
+REQUIRE_PGVECTOR="${REQUIRE_PGVECTOR:-true}"
+VERIFY_DB="sakura_restore_verify_$(date -u +%Y%m%d%H%M%S)_$$"
 
 if [[ -z "${PGPASSWORD:-}" ]]; then
   echo "ERROR: PGPASSWORD must be set in environment." >&2
   exit 1
 fi
 
+for bin in pg_restore psql sha256sum; do
+  if ! command -v "${bin}" >/dev/null 2>&1; then
+    echo "ERROR: Required tool '${bin}' not found in PATH." >&2
+    exit 1
+  fi
+done
+
 if [[ ! -f "${DUMP_FILE}" ]]; then
   echo "ERROR: Dump file not found: ${DUMP_FILE}" >&2
+  exit 1
+fi
+
+if [[ ! -s "${DUMP_FILE}" ]]; then
+  echo "ERROR: Dump file is empty: ${DUMP_FILE}" >&2
+  exit 1
+fi
+
+CLIENT_VER_STR="$(pg_restore --version)"
+CLIENT_MAJOR="$(echo "${CLIENT_VER_STR}" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1 | cut -d. -f1)"
+SERVER_VER_NUM="$(psql --host="${POSTGRES_HOST}" --port="${POSTGRES_PORT}" --username="${POSTGRES_USER}" -d postgres -Atc "SHOW server_version_num;")"
+SERVER_VER_STR="$(psql --host="${POSTGRES_HOST}" --port="${POSTGRES_PORT}" --username="${POSTGRES_USER}" -d postgres -Atc "SHOW server_version;")"
+SERVER_MAJOR="$((SERVER_VER_NUM / 10000))"
+
+echo "[verify] Client: ${CLIENT_VER_STR} (major=${CLIENT_MAJOR}) | Server: PostgreSQL ${SERVER_VER_STR} (major=${SERVER_MAJOR})"
+if [[ "${CLIENT_MAJOR}" != "${SERVER_MAJOR}" ]]; then
+  echo "ERROR: PostgreSQL client major version (${CLIENT_MAJOR}) does not match server major version (${SERVER_MAJOR})." >&2
   exit 1
 fi
 
@@ -33,6 +64,10 @@ if [[ -f "${DUMP_FILE}.sha256" ]]; then
   echo "[verify] Checking SHA-256 checksum..."
   sha256sum -c "${DUMP_FILE}.sha256"
 fi
+
+# Validate dump archive catalog before creating verification database
+echo "[verify] Validating archive catalog..."
+pg_restore --list "${DUMP_FILE}" >/dev/null
 
 cleanup() {
   echo "[verify] Dropping temporary verification database ${VERIFY_DB}..."
@@ -56,12 +91,96 @@ pg_restore \
   --exit-on-error \
   "${DUMP_FILE}"
 
-echo "[verify] Inspecting restored schema & Alembic version..."
-psql --host="${POSTGRES_HOST}" --port="${POSTGRES_PORT}" --username="${POSTGRES_USER}" \
-  -d "${VERIFY_DB}" -v ON_ERROR_STOP=1 <<'SQL'
-SELECT version_num AS alembic_head FROM alembic_version;
-SELECT count(*) AS table_count FROM information_schema.tables WHERE table_schema = 'public';
-SELECT count(*) AS user_count FROM users;
-SQL
+echo "[verify] Asserting restored Alembic version, core tables, extensions, and data integrity..."
+
+# 1. Assert alembic_version exists and matches expected head when provided
+RESTORED_ALEMBIC_COUNT="$(psql --host="${POSTGRES_HOST}" --port="${POSTGRES_PORT}" --username="${POSTGRES_USER}" \
+  -d "${VERIFY_DB}" -Atv ON_ERROR_STOP=1 -c "SELECT count(*) FROM alembic_version;")"
+if [[ "${RESTORED_ALEMBIC_COUNT}" -lt 1 ]]; then
+  echo "ERROR: Restored alembic_version table is empty!" >&2
+  exit 1
+fi
+
+RESTORED_ALEMBIC_HEAD="$(psql --host="${POSTGRES_HOST}" --port="${POSTGRES_PORT}" --username="${POSTGRES_USER}" \
+  -d "${VERIFY_DB}" -Atv ON_ERROR_STOP=1 -c "SELECT version_num FROM alembic_version LIMIT 1;")"
+echo "[verify] Restored alembic_version = ${RESTORED_ALEMBIC_HEAD}"
+
+if [[ -n "${EXPECTED_ALEMBIC_HEAD}" && "${RESTORED_ALEMBIC_HEAD}" != "${EXPECTED_ALEMBIC_HEAD}" ]]; then
+  echo "ERROR: Restored alembic_version (${RESTORED_ALEMBIC_HEAD}) != expected (${EXPECTED_ALEMBIC_HEAD})." >&2
+  exit 1
+fi
+
+# 2. Assert all required core tables exist in public schema
+REQUIRED_TABLES=(
+  "users"
+  "conversations"
+  "messages"
+  "documents"
+  "document_chunks"
+  "coding_jobs"
+  "coding_tasks"
+  "coding_task_events"
+  "background_tasks"
+  "scheduled_tasks"
+  "scheduled_task_runs"
+  "image_generation_jobs"
+  "image_variation_batches"
+  "storage_deletion_outbox"
+  "user_usage_quotas"
+  "user_data_exports"
+  "account_audit_events"
+)
+
+MISSING_TABLES=()
+for tbl in "${REQUIRED_TABLES[@]}"; do
+  EXISTS="$(psql --host="${POSTGRES_HOST}" --port="${POSTGRES_PORT}" --username="${POSTGRES_USER}" \
+    -d "${VERIFY_DB}" -Atv ON_ERROR_STOP=1 \
+    -c "SELECT CASE WHEN to_regclass('public.${tbl}') IS NOT NULL THEN 1 ELSE 0 END;")"
+  if [[ "${EXISTS}" != "1" ]]; then
+    MISSING_TABLES+=("${tbl}")
+  fi
+done
+
+if [[ "${#MISSING_TABLES[@]}" -gt 0 ]]; then
+  echo "ERROR: Restored database is missing required core tables: ${MISSING_TABLES[*]}" >&2
+  exit 1
+fi
+
+TABLE_COUNT="$(psql --host="${POSTGRES_HOST}" --port="${POSTGRES_PORT}" --username="${POSTGRES_USER}" \
+  -d "${VERIFY_DB}" -Atv ON_ERROR_STOP=1 -c "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public';")"
+echo "[verify] Verified ${#REQUIRED_TABLES[@]} required core tables (total public tables: ${TABLE_COUNT})."
+
+# 3. Assert pgvector extension when required
+if [[ "${REQUIRE_PGVECTOR}" == "true" ]]; then
+  HAS_VECTOR="$(psql --host="${POSTGRES_HOST}" --port="${POSTGRES_PORT}" --username="${POSTGRES_USER}" \
+    -d "${VERIFY_DB}" -Atv ON_ERROR_STOP=1 \
+    -c "SELECT count(*) FROM pg_extension WHERE extname = 'vector';")"
+  if [[ "${HAS_VECTOR}" != "1" ]]; then
+    echo "ERROR: Required pgvector extension ('vector') is missing in restored database." >&2
+    exit 1
+  fi
+  echo "[verify] Verified pgvector extension is installed."
+fi
+
+# 4. Assert restored row data readability and expected probe rows
+USER_COUNT="$(psql --host="${POSTGRES_HOST}" --port="${POSTGRES_PORT}" --username="${POSTGRES_USER}" \
+  -d "${VERIFY_DB}" -Atv ON_ERROR_STOP=1 -c "SELECT count(*) FROM users;")"
+echo "[verify] Restored user_count = ${USER_COUNT}"
+
+if [[ "${REQUIRED_MIN_USERS}" -gt 0 && "${USER_COUNT}" -lt "${REQUIRED_MIN_USERS}" ]]; then
+  echo "ERROR: Expected at least ${REQUIRED_MIN_USERS} user row(s) after restore, found ${USER_COUNT}." >&2
+  exit 1
+fi
+
+if [[ -n "${EXPECTED_USER_USERNAME}" ]]; then
+  FOUND_PROBE="$(psql --host="${POSTGRES_HOST}" --port="${POSTGRES_PORT}" --username="${POSTGRES_USER}" \
+    -d "${VERIFY_DB}" -Atv ON_ERROR_STOP=1 -v uname="${EXPECTED_USER_USERNAME}" \
+    -c "SELECT count(*) FROM users WHERE username = :'uname';")"
+  if [[ "${FOUND_PROBE}" -lt 1 ]]; then
+    echo "ERROR: Expected restored probe user '${EXPECTED_USER_USERNAME}' was not found in restored DB!" >&2
+    exit 1
+  fi
+  echo "[verify] Verified seeded probe user '${EXPECTED_USER_USERNAME}' survived backup & restore."
+fi
 
 echo "[verify] SUCCESS: Backup ${DUMP_FILE} restored and verified cleanly."

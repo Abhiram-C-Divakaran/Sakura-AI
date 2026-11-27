@@ -202,10 +202,15 @@ class TestRealRemoteWorkspaceTopologyE2E(unittest.IsolatedAsyncioTestCase):
         os.makedirs(ws_a_dir, exist_ok=True)
         os.makedirs(ws_b_dir, exist_ok=True)
 
-        # 1. Backend/application writes file into shared volume for Workspace A
+        # 1. Backend/application writes files into shared volume for Workspace A and Workspace B
         app_file = os.path.join(ws_a_dir, "topology_probe.txt")
         with open(app_file, "w", encoding="utf-8") as f:
             f.write("WRITTEN_BY_BACKEND\n")
+
+        ws_b_secret = f"WORKSPACE_B_SECRET_SENTINEL_{uuid.uuid4().hex}"
+        ws_b_secret_file = os.path.join(ws_b_dir, "ws_b_secret.txt")
+        with open(ws_b_secret_file, "w", encoding="utf-8") as f:
+            f.write(f"{ws_b_secret}\n")
 
         # Verify workspace ownership & non-world-writable permission contract on POSIX
         if os.name != "nt":
@@ -262,15 +267,42 @@ class TestRealRemoteWorkspaceTopologyE2E(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(git_res.get("success"), f"Git operations failed inside workspace: {git_res}")
 
-        # 7. Cross-workspace isolation: Workspace B child container cannot read Workspace A's file
+        # 7. Cross-workspace isolation:
+        #    - Workspace B can read its own secret sentinel, but CANNOT read Workspace A's file
+        own_b_res = await remote_b.run_command("cat /workspace/ws_b_secret.txt")
+        self.assertTrue(own_b_res.get("success"), f"Workspace B failed to read its own file: {own_b_res}")
+        self.assertIn(ws_b_secret, own_b_res.get("stdout", ""))
+
         iso_res = await remote_b.run_command("cat /workspace/topology_probe.txt")
         self.assertFalse(iso_res.get("success"))
+        self.assertNotEqual(iso_res.get("exit_code", 0), 0)
         self.assertNotIn("WRITTEN_BY_BACKEND", iso_res.get("stdout", ""))
+        self.assertNotIn("WRITTEN_BY_BACKEND", iso_res.get("stderr", ""))
 
-        # 8. Child container cannot access the parent /workspaces directory or sibling workspaces
-        parent_res = await remote_a.run_command(f"ls /workspaces 2>&1 || true; cat /workspaces/{ws_b_id}/topology_probe.txt 2>&1 || true")
-        self.assertNotIn(ws_b_id, parent_res.get("stdout", ""))
-        self.assertNotIn("WRITTEN_BY_BACKEND", parent_res.get("stdout", ""))
+        # 8. Child container for Workspace A cannot access the parent /workspaces directory or Workspace B's secret
+        parent_absent_res = await remote_a.run_command("test ! -e /workspaces")
+        self.assertTrue(
+            parent_absent_res.get("success"),
+            f"Parent /workspaces path must NOT exist inside child container: {parent_absent_res}",
+        )
+
+        parent_ls_res = await remote_a.run_command("ls -la /workspaces")
+        self.assertFalse(parent_ls_res.get("success"), f"ls /workspaces must fail inside child: {parent_ls_res}")
+        self.assertNotEqual(parent_ls_res.get("exit_code", 0), 0)
+        self.assertNotIn(ws_b_id, parent_ls_res.get("stdout", ""))
+        self.assertNotIn(ws_b_secret, parent_ls_res.get("stdout", ""))
+        self.assertNotIn(ws_b_secret, parent_ls_res.get("stderr", ""))
+
+        sibling_read_res = await remote_a.run_command(f"cat /workspaces/{ws_b_id}/ws_b_secret.txt")
+        self.assertFalse(sibling_read_res.get("success"), f"Cross-workspace read must fail: {sibling_read_res}")
+        self.assertNotEqual(sibling_read_res.get("exit_code", 0), 0)
+        self.assertNotIn(ws_b_secret, sibling_read_res.get("stdout", ""))
+        self.assertNotIn(ws_b_secret, sibling_read_res.get("stderr", ""))
+
+        ws_a_no_b_res = await remote_a.run_command("cat /workspace/ws_b_secret.txt")
+        self.assertFalse(ws_a_no_b_res.get("success"))
+        self.assertNotIn(ws_b_secret, ws_a_no_b_res.get("stdout", ""))
+        self.assertNotIn(ws_b_secret, ws_a_no_b_res.get("stderr", ""))
 
 
 if __name__ == "__main__":

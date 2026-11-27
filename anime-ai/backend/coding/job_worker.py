@@ -301,10 +301,12 @@ class CodingJobWorker:
         worker_id: Optional[str] = None,
         heartbeat_interval: float = CODING_HEARTBEAT_INTERVAL_SECONDS,
         lease_duration: int = CODING_LEASE_DURATION_SECONDS,
+        max_heartbeat_failures: int = 3,
     ):
         self.worker_id = worker_id or f"coding_worker_{os.getpid()}_{uuid.uuid4().hex[:8]}"
-        self.heartbeat_interval = heartbeat_interval
-        self.lease_duration = lease_duration
+        self.heartbeat_interval = max(0.05, float(heartbeat_interval))
+        self.lease_duration = float(lease_duration)
+        self.max_heartbeat_failures = max(1, int(max_heartbeat_failures))
         self._running = False
         self.llm_router = LLMRouter()
 
@@ -798,6 +800,11 @@ class CodingJobWorker:
                 rt.cancel()
 
         async def _heartbeat_loop():
+            loop = asyncio.get_running_loop()
+            last_confirmed = loop.time()
+            consecutive_failures = 0
+            lease_loss_window = max(self.heartbeat_interval * 2.0, self.lease_duration * 0.75)
+
             while not should_stop():
                 try:
                     await asyncio.sleep(self.heartbeat_interval)
@@ -831,10 +838,28 @@ class CodingJobWorker:
                                 lease_lost_event.set()
                             abort_active_runner()
                             break
+                        consecutive_failures = 0
+                        last_confirmed = loop.time()
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    logger.warning(f"Heartbeat update failed for coding job {job_id}: {e}")
+                    consecutive_failures += 1
+                    elapsed_unconfirmed = loop.time() - last_confirmed
+                    logger.warning(
+                        f"Heartbeat DB error ({consecutive_failures}/{self.max_heartbeat_failures}, "
+                        f"unconfirmed={elapsed_unconfirmed:.2f}s) for coding job {job_id}: {e}"
+                    )
+                    if (
+                        consecutive_failures >= self.max_heartbeat_failures
+                        or elapsed_unconfirmed >= lease_loss_window
+                    ):
+                        logger.error(
+                            f"Aborting coding job {job_id}: unable to confirm lease within safe window "
+                            f"(failures={consecutive_failures}, elapsed={elapsed_unconfirmed:.2f}s)."
+                        )
+                        lease_lost_event.set()
+                        abort_active_runner()
+                        break
 
         async def _run_agent_pipeline():
             self.record_event(

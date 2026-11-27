@@ -435,69 +435,89 @@ class ImageGenerationEngine:
         if not sanitized_title:
             sanitized_title = "Sakura_Artwork"
 
+        from llm.providers.deterministic_test import (
+            is_deterministic_test_provider_enabled,
+            build_deterministic_test_png,
+        )
+
         storage_path = os.path.join(UPLOAD_DIR, f"{image_id}.png")
         file_size = 0
         actual_seed = seed if seed is not None else random.randint(1000, 9999999)
         actual_model = "flux"
+        actual_provider = "pollinations"
+        requested_provider = "pollinations"
+        requested_model = "flux"
         successful_attempt = 1
 
-        loop = asyncio.get_event_loop()
+        if is_deterministic_test_provider_enabled():
+            png_bytes = build_deterministic_test_png(clean_prompt, width=64, height=64)
+            with open(storage_path, "wb") as f:
+                f.write(png_bytes)
+            if not QualityEvaluator.validate_image_payload(storage_path):
+                raise RuntimeError("Deterministic test PNG failed quality validation.")
+            file_size = os.path.getsize(storage_path)
+            actual_provider = "deterministic_test"
+            requested_provider = "deterministic_test"
+            actual_model = "deterministic-png-v1"
+            requested_model = "deterministic-png-v1"
+        else:
+            loop = asyncio.get_event_loop()
 
-        for attempt in range(max_attempts):
-            current_seed = actual_seed if attempt == 0 else random.randint(10000, 9999999)
-            
-            # Failover: If primary Flux fails or times out, failover to secondary turbo provider
-            active_model = "flux" if attempt < (max_attempts - 1) else "turbo"
-            
-            # Encode URL for neural rendering engine
-            encoded_prompt = urllib.parse.quote(enhanced_prompt)
-            pollinations_url = (
-                f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-                f"?width={width}&height={height}&nologo=true&seed={current_seed}&model={active_model}"
-            )
-
-            def download_worker():
-                req = urllib.request.Request(
-                    pollinations_url,
-                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SakuraAI/1.0"}
+            for attempt in range(max_attempts):
+                current_seed = actual_seed if attempt == 0 else random.randint(10000, 9999999)
+                
+                # Failover: If primary Flux fails or times out, failover to secondary turbo provider
+                active_model = "flux" if attempt < (max_attempts - 1) else "turbo"
+                
+                # Encode URL for neural rendering engine
+                encoded_prompt = urllib.parse.quote(enhanced_prompt)
+                pollinations_url = (
+                    f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+                    f"?width={width}&height={height}&nologo=true&seed={current_seed}&model={active_model}"
                 )
-                with urllib.request.urlopen(req, timeout=attempt_timeout) as resp:
-                    with open(storage_path, "wb") as f:
-                        f.write(resp.read())
 
-            try:
-                await loop.run_in_executor(None, download_worker)
-                if QualityEvaluator.validate_image_payload(storage_path):
-                    file_size = os.path.getsize(storage_path)
-                    actual_seed = current_seed
-                    actual_model = active_model
-                    successful_attempt = attempt + 1
-                    break
-                else:
+                def download_worker():
+                    req = urllib.request.Request(
+                        pollinations_url,
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SakuraAI/1.0"}
+                    )
+                    with urllib.request.urlopen(req, timeout=attempt_timeout) as resp:
+                        with open(storage_path, "wb") as f:
+                            f.write(resp.read())
+
+                try:
+                    await loop.run_in_executor(None, download_worker)
+                    if QualityEvaluator.validate_image_payload(storage_path):
+                        file_size = os.path.getsize(storage_path)
+                        actual_seed = current_seed
+                        actual_model = active_model
+                        successful_attempt = attempt + 1
+                        break
+                    else:
+                        if os.path.exists(storage_path):
+                            os.remove(storage_path)
+                        last_error = Exception("Output failed quality validation (incomplete or corrupt image).")
+                except Exception as e:
+                    err_str = str(e).lower()
+                    is_timeout = "timed out" in err_str or "timeout" in err_str or "time out" in err_str
+                    last_error = e
                     if os.path.exists(storage_path):
-                        os.remove(storage_path)
-                    last_error = Exception("Output failed quality validation (incomplete or corrupt image).")
-            except Exception as e:
-                err_str = str(e).lower()
-                is_timeout = "timed out" in err_str or "timeout" in err_str or "time out" in err_str
-                last_error = e
-                if os.path.exists(storage_path):
-                    try:
-                        os.remove(storage_path)
-                    except Exception:
-                        pass
+                        try:
+                            os.remove(storage_path)
+                        except Exception:
+                            pass
 
-                # Non-transient errors (invalid parameters, auth, content rejection) should not retry
-                if "400" in err_str or "401" in err_str or "403" in err_str or "unsupported" in err_str:
-                    raise ImageNonTransientError(f"Image generation request error: {str(e)}")
+                    # Non-transient errors (invalid parameters, auth, content rejection) should not retry
+                    if "400" in err_str or "401" in err_str or "403" in err_str or "unsupported" in err_str:
+                        raise ImageNonTransientError(f"Image generation request error: {str(e)}")
 
-            # Exponential backoff with jitter before next attempt
-            if attempt < (max_attempts - 1):
-                if attempt == 0:
-                    backoff = random.uniform(1.0, 2.0)
-                else:
-                    backoff = random.uniform(3.0, 5.0)
-                await asyncio.sleep(backoff)
+                # Exponential backoff with jitter before next attempt
+                if attempt < (max_attempts - 1):
+                    if attempt == 0:
+                        backoff = random.uniform(1.0, 2.0)
+                    else:
+                        backoff = random.uniform(3.0, 5.0)
+                    await asyncio.sleep(backoff)
 
         if not os.path.exists(storage_path) or file_size == 0:
             if is_timeout:
@@ -519,10 +539,7 @@ class ImageGenerationEngine:
                 valid_parent_id = parent.id
                 lineage_depth = parent.lineage_depth + 1
 
-        actual_provider = "pollinations"
-        requested_provider = "pollinations"
-        requested_model = "flux"
-        failover_used = (actual_model != "flux")
+        failover_used = (actual_model != requested_model)
         attempt_count = successful_attempt
 
         # Store in durable storage backend and clean up temp download file
@@ -692,13 +709,7 @@ class ImageGenerationEngine:
         ).first()
 
         if not parent:
-            # If parent image is not found or not owned by user, treat as targeted generation without parent
-            return await self.generate_image(
-                prompt=edit_instruction,
-                conversation_id=conversation_id,
-                intensity=intensity,
-                workflow="PROMPT_VARIATION"
-            )
+            raise ValueError("Parent image not found or not owned by user.")
 
         combined_prompt = self.build_edit_prompt(parent.prompt, edit_instruction)
         return await self.generate_image(
