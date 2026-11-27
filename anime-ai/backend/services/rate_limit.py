@@ -26,20 +26,39 @@ def reset_rate_limits() -> None:
         _LOCAL_BUCKETS.clear()
 
 
-def _parse_trusted_proxy_cidrs() -> List[IPNetwork]:
-    raw = (os.getenv("TRUSTED_PROXY_CIDRS") or "").strip()
-    if not raw:
-        return []
+def validate_trusted_proxy_cidrs(raw: str | None) -> tuple[List[IPNetwork], List[str]]:
+    """
+    Parses and strictly validates comma-separated trusted proxy CIDRs/IPs.
+    Rejects malformed entries and overly broad wildcard CIDRs (0.0.0.0/0, ::/0).
+    Returns (valid_networks, errors).
+    """
+    text = (raw or "").strip()
+    if not text:
+        return [], []
     networks: List[IPNetwork] = []
-    for entry in raw.split(","):
+    errors: List[str] = []
+    for entry in text.split(","):
         item = entry.strip()
         if not item:
             continue
         try:
-            networks.append(ipaddress.ip_network(item, strict=False))
+            net = ipaddress.ip_network(item, strict=False)
         except ValueError:
+            errors.append(f"Invalid CIDR in TRUSTED_PROXY_CIDRS: '{item}'")
             continue
-    return networks
+        if net.prefixlen == 0:
+            errors.append(f"Wildcard CIDR '{item}' is forbidden in TRUSTED_PROXY_CIDRS.")
+            continue
+        if isinstance(net, ipaddress.IPv4Network) and net.prefixlen < 8:
+            errors.append(f"Overly broad IPv4 CIDR '{item}' is forbidden in TRUSTED_PROXY_CIDRS.")
+            continue
+        networks.append(net)
+    return networks, errors
+
+
+def _parse_trusted_proxy_cidrs() -> List[IPNetwork]:
+    nets, _ = validate_trusted_proxy_cidrs(os.getenv("TRUSTED_PROXY_CIDRS"))
+    return nets
 
 
 def _ip_in_networks(ip_str: str, networks: List[IPNetwork]) -> bool:

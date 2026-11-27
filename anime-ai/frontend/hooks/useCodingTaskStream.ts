@@ -37,6 +37,7 @@ export interface CodingTaskState {
   verification?: VerificationResult;
   error?: string | null;
   reconnecting: boolean;
+  reconnectAttempts: number;
   cancelRequested: boolean;
 }
 
@@ -56,7 +57,24 @@ export function isTerminalCodingStatus(status?: string | null): boolean {
 }
 
 /**
- * Deduplicates coding task events strictly by sequenceNumber and sorts ascending.
+ * Capped exponential backoff with ±20% jitter.
+ * Never gives up on long-running tasks (no hard attempt ceiling).
+ */
+export function computeReconnectDelayMs(
+  attempt: number,
+  rng: () => number = Math.random,
+  baseMs = 1000,
+  capMs = 15000
+): number {
+  const safeAttempt = Math.max(0, Math.min(attempt, 10));
+  const exp = Math.min(baseMs * Math.pow(2, safeAttempt), capMs);
+  const jitterFactor = 0.8 + rng() * 0.4; // [0.8, 1.2]
+  return Math.max(250, Math.round(exp * jitterFactor));
+}
+
+/**
+ * Deduplicates coding task events strictly by sequenceNumber and sorts ascending
+ * (handles both duplicate frames and out-of-order delivery cleanly).
  */
 export function mergeCodingEvents(
   existing: CodingTaskEventItem[],
@@ -182,10 +200,27 @@ export function useCodingTaskStream() {
 
   const controllersRef = useRef<Map<string, AbortController>>(new Map());
   const timersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const activeTokensRef = useRef<Map<string, number>>(new Map());
+  const nextTokenRef = useRef<number>(1);
   const mountedRef = useRef<boolean>(true);
   const lastSeqRef = useRef<Map<string, number>>(new Map());
 
+  const detachTask = useCallback((taskId: string) => {
+    activeTokensRef.current.delete(taskId);
+    const ctrl = controllersRef.current.get(taskId);
+    if (ctrl) {
+      ctrl.abort();
+      controllersRef.current.delete(taskId);
+    }
+    const timer = timersRef.current.get(taskId);
+    if (timer) {
+      clearTimeout(timer);
+      timersRef.current.delete(taskId);
+    }
+  }, []);
+
   const detachAll = useCallback(() => {
+    activeTokensRef.current.clear();
     controllersRef.current.forEach((ctrl) => ctrl.abort());
     controllersRef.current.clear();
     timersRef.current.forEach((timer) => clearTimeout(timer));
@@ -223,58 +258,107 @@ export function useCodingTaskStream() {
     }
   }, []);
 
+  const syncMissedEvents = useCallback(async (taskId: string) => {
+    const afterSeq = lastSeqRef.current.get(taskId) || 0;
+    try {
+      const res = await authFetch(`/api/v1/coding/tasks/${taskId}/events?after_sequence=${afterSeq}`);
+      if (!res.ok || !mountedRef.current) return [];
+      const historyEvents: CodingTaskEventItem[] = await res.json();
+      if (historyEvents.length > 0) {
+        const sorted = mergeCodingEvents([], historyEvents);
+        const maxSeq = sorted[sorted.length - 1]?.sequenceNumber || afterSeq;
+        if (maxSeq > afterSeq) {
+          lastSeqRef.current.set(taskId, maxSeq);
+        }
+        setCodingTasks((prev) => {
+          const cur = prev[taskId];
+          if (!cur) return prev;
+          const merged = mergeCodingEvents(cur.events, sorted);
+          const lastEvt = merged[merged.length - 1];
+          return {
+            ...prev,
+            [taskId]: {
+              ...cur,
+              events: merged,
+              tools: mapEventsToTools(merged),
+              lastSequence: lastEvt?.sequenceNumber || cur.lastSequence,
+              phase: lastEvt?.phase || cur.phase,
+              status: lastEvt && isTerminalCodingStatus(lastEvt.phase) ? lastEvt.phase : cur.status,
+            },
+          };
+        });
+        return sorted;
+      }
+    } catch {
+      // Will retry on next reconnect tick
+    }
+    return [];
+  }, []);
+
   const refreshTaskStatus = useCallback(
     async (taskId: string) => {
-      const statusRes = await authFetch(`/api/v1/coding/tasks/${taskId}`);
-      if (!statusRes.ok) return null;
-      const statusData = await statusRes.json();
-      if (!mountedRef.current) return statusData;
+      try {
+        const statusRes = await authFetch(`/api/v1/coding/tasks/${taskId}`);
+        if (!statusRes.ok) return null;
+        const statusData = await statusRes.json();
+        if (!mountedRef.current) return statusData;
 
-      const resolvedWsId = statusData.workspaceId || statusData.workspace_id || null;
-      const resolvedStatus = statusData.status || 'QUEUED';
-      setCodingTasks((prev) => {
-        const cur: CodingTaskState = prev[taskId] || {
-          taskId,
-          status: resolvedStatus,
-          phase: resolvedStatus,
-          lastSequence: 0,
-          events: [],
-          tools: [],
-          filesModified: [],
-          reconnecting: false,
-          cancelRequested: false,
-        };
-        const verification = extractVerificationResult(statusData, cur.events);
-        return {
-          ...prev,
-          [taskId]: {
-            ...cur,
-            jobId: statusData.id || cur.jobId,
-            workspaceId: resolvedWsId || cur.workspaceId,
-            title: statusData.title || cur.title,
+        const resolvedWsId = statusData.workspaceId || statusData.workspace_id || null;
+        const resolvedStatus = statusData.status || 'QUEUED';
+        setCodingTasks((prev) => {
+          const cur: CodingTaskState = prev[taskId] || {
+            taskId,
             status: resolvedStatus,
-            phase: isTerminalCodingStatus(resolvedStatus) ? resolvedStatus : cur.phase,
-            filesModified: Array.isArray(statusData.filesModified) ? statusData.filesModified : cur.filesModified,
-            verification: verification || cur.verification,
-            error: statusData.error || cur.error,
-            cancelRequested: Boolean(statusData.cancelRequested ?? cur.cancelRequested),
-            reconnecting: isTerminalCodingStatus(resolvedStatus) ? false : cur.reconnecting,
-          },
-        };
-      });
-      if (isTerminalCodingStatus(resolvedStatus) && resolvedWsId) {
-        fetchFinalDiff(taskId, resolvedWsId);
+            phase: resolvedStatus,
+            lastSequence: 0,
+            events: [],
+            tools: [],
+            filesModified: [],
+            reconnecting: false,
+            reconnectAttempts: 0,
+            cancelRequested: false,
+          };
+          const verification = extractVerificationResult(statusData, cur.events);
+          return {
+            ...prev,
+            [taskId]: {
+              ...cur,
+              jobId: statusData.id || cur.jobId,
+              workspaceId: resolvedWsId || cur.workspaceId,
+              title: statusData.title || cur.title,
+              status: resolvedStatus,
+              phase: isTerminalCodingStatus(resolvedStatus) ? resolvedStatus : cur.phase,
+              filesModified: Array.isArray(statusData.filesModified) ? statusData.filesModified : cur.filesModified,
+              verification: verification || cur.verification,
+              error: statusData.error || cur.error,
+              cancelRequested: Boolean(statusData.cancelRequested ?? cur.cancelRequested),
+              reconnecting: isTerminalCodingStatus(resolvedStatus) ? false : cur.reconnecting,
+            },
+          };
+        });
+        if (isTerminalCodingStatus(resolvedStatus) && resolvedWsId) {
+          fetchFinalDiff(taskId, resolvedWsId);
+        }
+        return statusData;
+      } catch {
+        return null;
       }
-      return statusData;
     },
     [fetchFinalDiff]
   );
 
   const subscribeStream = useCallback(
-    async (taskId: string, workspaceId?: string | null, attempt = 0) => {
-      if (!mountedRef.current) return;
+    async (taskId: string, workspaceId: string | null | undefined, attempt: number, token: number) => {
+      if (!mountedRef.current || activeTokensRef.current.get(taskId) !== token) {
+        return;
+      }
 
-      // Cancel any existing controller for this task
+      // Clear any pending reconnect timer and previous controller for this task
+      const existingTimer = timersRef.current.get(taskId);
+      if (existingTimer) {
+        clearTimeout(existingTimer);
+        timersRef.current.delete(taskId);
+      }
       const prevCtrl = controllersRef.current.get(taskId);
       if (prevCtrl) prevCtrl.abort();
 
@@ -285,14 +369,19 @@ export function useCodingTaskStream() {
       const url = `/api/v1/coding/tasks/${taskId}/events/stream?after_sequence=${afterSeq}`;
 
       let reachedTerminal = false;
+      let receivedAnyEvent = false;
+      let streamClosedCleanly = false;
+
       try {
         const res = await authFetch(url, { signal: ctrl.signal });
         if (!res.ok) {
           throw new Error(`Coding event stream returned HTTP ${res.status}`);
         }
-        if (mountedRef.current) {
+        if (mountedRef.current && activeTokensRef.current.get(taskId) === token) {
           setCodingTasks((prev) =>
-            prev[taskId] ? { ...prev, [taskId]: { ...prev[taskId], reconnecting: false } } : prev
+            prev[taskId]
+              ? { ...prev, [taskId]: { ...prev[taskId], reconnecting: false } }
+              : prev
           );
         }
 
@@ -302,7 +391,10 @@ export function useCodingTaskStream() {
           let buffer = '';
           while (true) {
             const { value, done } = await reader.read();
-            if (done) break;
+            if (done) {
+              streamClosedCleanly = true;
+              break;
+            }
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split('\n');
             buffer = lines.pop() || '';
@@ -311,6 +403,7 @@ export function useCodingTaskStream() {
               if (!trimmed.startsWith('data: ')) continue;
               try {
                 const evt: CodingTaskEventItem = JSON.parse(trimmed.slice(6));
+                receivedAnyEvent = true;
                 if (typeof evt.sequenceNumber === 'number') {
                   const prevMax = lastSeqRef.current.get(taskId) || 0;
                   if (evt.sequenceNumber > prevMax) {
@@ -320,7 +413,7 @@ export function useCodingTaskStream() {
                 if (isTerminalCodingStatus(evt.phase)) {
                   reachedTerminal = true;
                 }
-                if (mountedRef.current) {
+                if (mountedRef.current && activeTokensRef.current.get(taskId) === token) {
                   setCodingTasks((prev) => {
                     const cur = prev[taskId];
                     if (!cur) return prev;
@@ -330,12 +423,17 @@ export function useCodingTaskStream() {
                       ...prev,
                       [taskId]: {
                         ...cur,
-                        status: isTerminalCodingStatus(evt.phase) ? evt.phase : (cur.status === 'QUEUED' ? 'RUNNING' : cur.status),
+                        status: isTerminalCodingStatus(evt.phase)
+                          ? evt.phase
+                          : cur.status === 'QUEUED'
+                          ? 'RUNNING'
+                          : cur.status,
                         phase: evt.phase || cur.phase,
                         lastSequence: maxSeq,
                         events: merged,
                         tools: mapEventsToTools(merged),
                         reconnecting: false,
+                        reconnectAttempts: 0,
                       },
                     };
                   });
@@ -347,7 +445,7 @@ export function useCodingTaskStream() {
           }
         }
       } catch (err: any) {
-        if (err?.name === 'AbortError' || !mountedRef.current) {
+        if (err?.name === 'AbortError' || !mountedRef.current || activeTokensRef.current.get(taskId) !== token) {
           return;
         }
       } finally {
@@ -356,31 +454,49 @@ export function useCodingTaskStream() {
         }
       }
 
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || activeTokensRef.current.get(taskId) !== token) {
+        return;
+      }
 
-      // Always reconcile authoritative task status after stream closes or drops
+      // Recover any events missed during disconnect + reconcile authoritative status from DB
+      const missed = await syncMissedEvents(taskId);
+      if (missed.some((e) => isTerminalCodingStatus(e.phase))) {
+        reachedTerminal = true;
+      }
       const latestStatus = await refreshTaskStatus(taskId);
       const isDone = reachedTerminal || isTerminalCodingStatus(latestStatus?.status);
       if (isDone) {
         const wsId = latestStatus?.workspaceId || workspaceId;
         await fetchFinalDiff(taskId, wsId);
+        detachTask(taskId);
         return;
       }
 
-      // Schedule bounded exponential-backoff reconnect from lastSequence
-      if (attempt < 8) {
-        const delayMs = Math.min(1000 * Math.pow(2, attempt), 8000);
-        setCodingTasks((prev) =>
-          prev[taskId] ? { ...prev, [taskId]: { ...prev[taskId], reconnecting: true } } : prev
-        );
-        const timer = setTimeout(() => {
-          timersRef.current.delete(taskId);
-          subscribeStream(taskId, latestStatus?.workspaceId || workspaceId, attempt + 1);
-        }, delayMs);
-        timersRef.current.set(taskId, timer);
-      }
+      // Reconnect indefinitely until confirmed terminal status or detach/unmount.
+      // Reset backoff to 0 if events were received or stream closed cleanly (e.g. 120s idle close).
+      const nextAttempt = receivedAnyEvent || streamClosedCleanly ? 0 : attempt + 1;
+      const delayMs = streamClosedCleanly ? 500 : computeReconnectDelayMs(nextAttempt);
+
+      setCodingTasks((prev) =>
+        prev[taskId]
+          ? {
+              ...prev,
+              [taskId]: {
+                ...prev[taskId],
+                reconnecting: true,
+                reconnectAttempts: nextAttempt,
+              },
+            }
+          : prev
+      );
+
+      const timer = setTimeout(() => {
+        timersRef.current.delete(taskId);
+        subscribeStream(taskId, latestStatus?.workspaceId || workspaceId, nextAttempt, token);
+      }, delayMs);
+      timersRef.current.set(taskId, timer);
     },
-    [fetchFinalDiff, refreshTaskStatus]
+    [detachTask, fetchFinalDiff, refreshTaskStatus, syncMissedEvents]
   );
 
   const attachCodingTask = useCallback(
@@ -415,46 +531,27 @@ export function useCodingTaskStream() {
             tools: [],
             filesModified: [],
             reconnecting: false,
+            reconnectAttempts: 0,
             cancelRequested: false,
           },
         };
       });
 
-      // 1. Recover persisted status + events history (covers refresh & reopen)
-      const [statusData, eventsRes] = await Promise.all([
-        refreshTaskStatus(taskId).catch(() => null),
-        authFetch(`/api/v1/coding/tasks/${taskId}/events?after_sequence=0`).catch(() => null),
+      // Prevent duplicate simultaneous subscriptions for the same task
+      if (activeTokensRef.current.has(taskId)) {
+        return;
+      }
+      const token = nextTokenRef.current++;
+      activeTokensRef.current.set(taskId, token);
+
+      // 1. Recover persisted status + full event history (covers page refresh & conversation reopen)
+      const [statusData] = await Promise.all([
+        refreshTaskStatus(taskId),
+        syncMissedEvents(taskId),
       ]);
 
-      let historyEvents: CodingTaskEventItem[] = [];
-      if (eventsRes && eventsRes.ok) {
-        historyEvents = await eventsRes.json();
-      }
-
-      if (!mountedRef.current) return;
-
-      if (historyEvents.length > 0) {
-        const maxSeq = historyEvents[historyEvents.length - 1].sequenceNumber || 0;
-        const prevMax = lastSeqRef.current.get(taskId) || 0;
-        if (maxSeq > prevMax) lastSeqRef.current.set(taskId, maxSeq);
-
-        setCodingTasks((prev) => {
-          const cur = prev[taskId];
-          if (!cur) return prev;
-          const merged = mergeCodingEvents(cur.events, historyEvents);
-          const lastEvt = merged[merged.length - 1];
-          return {
-            ...prev,
-            [taskId]: {
-              ...cur,
-              events: merged,
-              tools: mapEventsToTools(merged),
-              lastSequence: lastEvt?.sequenceNumber || cur.lastSequence,
-              phase: lastEvt?.phase || cur.phase,
-              verification: extractVerificationResult(statusData, merged) || cur.verification,
-            },
-          };
-        });
+      if (!mountedRef.current || activeTokensRef.current.get(taskId) !== token) {
+        return;
       }
 
       const resolvedStatus = statusData?.status || 'QUEUED';
@@ -462,15 +559,14 @@ export function useCodingTaskStream() {
 
       if (isTerminalCodingStatus(resolvedStatus)) {
         await fetchFinalDiff(taskId, resolvedWsId);
+        detachTask(taskId);
         return;
       }
 
-      // 2. Open live SSE stream from last recovered sequence if not already streaming
-      if (!controllersRef.current.has(taskId)) {
-        subscribeStream(taskId, resolvedWsId, 0);
-      }
+      // 2. Open persistent SSE stream from last recovered sequence
+      subscribeStream(taskId, resolvedWsId, 0, token);
     },
-    [fetchFinalDiff, refreshTaskStatus, subscribeStream]
+    [detachTask, fetchFinalDiff, refreshTaskStatus, subscribeStream, syncMissedEvents]
   );
 
   const cancelCodingTask = useCallback(async (taskId: string) => {

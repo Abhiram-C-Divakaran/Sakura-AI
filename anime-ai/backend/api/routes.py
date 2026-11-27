@@ -324,8 +324,12 @@ def request_my_data_export(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Queues an asynchronous, user-isolated account data export job."""
+    """
+    Atomically persists UserDataExport, AccountAuditEvent, and BackgroundTask in a single
+    database transaction, then enqueues the Redis notification strictly after commit.
+    """
     from database.models import UserDataExport, AccountAuditEvent
+    from tasks.worker import enqueue_task
 
     now = utc_now()
     exp = UserDataExport(
@@ -344,15 +348,23 @@ def request_my_data_export(
             created_at=now,
         )
     )
-    db.commit()
-    db.refresh(exp)
-
-    bg_task = TaskManager.create_task(
+    bg_task = TaskManager.create_task_in_session(
+        db=db,
         user_id=current_user.id,
         task_type="user_data_export",
         title="Account Data Export",
         payload={"export_id": str(exp.id)},
     )
+    db.commit()
+    db.refresh(exp)
+    db.refresh(bg_task)
+
+    # Best-effort Redis push strictly after atomic DB commit (DB polling remains authoritative fallback)
+    try:
+        enqueue_task(bg_task.id)
+    except Exception:
+        pass
+
     data = exp.to_dict()
     data["task_id"] = str(bg_task.id)
     return data
@@ -365,9 +377,17 @@ def list_my_data_exports(
 ):
     """Lists data export jobs owned by the authenticated user."""
     from database.models import UserDataExport
+    from services.account import is_export_expired
     rows = db.query(UserDataExport).filter(
         UserDataExport.user_id == current_user.id
     ).order_by(UserDataExport.created_at.desc()).limit(20).all()
+    changed = False
+    for r in rows:
+        if r.status == "COMPLETED" and is_export_expired(r):
+            r.status = "EXPIRED"
+            changed = True
+    if changed:
+        db.commit()
     return [r.to_dict() for r in rows]
 
 
@@ -377,8 +397,9 @@ def get_my_data_export(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Returns owner-verified status of a user data export."""
+    """Returns owner-verified status of a user data export, enforcing expiry truthfully."""
     from database.models import UserDataExport
+    from services.account import is_export_expired
     try:
         exp_uuid = uuid.UUID(str(export_id).strip())
     except ValueError:
@@ -389,6 +410,9 @@ def get_my_data_export(
     ).first()
     if not exp:
         raise HTTPException(status_code=404, detail="Data export not found.")
+    if exp.status == "COMPLETED" and is_export_expired(exp):
+        exp.status = "EXPIRED"
+        db.commit()
     return exp.to_dict()
 
 
@@ -398,8 +422,9 @@ def download_my_data_export(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Downloads a completed user-isolated data export archive."""
+    """Downloads a completed, non-expired user-isolated data export archive."""
     from database.models import UserDataExport
+    from services.account import is_export_expired, _enqueue_outbox_entry
     from services.storage import get_storage_backend, assert_user_storage_key
 
     try:
@@ -412,6 +437,24 @@ def download_my_data_export(
     ).first()
     if not exp:
         raise HTTPException(status_code=404, detail="Data export not found.")
+
+    if is_export_expired(exp):
+        if exp.status != "EXPIRED":
+            exp.status = "EXPIRED"
+        if exp.storage_key:
+            _enqueue_outbox_entry(
+                db,
+                storage_backend=exp.storage_backend or "local",
+                storage_key=exp.storage_key,
+                legacy_path=None,
+                last_error="Export expired; scheduled for deletion",
+            )
+        db.commit()
+        raise HTTPException(
+            status_code=410,
+            detail="Data export has expired and is no longer available for download.",
+        )
+
     if exp.status != "COMPLETED" or not exp.storage_key:
         raise HTTPException(status_code=409, detail=f"Data export is not ready (status: {exp.status}).")
 
@@ -1569,25 +1612,13 @@ async def api_generate_image(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Enqueues a durable worker-backed ImageGenerationJob (never executes generation inline)."""
+    """Enqueues a durable worker-backed text-to-image ImageGenerationJob with centralized quota enforcement."""
     from media.image_worker import create_image_generation_job
-    from services.quotas import enforce_user_quota
-    from database.models import ImageGenerationJob
     if req.conversation_id:
         try:
             uuid.UUID(str(req.conversation_id))
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid conversation ID format.")
-    is_replay = bool(
-        req.idempotency_key
-        and req.idempotency_key.strip()
-        and db.query(ImageGenerationJob).filter(
-            ImageGenerationJob.user_id == current_user.id,
-            ImageGenerationJob.idempotency_key == req.idempotency_key.strip()[:128],
-        ).first()
-    )
-    if not is_replay:
-        enforce_user_quota(db, current_user.id, "image_generation")
     try:
         job, created = create_image_generation_job(
             db=db,
@@ -1619,7 +1650,10 @@ async def api_edit_image(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Enqueues a durable worker-backed prompt-variation ImageGenerationJob."""
+    """
+    Enqueues a durable worker-backed prompt-based variation ImageGenerationJob (reinterpretation,
+    not pixel-level image-conditioned editing). Verifies parent image ownership and enforces image quota.
+    """
     from media.image_worker import create_image_generation_job
     try:
         parent_id = uuid.UUID(req.parent_image_id)
@@ -1627,6 +1661,14 @@ async def api_edit_image(
             uuid.UUID(req.conversation_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid UUID format.")
+
+    parent = db.query(GeneratedImage).filter(
+        GeneratedImage.id == parent_id,
+        GeneratedImage.user_id == current_user.id,
+    ).first()
+    if not parent:
+        raise HTTPException(status_code=404, detail="Parent image not found.")
+
     try:
         job, created = create_image_generation_job(
             db=db,
@@ -1650,6 +1692,8 @@ async def api_edit_image(
         "status": "queued",
         "job_id": str(job.id),
         "status_url": f"/api/v1/images/jobs/{job.id}",
+        "workflow": "PROMPT_VARIATION",
+        "image_conditioned_edit": False,
         "job": job_dict,
     }
 
@@ -1659,8 +1703,8 @@ async def api_variation_image(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Enqueues durable worker-backed prompt-variation ImageGenerationJobs."""
-    from media.image_worker import create_image_generation_job
+    """Enqueues durable worker-backed prompt-variation ImageGenerationJobs with atomic batch quota reservation."""
+    from media.image_worker import create_batch_image_generation_jobs
     try:
         parent_id = uuid.UUID(req.parent_image_id)
         if req.conversation_id:
@@ -1676,22 +1720,25 @@ async def api_variation_image(
         raise HTTPException(status_code=404, detail="Parent image not found.")
 
     count = max(1, min(int(req.count or 2), 4))
-    jobs = []
-    for i in range(count):
-        job, _ = create_image_generation_job(
-            db=db,
-            user_id=current_user.id,
-            prompt=f"{parent.prompt} (variation {i + 1})",
-            requested_pipeline="auto",
-            parameters={
+    specs = [
+        {
+            "prompt": f"{parent.prompt} (variation {i + 1})",
+            "requested_pipeline": "auto",
+            "parameters": {
                 "parent_image_id": str(parent_id),
                 "aspect_ratio": parent.aspect_ratio or "1:1",
                 "conversation_id": req.conversation_id,
                 "workflow": "VARIATION",
             },
-        )
-        jobs.append(job.to_dict())
-    return {"status": "queued", "jobs": jobs}
+        }
+        for i in range(count)
+    ]
+    jobs = create_batch_image_generation_jobs(db=db, user_id=current_user.id, job_specs=specs)
+    return {
+        "status": "queued",
+        "workflow": "PROMPT_VARIATION",
+        "jobs": [j.to_dict() for j in jobs],
+    }
 
 @router.post("/images/upscale", status_code=202)
 async def api_upscale_image(
@@ -1699,7 +1746,10 @@ async def api_upscale_image(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Enqueues a durable worker-backed high-resolution regeneration ImageGenerationJob."""
+    """
+    Enqueues a durable worker-backed high-resolution prompt-based regeneration ImageGenerationJob
+    (not pixel-level super-resolution upscaling). Verifies parent ownership and enforces image quota.
+    """
     from media.image_worker import create_image_generation_job
     try:
         parent_id = uuid.UUID(req.parent_image_id)
@@ -1736,6 +1786,8 @@ async def api_upscale_image(
         "status": "queued",
         "job_id": str(job.id),
         "status_url": f"/api/v1/images/jobs/{job.id}",
+        "workflow": "HIGH_RES_REGENERATION",
+        "true_upscale": False,
         "job": job_dict,
     }
 
@@ -1754,10 +1806,8 @@ def api_create_image_job(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Creates a durable worker-backed ImageGenerationJob in QUEUED state."""
+    """Creates a durable worker-backed ImageGenerationJob in QUEUED state with centralized quota enforcement."""
     from media.image_worker import create_image_generation_job
-    from services.quotas import enforce_user_quota
-    from database.models import ImageGenerationJob
     if not (req.prompt or "").strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
     if req.conversation_id:
@@ -1765,17 +1815,6 @@ def api_create_image_job(
             uuid.UUID(str(req.conversation_id))
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid conversation ID format.")
-
-    is_replay = bool(
-        req.idempotency_key
-        and req.idempotency_key.strip()
-        and db.query(ImageGenerationJob).filter(
-            ImageGenerationJob.user_id == current_user.id,
-            ImageGenerationJob.idempotency_key == req.idempotency_key.strip()[:128],
-        ).first()
-    )
-    if not is_replay:
-        enforce_user_quota(db, current_user.id, "image_generation")
 
     try:
         job, created = create_image_generation_job(

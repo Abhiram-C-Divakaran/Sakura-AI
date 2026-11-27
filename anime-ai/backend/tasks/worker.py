@@ -349,51 +349,96 @@ class DurableTaskWorker:
                 pass
 
     async def run(self, max_iterations: Optional[int] = None):
-        """Main worker loop processing background tasks, durable image jobs, and storage deletion outbox."""
+        """
+        Main worker orchestrator running bounded, independent concurrent loops for:
+        1. General BackgroundTasks (bounded concurrency via Semaphore)
+        2. Maintenance loop (stale recovery, StorageDeletionOutbox, expired export/token pruning)
+        3. Optional ImageGenerationJob loop when dedicated image-worker service is not split out
+           (controlled by SAKURA_WORKER_HANDLE_IMAGES, default true in single-worker dev, false in prod).
+        Prevents long-running background tasks from starving image jobs or storage cleanup.
+        """
         from media.image_worker import ImageJobWorker
         from services.documents import process_storage_deletion_outbox
+        from services.account import cleanup_expired_exports_and_tokens
 
         self._running = True
-        image_worker = ImageJobWorker(worker_id=f"{self.worker_id}_img")
         self.recover_stale_tasks()
-        image_worker.recover_stale_jobs()
-        logger.info(f"Sakura Durable Task Worker {self.worker_id} online and listening for jobs...")
+        handle_images = os.getenv("SAKURA_WORKER_HANDLE_IMAGES", "true").strip().lower() == "true"
+        task_concurrency = max(1, min(int(os.getenv("TASK_WORKER_CONCURRENCY", "2")), 8))
+        image_worker = ImageJobWorker(worker_id=f"{self.worker_id}_img") if handle_images else None
+        if image_worker:
+            image_worker.recover_stale_jobs()
 
-        iteration = 0
-        last_housekeeping = asyncio.get_running_loop().time()
-        while self._running:
-            if max_iterations is not None and iteration >= max_iterations:
-                break
-            iteration += 1
+        logger.info(
+            f"Sakura Durable Task Worker {self.worker_id} online "
+            f"(task_concurrency={task_concurrency}, handle_images={handle_images})..."
+        )
+
+        async def _background_task_loop():
+            sem = asyncio.Semaphore(task_concurrency)
+            in_flight: set[asyncio.Task] = set()
+            iteration = 0
+
+            async def _exec_bounded(t_obj: BackgroundTask):
+                try:
+                    await self.execute_task(t_obj)
+                finally:
+                    sem.release()
 
             try:
-                now_mono = asyncio.get_running_loop().time()
-                if now_mono - last_housekeeping >= 30.0:
+                while self._running:
+                    if max_iterations is not None and iteration >= max_iterations:
+                        break
+                    iteration += 1
+                    try:
+                        await sem.acquire()
+                        task = self.claim_next_task()
+                        if task:
+                            t = asyncio.create_task(_exec_bounded(task))
+                            in_flight.add(t)
+                            t.add_done_callback(in_flight.discard)
+                        else:
+                            sem.release()
+                            await asyncio.sleep(0.75)
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        logger.error(f"Unexpected error in background task loop: {e}", exc_info=True)
+                        await asyncio.sleep(2.0)
+            finally:
+                if in_flight:
+                    await asyncio.gather(*list(in_flight), return_exceptions=True)
+
+        async def _maintenance_loop():
+            iteration = 0
+            while self._running:
+                if max_iterations is not None and iteration >= max_iterations:
+                    break
+                iteration += 1
+                try:
                     self.recover_stale_tasks()
-                    image_worker.recover_stale_jobs()
+                    if image_worker:
+                        image_worker.recover_stale_jobs()
                     process_storage_deletion_outbox(limit=25)
-                    last_housekeeping = now_mono
+                    cleanup_expired_exports_and_tokens()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Unexpected error in maintenance loop: {e}", exc_info=True)
+                if max_iterations is not None and iteration >= max_iterations:
+                    break
+                await asyncio.sleep(30.0)
 
-                did_work = False
-                task = self.claim_next_task()
-                if task:
-                    did_work = True
-                    await self.execute_task(task)
+        loops = [_background_task_loop(), _maintenance_loop()]
+        if image_worker:
+            loops.append(image_worker.run(max_iterations=max_iterations))
 
-                img_job = image_worker.claim_next_job()
-                if img_job:
-                    did_work = True
-                    await image_worker.execute_job(img_job)
-
-                if not did_work:
-                    await asyncio.sleep(1.0)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Unexpected error in worker loop: {e}", exc_info=True)
-                await asyncio.sleep(2.0)
-
-        logger.info(f"Worker {self.worker_id} shut down cleanly.")
+        try:
+            await asyncio.gather(*loops)
+        finally:
+            if image_worker:
+                image_worker.stop()
+            logger.info(f"Worker {self.worker_id} shut down cleanly.")
 
     def stop(self):
         self._running = False

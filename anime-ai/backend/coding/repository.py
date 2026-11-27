@@ -1,6 +1,8 @@
 import os
+import stat
 import uuid
 import shutil
+import logging
 from typing import Optional, Dict, Any
 from sqlalchemy.orm import Session
 from database.models import RepositoryWorkspace, User
@@ -8,8 +10,48 @@ from coding.tools import CodingToolchain
 from coding.executor import SandboxExecutor
 from coding.security import WorkspaceSecurity
 
+logger = logging.getLogger("sakura.coding.repository")
+
+SANDBOX_CHILD_UID = int(os.getenv("SAKURA_SANDBOX_UID", "1001"))
+SANDBOX_CHILD_GID = int(os.getenv("SAKURA_SANDBOX_GID", "1001"))
+
+# Never create directories on module import; resolve canonical path string lazily at runtime.
 WORKSPACES_ROOT = os.path.realpath(os.path.abspath(os.getenv("SAKURA_WORKSPACE_ROOT", "./workspaces")))
-os.makedirs(WORKSPACES_ROOT, exist_ok=True)
+
+
+def get_workspaces_root(override: Optional[str] = None) -> str:
+    """Resolves canonical workspaces root path dynamically without import-time side effects."""
+    raw = override or os.getenv("SAKURA_WORKSPACE_ROOT") or "./workspaces"
+    return os.path.realpath(os.path.abspath(raw))
+
+
+def apply_workspace_permissions(path: str, *, recursive: bool = False) -> None:
+    """
+    Applies the explicit workspace ownership/permission contract for POSIX hosts:
+    - Owner/group set to UID/GID 1001 (the non-root sandbox child identity) when permitted.
+    - Restrictive owner+group permissions (0770 for directories, 0660 for files) — NEVER world-writable (0777).
+    """
+    if os.name == "nt" or not os.path.exists(path):
+        return
+
+    def _apply_one(target: str, is_dir: bool) -> None:
+        try:
+            os.chown(target, SANDBOX_CHILD_UID, SANDBOX_CHILD_GID)
+        except (PermissionError, OSError):
+            pass
+        try:
+            os.chmod(target, 0o770 if is_dir else 0o660)
+        except (PermissionError, OSError):
+            pass
+
+    _apply_one(path, os.path.isdir(path))
+    if recursive and os.path.isdir(path):
+        for root, dirs, files in os.walk(path):
+            for d in dirs:
+                _apply_one(os.path.join(root, d), True)
+            for f in files:
+                _apply_one(os.path.join(root, f), False)
+
 
 class WorkspaceManager:
     """Manages creation, allocation, and tracking of repository workspaces."""
@@ -17,8 +59,16 @@ class WorkspaceManager:
     def __init__(self, db: Optional[Session] = None, user: Optional[User] = None, workspaces_root: Optional[str] = None):
         self.db = db
         self.user = user
-        self.workspaces_root = os.path.realpath(os.path.abspath(workspaces_root)) if workspaces_root else WORKSPACES_ROOT
+        self.workspaces_root = get_workspaces_root(workspaces_root)
         os.makedirs(self.workspaces_root, exist_ok=True)
+        if os.name != "nt":
+            try:
+                # Ensure root allows group traversal (0750 or 0770), never world-writable
+                mode = stat.S_IMODE(os.stat(self.workspaces_root).st_mode)
+                if mode & stat.S_IWOTH:
+                    os.chmod(self.workspaces_root, 0o770)
+            except OSError:
+                pass
 
     def get_workspace(self, workspace_id: uuid.UUID) -> Optional[RepositoryWorkspace]:
         if not self.db or not self.user:
@@ -37,8 +87,12 @@ class WorkspaceManager:
     ) -> Any:
         """Allocates an isolated workspace directory and persists record."""
         workspace_id = uuid.uuid4()
-        workspace_dir = os.path.join(self.workspaces_root, str(workspace_id))
+        os.makedirs(self.workspaces_root, exist_ok=True)
+        workspace_dir = os.path.realpath(os.path.join(self.workspaces_root, str(workspace_id)))
+        if os.path.commonpath([workspace_dir, self.workspaces_root]) != self.workspaces_root or workspace_dir == self.workspaces_root:
+            raise ValueError("Workspace directory escapes workspaces root.")
         os.makedirs(workspace_dir, exist_ok=True)
+        apply_workspace_permissions(workspace_dir)
 
         status = "READY"
         base_commit = None

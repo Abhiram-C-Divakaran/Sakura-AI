@@ -68,17 +68,17 @@ EDIT_IMAGE_TOOL = {
     "type": "function",
     "function": {
         "name": "edit_image",
-        "description": "Edit or modify a previously generated image in the conversation. Use this when the user asks to change, add, remove, recolor, or modify elements of an existing image in chat (e.g., 'Change the background to Tokyo', 'Make the jacket black', 'Add cherry blossoms', 'Make it darker').",
+        "description": "Create a prompt-based variation or reinterpretation of a previously generated image in the conversation (regenerates a new image preserving the original prompt context rather than pixel-level inpainting). Use this when the user asks to adjust, restyle, or vary elements of a prior generated image.",
         "parameters": {
             "type": "object",
             "properties": {
                 "edit_instruction": {
                     "type": "string",
-                    "description": "The specific modification instruction to apply to the existing image."
+                    "description": "The prompt variation or reinterpretation instruction to apply based on the prior image."
                 },
                 "image_id": {
                     "type": "string",
-                    "description": "Optional ID of the parent image to edit if available from context."
+                    "description": "Optional ID of the user-owned parent image to create a prompt variation from."
                 }
             },
             "required": ["edit_instruction"]
@@ -402,6 +402,9 @@ class Agent:
             err_detail = (job_state or {}).get("error") or "The generation service took too long to respond."
             raise RuntimeError(err_detail)
         except Exception as e:
+            from fastapi import HTTPException
+            if isinstance(e, HTTPException) and e.status_code == 429:
+                return f"Image generation quota exceeded: {e.detail}"
             err_json = json.dumps({
                 "error": "timeout" if "timed out" in str(e).lower() or "timeout" in str(e).lower() else "transient_error",
                 "message": str(e) or "The generation service took too long to respond.",
@@ -418,7 +421,8 @@ class Agent:
             )
 
     async def _tool_edit_image(self, edit_instruction: str, image_id: Optional[str] = None) -> str:
-        """Creates a durable worker-backed prompt-variation ImageGenerationJob with edit lineage."""
+        """Creates a durable worker-backed prompt-variation ImageGenerationJob with strict parent ownership & quota."""
+        from fastapi import HTTPException
         from media.image_worker import create_image_generation_job, wait_for_image_job
         from database.models import GeneratedImage, ImageGenerationJobStatus
         import uuid as _uuid
@@ -426,9 +430,16 @@ class Agent:
         parent_uuid = None
         if image_id:
             try:
-                parent_uuid = _uuid.UUID(image_id)
+                candidate_uuid = _uuid.UUID(str(image_id).strip())
             except Exception:
-                pass
+                return "Invalid parent image ID format."
+            owned_parent = self.db.query(GeneratedImage).filter(
+                GeneratedImage.id == candidate_uuid,
+                GeneratedImage.user_id == self.user_id,
+            ).first()
+            if not owned_parent:
+                return "Parent image not found or access denied."
+            parent_uuid = owned_parent.id
 
         if not parent_uuid and self.conversation_id:
             conv_img = self.db.query(GeneratedImage).filter(
@@ -456,7 +467,7 @@ class Agent:
                     "edit_instruction": edit_instruction,
                     "conversation_id": str(self.conversation_id) if self.conversation_id else None,
                     "intensity": self.intensity,
-                    "workflow": "PROMPT_VARIATION" if parent_uuid else "EDIT_IMAGE",
+                    "workflow": "PROMPT_VARIATION",
                     "source": "chat_tool",
                 },
             )
@@ -471,10 +482,10 @@ class Agent:
 
             if job_state and job_state.get("status") == ImageGenerationJobStatus.COMPLETED and res:
                 meta_json = json.dumps(res)
-                img_snippet = f"![{res['filename']}]({res['url']})\n\n<!-- SAKURA_IMAGE_DATA:{meta_json} -->\n\n*Instruction:* \"{edit_instruction}\" | *Lineage:* Version {res['lineage_depth'] + 1}"
+                img_snippet = f"![{res['filename']}]({res['url']})\n\n<!-- SAKURA_IMAGE_DATA:{meta_json} -->\n\n*Prompt Variation:* \"{edit_instruction}\" | *Lineage:* Version {res['lineage_depth'] + 1}"
                 self.pending_image_markdowns.append(img_snippet)
                 return (
-                    f"Updated image with requested changes.\n\n"
+                    f"Generated a prompt-based variation (regenerated from your prompt context; not pixel-level editing).\n\n"
                     f"{img_snippet}\n\n"
                     f"CRITICAL SYSTEM DIRECTIVE: You MUST display the generated image by including the exact markdown image tag and SAKURA_IMAGE_DATA comment block in your response to the user."
                 )
@@ -484,16 +495,21 @@ class Agent:
                     "job_id": str(job.id),
                     "status": job_state.get("status"),
                     "status_url": f"/api/v1/images/jobs/{job.id}",
+                    "workflow": "PROMPT_VARIATION",
                     "prompt": edit_instruction,
                 })
                 return (
-                    f"Image variation job `{job.id}` is currently **{job_state.get('status')}** in the durable worker queue.\n\n"
+                    f"Prompt variation job `{job.id}` is currently **{job_state.get('status')}** in the durable worker queue.\n\n"
                     f"Track status at `/api/v1/images/jobs/{job.id}`.\n\n"
                     f"<!-- SAKURA_IMAGE_JOB:{job_info} -->"
                 )
 
             err_detail = (job_state or {}).get("error") or "The generation service took too long to respond."
             raise RuntimeError(err_detail)
+        except HTTPException as e:
+            if e.status_code == 429:
+                return f"Image generation quota exceeded: {e.detail}"
+            return f"Image variation request failed: {e.detail}"
         except Exception as e:
             err_json = json.dumps({
                 "error": "timeout" if "timed out" in str(e).lower() or "timeout" in str(e).lower() else "transient_error",

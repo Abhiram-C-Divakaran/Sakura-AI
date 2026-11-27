@@ -1,7 +1,7 @@
 """
 Sakura AI — Durable Multi-Worker Per-User Usage Quotas
 Enforces persistent daily usage caps across chat, image generation, coding tasks,
-file uploads, and scheduled jobs using atomic database counter updates.
+file uploads, and scheduled jobs using transaction-safe atomic database updates.
 """
 
 import os
@@ -41,32 +41,42 @@ def current_quota_window_key() -> str:
     return utc_now().strftime("%Y-%m-%d")
 
 
-def enforce_user_quota(
+def reserve_user_quota_in_session(
     db: Session,
     user_id: uuid.UUID,
     category: str,
     amount: int = 1,
 ) -> Dict[str, Any]:
     """
-    Atomically checks and increments a user's persistent daily usage quota.
-    Safe across multiple API workers and restarts.
-    Raises HTTP 429 when the user's quota for the current UTC day is exhausted.
+    Atomically checks and reserves `amount` units against a user's daily quota
+    WITHOUT committing the caller's outer database transaction.
+    - Uses a SAVEPOINT (`begin_nested`) to safely initialize the counter row on race.
+    - Performs an atomic conditional UPDATE (`usage_count + amount <= limit`) safe across
+      concurrent PostgreSQL and SQLite workers.
+    - If the caller rolls back the transaction (e.g., job creation fails), the quota
+      reservation automatically rolls back atomically.
+    Raises HTTP 429 when the quota is insufficient.
     """
-    if os.getenv("SAKURA_DISABLE_QUOTAS", "false").lower() == "true":
-        return {"category": category, "used": 0, "limit": get_daily_quota_limit(category)}
-
     limit = get_daily_quota_limit(category)
     step = max(1, int(amount))
     window_key = current_quota_window_key()
-    now = utc_now()
 
-    if limit <= 0:
+    if os.getenv("SAKURA_DISABLE_QUOTAS", "false").lower() == "true":
+        return {
+            "category": category,
+            "window": window_key,
+            "used": 0,
+            "limit": limit,
+            "remaining": limit,
+        }
+
+    if limit < step:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Daily usage quota exceeded for {category} (limit: {limit}).",
+            detail=f"Daily usage quota exceeded for {category} (requested {step}, limit: {limit} per UTC day).",
         )
 
-    # Ensure counter row exists (handle concurrent multi-worker insert race cleanly)
+    now = utc_now()
     existing = db.query(UserUsageQuota).filter(
         UserUsageQuota.user_id == user_id,
         UserUsageQuota.category == category,
@@ -75,20 +85,22 @@ def enforce_user_quota(
 
     if existing is None:
         try:
-            row = UserUsageQuota(
-                id=uuid.uuid4(),
-                user_id=user_id,
-                category=category,
-                window_key=window_key,
-                usage_count=0,
-                updated_at=now,
-            )
-            db.add(row)
-            db.commit()
+            with db.begin_nested():
+                db.add(
+                    UserUsageQuota(
+                        id=uuid.uuid4(),
+                        user_id=user_id,
+                        category=category,
+                        window_key=window_key,
+                        usage_count=0,
+                        updated_at=now,
+                    )
+                )
+                db.flush()
         except IntegrityError:
-            db.rollback()
+            # Another concurrent worker inserted the window row first; savepoint rolled back cleanly.
+            pass
 
-    # Atomic conditional increment fenced by usage_count + step <= limit
     updated = db.query(UserUsageQuota).filter(
         UserUsageQuota.user_id == user_id,
         UserUsageQuota.category == category,
@@ -102,13 +114,11 @@ def enforce_user_quota(
         synchronize_session=False,
     )
     if updated != 1:
-        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"Daily usage quota exceeded for {category} (limit: {limit} per UTC day).",
         )
 
-    db.commit()
     rec = db.query(UserUsageQuota).filter(
         UserUsageQuota.user_id == user_id,
         UserUsageQuota.category == category,
@@ -122,6 +132,27 @@ def enforce_user_quota(
         "limit": limit,
         "remaining": max(0, limit - used),
     }
+
+
+def enforce_user_quota(
+    db: Session,
+    user_id: uuid.UUID,
+    category: str,
+    amount: int = 1,
+) -> Dict[str, Any]:
+    """
+    Standalone quota check + commit for endpoints that do not require an enclosing transaction.
+    """
+    try:
+        res = reserve_user_quota_in_session(db, user_id, category, amount=amount)
+        db.commit()
+        return res
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise
 
 
 def get_user_quota_summary(db: Session, user_id: uuid.UUID) -> Dict[str, Any]:

@@ -53,10 +53,10 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -90,6 +90,20 @@ jobs:
           SAKURA_POSTGRES_TEST: "1"
         run: |
           python -m unittest tests/test_scheduler_resilience.py -v
+
+      - name: Verify PostgreSQL Backup and Restore Scripts
+        env:
+          POSTGRES_HOST: "localhost"
+          POSTGRES_PORT: "5432"
+          POSTGRES_USER: "sakura_ci"
+          POSTGRES_DB: "sakura_ci_db"
+          PGPASSWORD: "sakura_ci_password"
+          BACKUP_DIR: "/tmp/sakura_pg_backups"
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client-15 || sudo apt-get install -y --no-install-recommends postgresql-client
+          bash ../ops/scripts/backup_postgres.sh
+          LATEST_DUMP=$(ls -1t /tmp/sakura_pg_backups/sakura_sakura_ci_db_*.dump | head -n1)
+          bash ../ops/scripts/verify_restore.sh "$LATEST_DUMP"
 
       - name: Run Storage Persistence Integration Test
         env:
@@ -142,12 +156,12 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Set up Node.js 20
-        uses: actions/setup-node@v4
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 22
           cache: 'npm'
           cache-dependency-path: anime-ai/frontend/package-lock.json
 
@@ -183,7 +197,7 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Build Sandbox Execution Container
         run: |
@@ -192,6 +206,10 @@ jobs:
       - name: Build Sandbox Executor Service
         run: |
           docker build -t sakura-sandbox-executor:latest -f anime-ai/backend/Dockerfile.sandbox-executor anime-ai/backend
+
+      - name: Build Backend Test Runner Image
+        run: |
+          docker build -t sakura-backend:ci-test -f anime-ai/backend/Dockerfile anime-ai/backend
 
       - name: Start Redis and Sandbox Executor with Shared Workspace Volume
         env:
@@ -204,8 +222,6 @@ jobs:
           docker network create sakura_ci_net
           docker run -d --name sakura-ci-redis --network sakura_ci_net -p 6379:6379 redis:7-alpine
           docker volume create sakura_workspaces_vol
-          VOL_PATH=$(docker volume inspect sakura_workspaces_vol --format '{{ .Mountpoint }}')
-          echo "SAKURA_VOL_MOUNT=$VOL_PATH" >> $GITHUB_ENV
           docker run -d --name sakura-sandbox-executor \
             --network sakura_ci_net \
             -v /var/run/docker.sock:/var/run/docker.sock \
@@ -243,6 +259,51 @@ jobs:
             exit 1
           fi
 
+      - name: Run Real Docker Sandbox E2E & Topology Tests Inside Container (Zero Skips Allowed)
+        run: |
+          docker run --rm \
+            --network sakura_ci_net \
+            -v sakura_workspaces_vol:/workspaces \
+            -e SAKURA_SANDBOX_E2E=1 \
+            -e SAKURA_SANDBOX_URL=http://sakura-sandbox-executor:9000 \
+            -e SAKURA_SANDBOX_SERVICE_TOKEN=ci_test_sandbox_token_abc123 \
+            -e SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY=ci_test_capability_signing_key_32chars \
+            -e SAKURA_WORKSPACE_ROOT=/workspaces \
+            -e SAKURA_SHARED_WORKSPACE_ROOT=/workspaces \
+            -e REDIS_URL=redis://sakura-ci-redis:6379/0 \
+            -e POSTGRES_PASSWORD=ci_secret_super_secret_pg_pwd \
+            -e JWT_SECRET=ci_secret_super_secret_jwt_key_32c \
+            -e HOST_SENSITIVE_SECRET=very_sensitive_host_secret_should_never_leak \
+            sakura-backend:ci-test \
+            python -c '
+          import sys, unittest
+          loader = unittest.TestLoader()
+          suite = unittest.TestSuite()
+          suite.addTests(loader.loadTestsFromName("tests.test_sandbox_e2e_docker"))
+          suite.addTests(loader.loadTestsFromName("tests.test_workspace_topology_e2e"))
+          runner = unittest.TextTestRunner(verbosity=2)
+          result = runner.run(suite)
+          if result.testsRun == 0:
+              print("ERROR: Zero E2E tests executed!", file=sys.stderr)
+              sys.exit(1)
+          if len(result.skipped) > 0:
+              print(f"ERROR: E2E tests silently skipped: {result.skipped}", file=sys.stderr)
+              sys.exit(1)
+          if not result.wasSuccessful():
+              sys.exit(1)
+          print(f"SUCCESS: Executed {result.testsRun} Docker E2E tests with 0 skips.")
+          '
+
+      - name: Verify Zero Orphaned Sandbox Child Containers
+        run: |
+          ORPHANS=$(docker ps -a --filter "name=sakura-exec-" --filter "name=sakura-smoke-" --format "{{.ID}} {{.Names}} {{.Status}}")
+          if [ -n "$ORPHANS" ]; then
+            echo "ERROR: Lingering sandbox child containers detected:"
+            echo "$ORPHANS"
+            exit 1
+          fi
+          echo "Verified 0 lingering sandbox child containers."
+
       - name: Collect Sandbox Executor Diagnostics on Failure
         if: failure()
         run: |
@@ -264,49 +325,3 @@ jobs:
           echo "=== executor full /readiness response ==="
           curl -i -sS http://localhost:9000/readiness || true
           echo ""
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: anime-ai/backend/requirements.txt
-
-      - name: Install Test Dependencies
-        working-directory: anime-ai/backend
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run Real Docker Sandbox E2E & Topology Tests (Zero Skips Allowed)
-        working-directory: anime-ai/backend
-        env:
-          SAKURA_SANDBOX_E2E: "1"
-          SAKURA_SANDBOX_URL: "http://localhost:9000"
-          SAKURA_SANDBOX_SERVICE_TOKEN: "ci_test_sandbox_token_abc123"
-          SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY: "ci_test_capability_signing_key_32chars"
-          SAKURA_WORKSPACE_ROOT: "${{ env.SAKURA_VOL_MOUNT }}"
-          REDIS_URL: "redis://localhost:6379/0"
-          POSTGRES_PASSWORD: "ci_secret_super_secret_pg_pwd"
-          JWT_SECRET: "ci_secret_super_secret_jwt_key_32c"
-          HOST_SENSITIVE_SECRET: "very_sensitive_host_secret_should_never_leak"
-        run: |
-          sudo chmod 777 "$SAKURA_WORKSPACE_ROOT" || true
-          python - <<'PY'
-          import sys, unittest
-          loader = unittest.TestLoader()
-          suite = unittest.TestSuite()
-          suite.addTests(loader.loadTestsFromName("tests.test_sandbox_e2e_docker"))
-          suite.addTests(loader.loadTestsFromName("tests.test_workspace_topology_e2e"))
-          runner = unittest.TextTestRunner(verbosity=2)
-          result = runner.run(suite)
-          if result.testsRun == 0:
-              print("ERROR: Zero E2E tests executed!", file=sys.stderr)
-              sys.exit(1)
-          if len(result.skipped) > 0:
-              print(f"ERROR: E2E tests silently skipped: {result.skipped}", file=sys.stderr)
-              sys.exit(1)
-          if not result.wasSuccessful():
-              sys.exit(1)
-          print(f"SUCCESS: Executed {result.testsRun} Docker E2E tests with 0 skips.")
-          PY

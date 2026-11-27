@@ -97,6 +97,7 @@ class Settings(BaseSettings):
     smtp_from_email: Optional[str] = Field(default=None, alias="SMTP_FROM_EMAIL")
     smtp_use_tls: bool = Field(default=True, alias="SMTP_USE_TLS")
     public_app_url: Optional[str] = Field(default=None, alias="PUBLIC_APP_URL")
+    trusted_proxy_cidrs: Optional[str] = Field(default=None, alias="TRUSTED_PROXY_CIDRS")
 
     # OAuth Login Providers (only enabled when explicitly configured)
     google_client_id: Optional[str] = Field(default=None, alias="GOOGLE_CLIENT_ID")
@@ -148,6 +149,11 @@ class Settings(BaseSettings):
                     raise RuntimeError("Production security error: SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY must be independent of other secrets.")
                 if len(self.sakura_sandbox_capability_signing_key) < 32:
                     raise RuntimeError("Production security error: SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY must be at least 32 characters long.")
+            if self.trusted_proxy_cidrs:
+                from services.rate_limit import validate_trusted_proxy_cidrs
+                _, cidr_errors = validate_trusted_proxy_cidrs(self.trusted_proxy_cidrs)
+                if cidr_errors:
+                    raise RuntimeError(f"Production security error: {'; '.join(cidr_errors)}")
 
 
 @lru_cache()

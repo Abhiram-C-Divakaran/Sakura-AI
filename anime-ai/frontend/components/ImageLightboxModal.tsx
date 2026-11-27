@@ -242,7 +242,7 @@ export const ImageLightboxModal: React.FC<ImageLightboxModalProps> = ({
                 }}
                 className="w-full py-2.5 bg-[#212121] hover:bg-[#2A2A2A] text-white rounded-xl text-[13px] font-medium transition-colors border border-[#333333] flex items-center justify-center gap-2"
               >
-                <span>✏️ Edit prompt</span>
+                <span>Prompt reinterpretation</span>
               </button>
             )}
             {onVariation && (
@@ -254,7 +254,7 @@ export const ImageLightboxModal: React.FC<ImageLightboxModalProps> = ({
                 }}
                 className="w-full py-2.5 bg-[#212121] hover:bg-[#2A2A2A] text-white rounded-xl text-[13px] font-medium transition-colors border border-[#333333] flex items-center justify-center gap-2"
               >
-                <span>🔀 Create variation</span>
+                <span>Create prompt variation</span>
               </button>
             )}
             {onUpscale && (
@@ -266,7 +266,7 @@ export const ImageLightboxModal: React.FC<ImageLightboxModalProps> = ({
                 }}
                 className="w-full py-2.5 bg-[#212121] hover:bg-[#2A2A2A] text-white rounded-xl text-[13px] font-medium transition-colors border border-[#333333] flex items-center justify-center gap-2"
               >
-                <span>🔍 Upscale 2×</span>
+                <span>High-res regeneration</span>
               </button>
             )}
           </div>

@@ -123,10 +123,12 @@ def create_image_generation_job(
     parameters: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
     max_attempts: int = DEFAULT_MAX_IMAGE_ATTEMPTS,
+    enforce_quota: bool = True,
 ) -> Tuple[ImageGenerationJob, bool]:
     """
     Persists a durable ImageGenerationJob in QUEUED state and enqueues it.
-    Validates requested_pipeline truthfully and enforces idempotency per (user_id, idempotency_key).
+    Transactionally reserves per-user image_generation quota inside the same DB transaction
+    so job creation failures roll back quota automatically and idempotent replays never double-charge.
     """
     clean_prompt = (prompt or "").strip()
     if not clean_prompt:
@@ -159,6 +161,9 @@ def create_image_generation_job(
         updated_at=now,
     )
     try:
+        if enforce_quota:
+            from services.quotas import reserve_user_quota_in_session
+            reserve_user_quota_in_session(db, user_id, "image_generation", amount=1)
         db.add(job)
         db.commit()
         db.refresh(job)
@@ -172,9 +177,69 @@ def create_image_generation_job(
             if existing:
                 return existing, False
         raise
+    except Exception:
+        db.rollback()
+        raise
 
     enqueue_image_job(job.id)
     return job, True
+
+
+def create_batch_image_generation_jobs(
+    db: Session,
+    user_id: uuid.UUID,
+    job_specs: list[Dict[str, Any]],
+    enforce_quota: bool = True,
+) -> list[ImageGenerationJob]:
+    """
+    Atomically reserves quota for `len(job_specs)` jobs and persists all ImageGenerationJob rows
+    in a single transaction. If quota is exceeded or any insert fails, ALL jobs and the quota
+    reservation roll back cleanly.
+    """
+    if not job_specs:
+        return []
+
+    now = utc_now()
+    jobs: list[ImageGenerationJob] = []
+    for spec in job_specs:
+        clean_prompt = (spec.get("prompt") or "").strip()
+        if not clean_prompt:
+            raise ValueError("Image prompt cannot be empty.")
+        normalized_pipeline = validate_requested_pipeline(spec.get("requested_pipeline") or "auto")
+        max_att = max(1, min(int(spec.get("max_attempts") or DEFAULT_MAX_IMAGE_ATTEMPTS), 5))
+        jobs.append(
+            ImageGenerationJob(
+                id=uuid.uuid4(),
+                user_id=user_id,
+                prompt=clean_prompt,
+                requested_pipeline=normalized_pipeline,
+                status=ImageGenerationJobStatus.QUEUED,
+                attempt_count=0,
+                max_attempts=max_att,
+                parameters=dict(spec.get("parameters") or {}),
+                idempotency_key=None,
+                cancel_requested=False,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    try:
+        if enforce_quota:
+            from services.quotas import reserve_user_quota_in_session
+            reserve_user_quota_in_session(db, user_id, "image_generation", amount=len(jobs))
+        for job in jobs:
+            db.add(job)
+        db.commit()
+        for job in jobs:
+            db.refresh(job)
+    except Exception:
+        db.rollback()
+        raise
+
+    for job in jobs:
+        enqueue_image_job(job.id)
+    return jobs
 
 
 async def wait_for_image_job(
@@ -251,10 +316,13 @@ class ImageJobWorker:
         worker_id: Optional[str] = None,
         lease_duration: float = IMAGE_LEASE_DURATION_SECONDS,
         heartbeat_interval: float = IMAGE_HEARTBEAT_INTERVAL_SECONDS,
+        max_heartbeat_failures: int = 3,
     ):
         self.worker_id = worker_id or f"image_worker_{os.getpid()}_{uuid.uuid4().hex[:8]}"
         self.lease_duration = float(lease_duration)
         self.heartbeat_interval = max(0.05, float(heartbeat_interval))
+        self.max_heartbeat_failures = max(1, int(max_heartbeat_failures))
+        self._running = False
 
     def recover_stale_jobs(self) -> int:
         """Atomically recovers RUNNING image jobs whose lease has expired."""
@@ -503,6 +571,11 @@ class ImageJobWorker:
         gen_task: Optional[asyncio.Task] = None
 
         async def _heartbeat_loop():
+            loop = asyncio.get_running_loop()
+            last_confirmed = loop.time()
+            consecutive_failures = 0
+            lease_loss_window = max(self.heartbeat_interval * 2.0, self.lease_duration * 0.75)
+
             while not stop_hb.is_set():
                 try:
                     await asyncio.wait_for(stop_hb.wait(), timeout=self.heartbeat_interval)
@@ -545,10 +618,30 @@ class ImageJobWorker:
                             if gen_task and not gen_task.done():
                                 gen_task.cancel()
                             break
+                        # Confirmed renewal
+                        consecutive_failures = 0
+                        last_confirmed = loop.time()
                 except asyncio.CancelledError:
                     break
                 except Exception as ex:
-                    logger.warning(f"Image job heartbeat failed for {job_id}: {ex}")
+                    consecutive_failures += 1
+                    elapsed_unconfirmed = loop.time() - last_confirmed
+                    logger.warning(
+                        f"Image job heartbeat DB error ({consecutive_failures}/{self.max_heartbeat_failures}, "
+                        f"unconfirmed={elapsed_unconfirmed:.2f}s) for {job_id}: {ex}"
+                    )
+                    if (
+                        consecutive_failures >= self.max_heartbeat_failures
+                        or elapsed_unconfirmed >= lease_loss_window
+                    ):
+                        logger.error(
+                            f"Aborting image job {job_id}: unable to confirm lease ownership within safe window "
+                            f"(failures={consecutive_failures}, elapsed={elapsed_unconfirmed:.2f}s)."
+                        )
+                        abort_state["reason"] = "lease_lost"
+                        if gen_task and not gen_task.done():
+                            gen_task.cancel()
+                        break
 
         async def _run_generation():
             normalized_pipeline = validate_requested_pipeline(requested_pipeline)
@@ -726,3 +819,80 @@ class ImageJobWorker:
                 await hb_task
             except asyncio.CancelledError:
                 pass
+
+    def stop(self) -> None:
+        self._running = False
+
+    async def run(self, max_iterations: Optional[int] = None, max_concurrency: Optional[int] = None) -> None:
+        """
+        Dedicated bounded-concurrency loop for processing ImageGenerationJob records
+        independently of general background tasks.
+        """
+        self._running = True
+        concurrency = max(1, min(int(max_concurrency or os.getenv("IMAGE_WORKER_CONCURRENCY", "2")), 8))
+        sem = asyncio.Semaphore(concurrency)
+        in_flight: set[asyncio.Task] = set()
+        self.recover_stale_jobs()
+        logger.info(f"Sakura Image Worker {self.worker_id} online (concurrency={concurrency}).")
+
+        iteration = 0
+        last_recovery = asyncio.get_running_loop().time()
+
+        async def _run_bounded(claimed_job: ImageGenerationJob):
+            try:
+                await self.execute_job(claimed_job)
+            finally:
+                sem.release()
+
+        try:
+            while self._running:
+                if max_iterations is not None and iteration >= max_iterations:
+                    break
+                iteration += 1
+                try:
+                    now_mono = asyncio.get_running_loop().time()
+                    if now_mono - last_recovery >= 30.0:
+                        self.recover_stale_jobs()
+                        last_recovery = now_mono
+
+                    await sem.acquire()
+                    job = self.claim_next_job()
+                    if job:
+                        t = asyncio.create_task(_run_bounded(job))
+                        in_flight.add(t)
+                        t.add_done_callback(in_flight.discard)
+                    else:
+                        sem.release()
+                        await asyncio.sleep(0.75)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Unexpected error in image worker loop: {e}", exc_info=True)
+                    await asyncio.sleep(2.0)
+        finally:
+            if in_flight:
+                await asyncio.gather(*list(in_flight), return_exceptions=True)
+            logger.info(f"Sakura Image Worker {self.worker_id} shut down cleanly.")
+
+
+async def main():
+    import signal
+    worker = ImageJobWorker()
+
+    def handle_signal():
+        logger.info("Received termination signal, shutting down image worker gracefully...")
+        worker.stop()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, handle_signal)
+        except (NotImplementedError, AttributeError):
+            pass
+
+    await worker.run()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    asyncio.run(main())

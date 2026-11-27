@@ -131,3 +131,20 @@ Optional feature variables:
 
 - `/privacy` (`frontend/pages/privacy.tsx`) and `/terms` (`frontend/pages/terms.tsx`) are explicitly labeled as pre-launch drafts requiring legal review before public release.
 - Configure `NEXT_PUBLIC_SUPPORT_EMAIL` for `/contact` before staging/public launch.
+
+---
+
+## 12. GitHub Branch Protection & Repository Governance *(Manual Repository Setting)*
+
+> **Current Status:** `main` branch protection is **NOT YET ENABLED** (must be configured manually by a repository administrator in GitHub Settings → Branches → Branch protection rules for `main`).
+
+Required settings before staging/production release:
+- Require a pull request before merging (`>= 1` approving review; dismiss stale reviews on new commits).
+- Require status checks to pass before merging (strict — branch must be up to date):
+  - `Backend Tests & Schema Verification`
+  - `Frontend Typecheck & Build`
+  - `Docker Sandbox E2E Integration`
+- Block force pushes and branch deletions on `main`.
+- Require linear history or signed commits per organizational policy.
+- Dedicated `image-worker` service (`python -m media.image_worker`) runs independently from `worker` (`SAKURA_WORKER_HANDLE_IMAGES=false`) in `docker-compose.prod.yml` so long-running background tasks cannot starve image generation or storage deletion maintenance.
+

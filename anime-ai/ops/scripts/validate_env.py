@@ -91,19 +91,29 @@ def validate_environment(env: dict) -> Tuple[List[str], List[str]]:
     else:
         errors.append(f"Unsupported SAKURA_STORAGE_BACKEND: {storage_backend}")
 
-    # 6. Trusted proxy CIDRs for proxy-aware rate limiting
+    # 6. Trusted proxy CIDRs for proxy-aware rate limiting (strict explicit CIDR policy)
     proxy_cidrs = (env.get("TRUSTED_PROXY_CIDRS") or "").strip()
     if not proxy_cidrs:
-        warnings.append("TRUSTED_PROXY_CIDRS is unset; X-Forwarded-For headers will be ignored (configure proxy CIDR when behind Nginx/ALB).")
+        if is_prod:
+            errors.append("TRUSTED_PROXY_CIDRS must be explicitly configured in staging/production (e.g., 127.0.0.1/32 or your exact proxy CIDR).")
+        else:
+            warnings.append("TRUSTED_PROXY_CIDRS is unset; X-Forwarded-For headers will be ignored.")
     else:
         for item in proxy_cidrs.split(","):
             entry = item.strip()
             if not entry:
                 continue
             try:
-                ipaddress.ip_network(entry, strict=False)
+                net = ipaddress.ip_network(entry, strict=False)
             except ValueError:
                 errors.append(f"Invalid CIDR in TRUSTED_PROXY_CIDRS: '{entry}'")
+                continue
+            if net.prefixlen == 0:
+                errors.append(f"Wildcard CIDR '{entry}' is forbidden in TRUSTED_PROXY_CIDRS.")
+            elif isinstance(net, ipaddress.IPv4Network) and net.prefixlen < 8:
+                errors.append(f"Overly broad IPv4 CIDR '{entry}' is forbidden in TRUSTED_PROXY_CIDRS.")
+            elif isinstance(net, ipaddress.IPv4Network) and net.prefixlen <= 12:
+                warnings.append(f"TRUSTED_PROXY_CIDRS contains a broad range ('{entry}'); prefer the exact reverse-proxy subnet/IP.")
 
     # 7. SMTP & canonical PUBLIC_APP_URL consistency
     smtp_host = (env.get("SMTP_HOST") or "").strip()

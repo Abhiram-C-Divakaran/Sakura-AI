@@ -5,6 +5,7 @@ storage persistence, and generation fencing across all API modules.
 """
 
 import os
+import shutil
 import uuid
 import logging
 from typing import Dict, Any, Optional, List
@@ -477,12 +478,51 @@ def process_storage_deletion_outbox(
 
         for entry in entries:
             stats["processed"] += 1
-            ok, err_msg = _delete_physical_object(
-                storage_backend_name=entry.storage_backend,
-                storage_key=entry.storage_key if not entry.storage_key.startswith("document:") else None,
-                legacy_path=entry.legacy_path,
-                storage_override=storage_override,
-            )
+            if entry.storage_backend == "workspace" or (entry.storage_key or "").startswith("workspace:"):
+                ok = True
+                err_msg = None
+                if entry.legacy_path and os.path.exists(entry.legacy_path):
+                    try:
+                        shutil.rmtree(entry.legacy_path)
+                    except Exception as e:
+                        err_msg = str(e)
+                    if os.path.exists(entry.legacy_path):
+                        ok = False
+                        err_msg = err_msg or f"Workspace directory still exists: {entry.legacy_path}"
+            elif (entry.storage_key or "").startswith("prefix_scan:"):
+                scan_prefix = entry.storage_key[len("prefix_scan:"):]
+                storage = storage_override or get_storage_backend(entry.storage_backend or "local")
+                ok = True
+                err_msg = None
+                try:
+                    remaining_keys = storage.list_keys(prefix=scan_prefix)
+                    failed_sub = []
+                    for k in remaining_keys:
+                        try:
+                            if not storage.delete(k):
+                                failed_sub.append(k)
+                        except Exception:
+                            failed_sub.append(k)
+                    if failed_sub:
+                        ok = False
+                        err_msg = f"Failed to delete {len(failed_sub)} object(s) under {scan_prefix}"
+                except Exception as e:
+                    ok = False
+                    err_msg = f"Prefix scan retry failed for '{scan_prefix}': {e}"
+            elif (entry.storage_key or "").startswith("legacy:"):
+                ok, err_msg = _delete_physical_object(
+                    storage_backend_name=entry.storage_backend,
+                    storage_key=None,
+                    legacy_path=entry.legacy_path,
+                    storage_override=storage_override,
+                )
+            else:
+                ok, err_msg = _delete_physical_object(
+                    storage_backend_name=entry.storage_backend,
+                    storage_key=entry.storage_key if not entry.storage_key.startswith("document:") else None,
+                    legacy_path=entry.legacy_path,
+                    storage_override=storage_override,
+                )
             step_now = utc_now()
             entry.attempt_count = int(entry.attempt_count or 0) + 1
             entry.updated_at = step_now

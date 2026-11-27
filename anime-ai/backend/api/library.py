@@ -299,11 +299,9 @@ async def generate_image_to_library(
 ):
     """Enqueues a durable worker-backed ImageGenerationJob that saves the completed asset to the user's Library."""
     from media.image_worker import create_image_generation_job
-    from services.quotas import enforce_user_quota
     prompt = (req.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Image prompt cannot be empty")
-    enforce_user_quota(db, current_user.id, "image_generation")
 
     try:
         job, created = create_image_generation_job(

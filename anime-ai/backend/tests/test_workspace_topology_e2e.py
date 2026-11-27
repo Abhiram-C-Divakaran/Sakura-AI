@@ -207,6 +207,18 @@ class TestRealRemoteWorkspaceTopologyE2E(unittest.IsolatedAsyncioTestCase):
         with open(app_file, "w", encoding="utf-8") as f:
             f.write("WRITTEN_BY_BACKEND\n")
 
+        # Verify workspace ownership & non-world-writable permission contract on POSIX
+        if os.name != "nt":
+            import stat
+            st_ws = os.stat(ws_a_dir)
+            self.assertEqual(st_ws.st_uid, 1001, f"Expected workspace UID 1001, got {st_ws.st_uid}")
+            self.assertEqual(st_ws.st_gid, 1001, f"Expected workspace GID 1001, got {st_ws.st_gid}")
+            self.assertEqual(
+                stat.S_IMODE(st_ws.st_mode) & stat.S_IWOTH,
+                0,
+                f"Workspace directory must NOT be world-writable (mode={oct(stat.S_IMODE(st_ws.st_mode))})",
+            )
+
         remote_a = RemoteHttpSandboxRuntime(
             workspace_root=ws_a_dir,
             service_url=sandbox_url,
@@ -235,10 +247,30 @@ class TestRealRemoteWorkspaceTopologyE2E(unittest.IsolatedAsyncioTestCase):
         self.assertIn("WRITTEN_BY_BACKEND", final_text)
         self.assertIn("MODIFIED_BY_DOCKER_CHILD", final_text)
 
-        # 5. Cross-workspace isolation: Workspace B child container cannot read Workspace A's file
+        # 5. Docker child creates a new file and backend reads it
+        create_res = await remote_a.run_command("echo 'NEW_FILE_FROM_CHILD' > /workspace/child_created.txt")
+        self.assertTrue(create_res.get("success"), f"Child file creation failed: {create_res}")
+        child_file_host = os.path.join(ws_a_dir, "child_created.txt")
+        self.assertTrue(os.path.exists(child_file_host), "Child-created file not visible on shared volume")
+        with open(child_file_host, "r", encoding="utf-8") as f:
+            self.assertIn("NEW_FILE_FROM_CHILD", f.read())
+
+        # 6. Git operations work inside the workspace child container
+        git_res = await remote_a.run_command(
+            "git init && git config user.name 'Sakura CI' && git config user.email 'ci@sakura.local' "
+            "&& git add topology_probe.txt child_created.txt && git commit -m 'init' && git status --short"
+        )
+        self.assertTrue(git_res.get("success"), f"Git operations failed inside workspace: {git_res}")
+
+        # 7. Cross-workspace isolation: Workspace B child container cannot read Workspace A's file
         iso_res = await remote_b.run_command("cat /workspace/topology_probe.txt")
         self.assertFalse(iso_res.get("success"))
         self.assertNotIn("WRITTEN_BY_BACKEND", iso_res.get("stdout", ""))
+
+        # 8. Child container cannot access the parent /workspaces directory or sibling workspaces
+        parent_res = await remote_a.run_command(f"ls /workspaces 2>&1 || true; cat /workspaces/{ws_b_id}/topology_probe.txt 2>&1 || true")
+        self.assertNotIn(ws_b_id, parent_res.get("stdout", ""))
+        self.assertNotIn("WRITTEN_BY_BACKEND", parent_res.get("stdout", ""))
 
 
 if __name__ == "__main__":

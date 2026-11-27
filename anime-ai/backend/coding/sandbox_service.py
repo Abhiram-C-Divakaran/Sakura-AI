@@ -58,11 +58,47 @@ if not default_ws_root:
         default_ws_root = os.path.join(tempfile.gettempdir(), "sakura_workspaces")
 WORKSPACE_ROOT = os.path.realpath(os.path.abspath(default_ws_root))
 WORKSPACES_VOLUME = os.getenv("SAKURA_WORKSPACES_VOLUME", "")
+SANDBOX_CHILD_UID = int(os.getenv("SAKURA_SANDBOX_UID", "1001"))
+SANDBOX_CHILD_GID = int(os.getenv("SAKURA_SANDBOX_GID", "1001"))
 
-try:
+
+def _ensure_workspace_root_exists() -> str:
     os.makedirs(WORKSPACE_ROOT, exist_ok=True)
-except (PermissionError, OSError):
-    pass
+    return WORKSPACE_ROOT
+
+
+def ensure_workspace_ownership(ws_path: str, *, recursive: bool = True) -> None:
+    """
+    Enforces explicit POSIX ownership (UID/GID 1001) and restrictive owner+group
+    permissions (0770 dirs / 0660 files; NEVER world-writable 0777) so non-root
+    sandbox child containers and backend services share workspace files safely.
+    """
+    if os.name == "nt" or not os.path.exists(ws_path):
+        return
+
+    def _set_perms(target: str, is_dir: bool) -> None:
+        try:
+            os.chown(target, SANDBOX_CHILD_UID, SANDBOX_CHILD_GID)
+        except (PermissionError, OSError):
+            pass
+        try:
+            current_mode = os.stat(target).st_mode
+            if is_dir:
+                os.chmod(target, 0o770)
+            else:
+                # Preserve executable bit for owner/group if set, never grant world-write
+                exec_bits = 0o110 if (current_mode & 0o111) else 0
+                os.chmod(target, 0o660 | exec_bits)
+        except (PermissionError, OSError):
+            pass
+
+    _set_perms(ws_path, os.path.isdir(ws_path))
+    if recursive and os.path.isdir(ws_path):
+        for root, dirs, files in os.walk(ws_path):
+            for d in dirs:
+                _set_perms(os.path.join(root, d), True)
+            for f in files:
+                _set_perms(os.path.join(root, f), False)
 
 _readiness_cache: Dict[str, Any] = {"last_check": 0.0, "result": None}
 _ACTIVE_EXECUTIONS: Dict[str, Tuple[str, Any]] = {}
@@ -426,13 +462,21 @@ async def provision_workspace(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid workspace UUID format")
 
+    _ensure_workspace_root_exists()
     ws_path = os.path.realpath(os.path.join(WORKSPACE_ROOT, canonical_id))
     canonical_root = os.path.realpath(WORKSPACE_ROOT)
     if os.path.commonpath([ws_path, canonical_root]) != canonical_root or ws_path == canonical_root:
         raise HTTPException(status_code=400, detail="Workspace path escapes WORKSPACE_ROOT")
 
     os.makedirs(ws_path, exist_ok=True)
-    return {"status": "ok", "workspace_id": canonical_id, "path": ws_path}
+    ensure_workspace_ownership(ws_path, recursive=True)
+    return {
+        "status": "ok",
+        "workspace_id": canonical_id,
+        "path": ws_path,
+        "uid": SANDBOX_CHILD_UID,
+        "gid": SANDBOX_CHILD_GID,
+    }
 
 
 class CloneRequest(BaseModel):
@@ -467,6 +511,7 @@ async def clone_repository(
     if os.path.commonpath([canonical_ws, canonical_root]) != canonical_root or canonical_ws == canonical_root:
         raise HTTPException(status_code=400, detail="Workspace path escapes WORKSPACE_ROOT")
     os.makedirs(canonical_ws, exist_ok=True)
+    ensure_workspace_ownership(canonical_ws, recursive=True)
 
     from coding.capabilities import verify_and_consume_capability, CapabilityError
     from coding.security import WorkspaceSecurity, SecurityException
@@ -672,6 +717,9 @@ async def execute_command(
                 "output_limit_exceeded": False
             }
         resolved_workspace = canonical_ws
+        if not req.read_only:
+            # Ensure backend-created files inside this workspace are owned/writable by UID/GID 1001
+            ensure_workspace_ownership(resolved_workspace, recursive=True)
     else:
         if is_prod:
             return {

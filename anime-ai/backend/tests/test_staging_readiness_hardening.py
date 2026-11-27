@@ -449,7 +449,7 @@ class TestStagingReadinessHardening(unittest.IsolatedAsyncioTestCase):
             # Execute via DurableTaskWorker
             worker = DurableTaskWorker(worker_id="export_test_worker")
             claimed = worker.claim_next_task()
-            while claimed and claimed.type != "user_data_export":
+            while claimed and (claimed.type != "user_data_export" or (claimed.payload or {}).get("export_id") != export_id):
                 claimed = worker.claim_next_task()
             self.assertIsNotNone(claimed, "Expected durable user_data_export BackgroundTask")
             await worker.execute_task(claimed)
