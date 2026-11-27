@@ -236,15 +236,62 @@ def _load_batch_jobs(db: Session, user_id: uuid.UUID, batch: ImageVariationBatch
     return [by_id[u] for u in uuids if u in by_id]
 
 
-def _assert_fingerprint_matches(existing_batch: ImageVariationBatch, incoming_fp: Optional[str]) -> None:
-    if (
-        incoming_fp
-        and existing_batch.request_fingerprint
-        and existing_batch.request_fingerprint != incoming_fp
-    ):
+def _assert_fingerprint_matches(
+    db: Session,
+    user_id: uuid.UUID,
+    existing_batch: ImageVariationBatch,
+    incoming_fp: Optional[str],
+    incoming_parent_id: Optional[uuid.UUID],
+    incoming_count: int,
+    incoming_conversation_id: Optional[str] = None,
+    incoming_intensity: Optional[str] = None,
+) -> None:
+    """
+    Strictly validates idempotent batch replay parameters against the persisted batch.
+    - Modern batches (request_fingerprint present): require exact SHA-256 fingerprint equality.
+    - Legacy fingerprint-less batches (request_fingerprint IS NULL): enforce compatibility policy
+      by comparing persisted parent_image_id, batch job count, and stored job parameters
+      (conversation_id / intensity). Rejects any mismatch with IdempotencyConflictError (HTTP 409)
+      and backfills request_fingerprint when verified compatible.
+    """
+    if existing_batch.request_fingerprint:
+        if incoming_fp and existing_batch.request_fingerprint != incoming_fp:
+            raise IdempotencyConflictError(
+                "Idempotency key was already used with different image variation parameters."
+            )
+        return
+
+    # Legacy NULL-fingerprint compatibility check (never silently accept mismatched parameters)
+    stored_ids = list(existing_batch.job_ids or [])
+    if incoming_parent_id is not None and existing_batch.parent_image_id != incoming_parent_id:
         raise IdempotencyConflictError(
-            "Idempotency key was already used with different image variation parameters."
+            "Idempotency key was already used with a different parent image."
         )
+    if len(stored_ids) != int(incoming_count):
+        raise IdempotencyConflictError(
+            "Idempotency key was already used with a different variation count."
+        )
+
+    existing_jobs = _load_batch_jobs(db, user_id, existing_batch)
+    if existing_jobs:
+        first_params = existing_jobs[0].parameters or {}
+        stored_conv = str(first_params.get("conversation_id") or "").strip()
+        inc_conv = str(incoming_conversation_id or "").strip()
+        if stored_conv != inc_conv:
+            raise IdempotencyConflictError(
+                "Idempotency key was already used with a different conversation context."
+            )
+        stored_int = str(first_params.get("intensity") or "medium").strip().lower()
+        inc_int = str(incoming_intensity or "medium").strip().lower()
+        if stored_int != inc_int:
+            raise IdempotencyConflictError(
+                "Idempotency key was already used with a different intensity."
+            )
+
+    # Backfill verified fingerprint on legacy row so subsequent replays use direct SHA-256 match
+    if incoming_fp:
+        existing_batch.request_fingerprint = incoming_fp
+        db.commit()
 
 
 def create_batch_image_generation_jobs(
@@ -276,13 +323,26 @@ def create_batch_image_generation_jobs(
 
     clean_fp = request_fingerprint.strip()[:128] if request_fingerprint and request_fingerprint.strip() else None
 
+    first_spec_params = (job_specs[0].get("parameters") or {}) if job_specs else {}
+    inc_conv_id = first_spec_params.get("conversation_id")
+    inc_intensity = first_spec_params.get("intensity")
+
     if clean_idem:
         existing_batch = db.query(ImageVariationBatch).filter(
             ImageVariationBatch.user_id == user_id,
             ImageVariationBatch.idempotency_key == clean_idem,
         ).first()
         if existing_batch:
-            _assert_fingerprint_matches(existing_batch, clean_fp)
+            _assert_fingerprint_matches(
+                db,
+                user_id,
+                existing_batch,
+                clean_fp,
+                parent_image_id,
+                len(job_specs),
+                incoming_conversation_id=inc_conv_id,
+                incoming_intensity=inc_intensity,
+            )
             return _load_batch_jobs(db, user_id, existing_batch), False
 
     now = utc_now()
@@ -343,7 +403,16 @@ def create_batch_image_generation_jobs(
                 ImageVariationBatch.idempotency_key == clean_idem,
             ).first()
             if existing_batch:
-                _assert_fingerprint_matches(existing_batch, clean_fp)
+                _assert_fingerprint_matches(
+                    db,
+                    user_id,
+                    existing_batch,
+                    clean_fp,
+                    parent_image_id,
+                    len(job_specs),
+                    incoming_conversation_id=inc_conv_id,
+                    incoming_intensity=inc_intensity,
+                )
                 return _load_batch_jobs(db, user_id, existing_batch), False
         raise
     except Exception:

@@ -71,33 +71,3 @@ export function createIdempotencyKey(prefix = 'req'): string {
   }
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
 }
-
-export interface ImageVariationRequestOptions {
-  parentImageId: string;
-  count?: number;
-  conversationId?: string;
-  intensity?: string;
-  idempotencyKey: string;
-  accessToken: string;
-}
-
-/**
- * Submits an idempotent image variation batch request preserving the caller's
- * idempotency_key across retries of a single user action.
- */
-export async function requestImageVariation(options: ImageVariationRequestOptions): Promise<Response> {
-  return fetch(apiUrl('/api/v1/images/variation'), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${options.accessToken}`,
-    },
-    body: JSON.stringify({
-      parent_image_id: options.parentImageId,
-      count: options.count ?? 2,
-      conversation_id: options.conversationId,
-      intensity: options.intensity ?? 'medium',
-      idempotency_key: options.idempotencyKey,
-    }),
-  });
-}

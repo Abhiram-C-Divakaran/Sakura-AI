@@ -166,3 +166,13 @@ The repository is deployment-neutral and has no confirmed hosting provider or pu
 9. **Backup Scheduling & Restore Drills:** Scheduled daily `backup_postgres.sh` uploads to off-host encrypted storage plus regular automated `verify_restore.sh` drills with `REQUIRE_CHECKSUM=true` and `REQUIRE_PGVECTOR=true`.
 10. **Support & Legal Review:** Set `NEXT_PUBLIC_SUPPORT_EMAIL` for `/contact` and obtain formal legal counsel review/sign-off on `/privacy` and `/terms` before public launch.
 
+### Pre-Public-Launch Gate (Beyond Private Staging)
+- Independent security assessment / penetration review of auth, multi-tenant isolation, and sandbox egress controls.
+- Load & concurrency testing against staging PostgreSQL, Redis, and worker replicas.
+- Full end-to-end backup + restore drill into a clean staging PostgreSQL 15 instance (`verify_restore.sh` with `REQUIRE_CHECKSUM=true`, `REQUIRE_PGVECTOR=true`, `REQUIRE_RESTORED_VECTOR=true`).
+- User acceptance testing (UAT) covering desktop & mobile chat, Library, Knowledge Base semantic RAG, image generation/quotas, scheduled tasks, Sakura Code, data export, and account deletion.
+
+### Frontend Image Variation Entry-Point Note
+- `GenerateImageModal.tsx` (`LibraryView.tsx`) generates and preserves a retry-stable `idempotency_key` via `createIdempotencyKey('img_gen')` for `POST /api/v1/library/generate-image`.
+- `POST /api/v1/images/variation` enforces required `idempotency_key` (`HTTP 400`), normalized request fingerprint replay (`HTTP 202`, zero extra quota), payload conflict rejection (`HTTP 409`), and legacy `NULL`-fingerprint compatibility validation on the backend. No mounted frontend UI button currently calls `/api/v1/images/variation` (`ImageLightboxModal.tsx` is unmounted), so no dead frontend client helper is shipped.
+

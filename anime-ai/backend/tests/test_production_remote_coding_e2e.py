@@ -1,17 +1,20 @@
 """
 Sakura AI — Production-Mode Remote Sandbox Coding Execution Integration Test
 
-Verifies the complete application Sakura Code workflow running through the REAL
+Verifies the COMPLETE application Sakura Code workflow through the REAL
 remote HTTP Docker sandbox executor (NEVER LocalRestrictedSandboxRuntime):
+UNDERSTAND -> EXPLORE -> PLAN -> IMPLEMENT -> RUN -> TEST -> INSPECT FAILURE -> FIX -> RETEST -> REVIEW DIFF -> DELIVER
+
+Verifies:
 1. Real user registration & JWT auth via FastAPI API
-2. Real coding workspace creation (/api/v1/coding/workspaces)
+2. Real coding workspace creation (/api/v1/coding/workspaces) on shared volume
 3. Real durable coding job submission (/api/v1/coding/workspaces/{id}/tasks)
 4. Real CodingJobWorker claims the job
-5. Worker communicates with real RemoteHttpSandboxRuntime -> sakura-sandbox-executor
-6. Docker child container sees ONLY its assigned /workspace (parent /workspaces absent)
-7. File created inside Docker child is observed on shared /workspaces volume by backend
-8. Test execution runs inside Docker child container and output is persisted
-9. Monotonic CodingTaskEvents are persisted and replayable via HTTP API
+5. Worker's CodingAgent -> CodingToolchain -> SandboxExecutor ACTUALLY instantiates RemoteHttpSandboxRuntime
+6. Docker child container sees ONLY its assigned /workspace (parent /workspaces absent) and ZERO host secrets
+7. Buggy file written -> failing test executed inside Docker child -> patch applied -> passing test re-run -> git diff reviewed
+8. Backend observes the exact fixed file on shared /workspaces volume
+9. Output & monotonic CodingTaskEvents are persisted and replayable via HTTP API
 10. Cancellation & stale-worker lease fencing prevent stale writes
 11. Production mode strictly refuses local sandbox fallback when remote executor URL is missing
 
@@ -22,11 +25,131 @@ import os
 import sys
 import uuid
 import unittest
+from typing import Dict, Any, List, Optional
 from unittest.mock import patch
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 E2E_ENABLED = os.getenv("SAKURA_SANDBOX_E2E", "0") == "1"
+
+
+class _FullLoopCodingTestProvider:
+    """
+    Deterministic LLM adapter exercising the full CodingAgent engineering loop inside
+    the real remote Docker sandbox:
+      Turn 1: write_file (buggy calc.py) + write_file (test_calc.py)
+      Turn 2: run_tests (proves failing test + verifies /workspaces absent & HOST_SENSITIVE_SECRET scrubbed)
+      Turn 3: apply_patch (fixes calc.py)
+      Turn 4: run_tests (retests inside Docker child -> exit 0)
+      Turn 5: git_diff (reviews diff)
+      Turn 6: stop with delivery summary
+    """
+
+    model = "sakura-prod-e2e-deterministic-v1"
+
+    async def tool_turn(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        temperature: float = 0.2,
+        max_tokens: int = 1500,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        tool_msgs = [m for m in (messages or []) if m.get("role") == "tool"]
+        step = len(tool_msgs)
+
+        if step == 0:
+            return {
+                "content": "Implementing calc.py and unit test.",
+                "tool_calls": [
+                    {
+                        "id": "call_1_calc",
+                        "name": "write_file",
+                        "arguments": {
+                            "path": "calc.py",
+                            "content": "def add(a, b):\n    return a - b  # intentional bug\n",
+                        },
+                    },
+                    {
+                        "id": "call_1_test",
+                        "name": "write_file",
+                        "arguments": {
+                            "path": "test_calc.py",
+                            "content": (
+                                "import os\n"
+                                "from calc import add\n"
+                                "assert not os.path.exists('/workspaces'), 'parent /workspaces leaked!'\n"
+                                "assert not os.environ.get('HOST_SENSITIVE_SECRET'), 'host secret leaked!'\n"
+                                "assert add(2, 3) == 5, f'Expected 5, got {add(2, 3)}'\n"
+                                "print('CALC_TESTS_PASSED_IN_DOCKER_CHILD')\n"
+                            ),
+                        },
+                    },
+                ],
+                "finish_reason": "tool_calls",
+            }
+
+        if step == 2:
+            return {
+                "content": "Running initial test suite in remote Docker sandbox.",
+                "tool_calls": [
+                    {
+                        "id": "call_2_run_fail",
+                        "name": "run_tests",
+                        "arguments": {"command": "python3 test_calc.py"},
+                    }
+                ],
+                "finish_reason": "tool_calls",
+            }
+
+        if step == 3:
+            return {
+                "content": "Inspecting failure and patching calc.py.",
+                "tool_calls": [
+                    {
+                        "id": "call_3_patch",
+                        "name": "apply_patch",
+                        "arguments": {
+                            "path": "calc.py",
+                            "target_content": "return a - b  # intentional bug",
+                            "replacement_content": "return a + b",
+                        },
+                    }
+                ],
+                "finish_reason": "tool_calls",
+            }
+
+        if step == 4:
+            return {
+                "content": "Re-running tests inside remote Docker sandbox after fix.",
+                "tool_calls": [
+                    {
+                        "id": "call_4_run_pass",
+                        "name": "run_tests",
+                        "arguments": {"command": "python3 test_calc.py"},
+                    }
+                ],
+                "finish_reason": "tool_calls",
+            }
+
+        if step == 5:
+            return {
+                "content": "Reviewing git diff before delivery.",
+                "tool_calls": [
+                    {
+                        "id": "call_5_diff",
+                        "name": "git_diff",
+                        "arguments": {},
+                    }
+                ],
+                "finish_reason": "tool_calls",
+            }
+
+        return {
+            "content": "Fixed add() in calc.py and verified test_calc.py passes inside the isolated Docker child container.",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        }
 
 
 @unittest.skipUnless(
@@ -61,11 +184,10 @@ class TestProductionRemoteCodingE2E(unittest.IsolatedAsyncioTestCase):
         from fastapi.testclient import TestClient
         from alembic import command
         from alembic.config import Config
-        from database.db import get_db_context, engine
-        from database.models import CodingJob, CodingTask, CodingTaskEvent
+        from database.db import engine
         from coding.job_worker import CodingJobWorker
         from coding.sandbox import RemoteHttpSandboxRuntime
-        from llm.providers.deterministic_test import DeterministicTestProvider
+        from coding.executor import SandboxExecutor
         from main import app
 
         sandbox_url = (
@@ -102,7 +224,15 @@ class TestProductionRemoteCodingE2E(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r_tok.status_code, 200, r_tok.text)
         headers = {"Authorization": f"Bearer {r_tok.json()['access_token']}"}
 
-        # 2. Real workspace creation (provisions directory on shared /workspaces volume)
+        # Spy on SandboxExecutor.runtime to PROVE CodingJobWorker's own CodingAgent actually uses RemoteHttpSandboxRuntime
+        observed_runtimes = []
+        orig_runtime_prop = SandboxExecutor.runtime.fget
+
+        def _spy_runtime(self_exec):
+            rt = orig_runtime_prop(self_exec)
+            observed_runtimes.append(type(rt).__name__)
+            return rt
+
         with patch.dict(
             os.environ,
             {
@@ -112,7 +242,8 @@ class TestProductionRemoteCodingE2E(unittest.IsolatedAsyncioTestCase):
                 "SAKURA_WORKSPACE_ROOT": shared_root,
             },
             clear=False,
-        ):
+        ), patch.object(SandboxExecutor, "runtime", property(_spy_runtime)):
+            # 2. Real workspace creation (provisions via remote executor on shared /workspaces volume)
             r_ws = client.post(
                 "/api/v1/coding/workspaces",
                 headers=headers,
@@ -123,33 +254,14 @@ class TestProductionRemoteCodingE2E(unittest.IsolatedAsyncioTestCase):
             ws_dir = os.path.join(shared_root, ws_id)
             self.assertTrue(os.path.isdir(ws_dir), f"Workspace dir missing on shared volume: {ws_dir}")
 
-            # Ensure executor permissions/readiness on provisioned workspace
-            async with httpx.AsyncClient(timeout=10.0) as hclient:
-                r_prov = await hclient.post(
-                    f"{sandbox_url}/workspaces/{ws_id}",
-                    headers={"X-Sandbox-Token": service_token},
-                )
-                self.assertEqual(r_prov.status_code, 200, r_prov.text)
-
-            # Verify child container sees ONLY /workspace (never parent /workspaces)
-            remote_rt = RemoteHttpSandboxRuntime(
-                workspace_root=ws_dir,
-                service_url=sandbox_url,
-                service_token=service_token,
-                workspace_id=ws_id,
-            )
-            parent_check = await remote_rt.run_command("test ! -e /workspaces && pwd")
-            self.assertTrue(parent_check.get("success"), f"Parent /workspaces leaked inside child: {parent_check}")
-            self.assertEqual(parent_check.get("stdout", "").strip(), "/workspace")
-
             # 3. Real durable coding job submission
             r_task = client.post(
                 f"/api/v1/coding/workspaces/{ws_id}/tasks",
                 headers=headers,
                 json={
-                    "title": "Remote Docker coding verification",
-                    "objective": "Write sakura_fullstack_check.py and run it inside Docker child",
-                    "intensity": "medium",
+                    "title": "Fix add() in calc.py and verify in remote Docker sandbox",
+                    "objective": "Implement calc.py, run failing test, fix bug, retest, and review diff",
+                    "intensity": "high",
                 },
             )
             self.assertIn(r_task.status_code, (200, 202), r_task.text)
@@ -157,13 +269,12 @@ class TestProductionRemoteCodingE2E(unittest.IsolatedAsyncioTestCase):
             task_id = task_body.get("task_id") or task_body.get("taskId") or task_body.get("id")
             self.assertTrue(task_id)
 
-            # 4 & 5. Real CodingJobWorker claims & executes job via REAL RemoteHttpSandboxRuntime
-            #        (injects deterministic LLM provider directly without enabling test provider env flag in production!)
+            # 4 & 5. Real CodingJobWorker claims & executes full write->fail->patch->pass->diff loop via REAL RemoteHttpSandboxRuntime
             worker = CodingJobWorker(worker_id=f"prod_remote_worker_{uuid.uuid4().hex[:6]}")
-            worker.llm_router.providers["deterministic_test"] = DeterministicTestProvider()
-            orig_ordered = worker.llm_router.get_ordered_providers
+            full_loop_provider = _FullLoopCodingTestProvider()
+            worker.llm_router.providers["prod_e2e_loop"] = full_loop_provider
             worker.llm_router.get_ordered_providers = lambda intent="general_chat": [
-                ("deterministic_test", worker.llm_router.providers["deterministic_test"])
+                ("prod_e2e_loop", full_loop_provider)
             ]
 
             claimed = worker.claim_next_job()
@@ -173,29 +284,34 @@ class TestProductionRemoteCodingE2E(unittest.IsolatedAsyncioTestCase):
             ok = await worker.execute_job(claimed)
             self.assertTrue(ok, "CodingJobWorker.execute_job returned False!")
 
-            # 7 & 8. Backend observes the exact file created by CodingAgent inside shared volume
-            created_file = os.path.join(ws_dir, "sakura_fullstack_check.py")
-            self.assertTrue(os.path.isfile(created_file), f"Expected file {created_file} on shared volume!")
-            with open(created_file, "r", encoding="utf-8") as f:
-                self.assertIn("assert add(2, 3) == 5", f.read())
+            # Verify worker ACTUALLY executed through RemoteHttpSandboxRuntime (never LocalRestrictedSandboxRuntime!)
+            self.assertIn("RemoteHttpSandboxRuntime", observed_runtimes)
+            self.assertNotIn("LocalRestrictedSandboxRuntime", observed_runtimes)
 
-            # 9, 10 & 11. Output & monotonic CodingTaskEvents persisted and replayable via HTTP API
+            # 7 & 8. Backend observes the exact fixed file on shared volume
+            calc_path = os.path.join(ws_dir, "calc.py")
+            self.assertTrue(os.path.isfile(calc_path), f"Expected file {calc_path} on shared volume!")
+            with open(calc_path, "r", encoding="utf-8") as f:
+                calc_src = f.read()
+            self.assertIn("return a + b", calc_src)
+            self.assertNotIn("intentional bug", calc_src)
+
+            # 9 & 10. Output & monotonic CodingTaskEvents persisted and replayable via HTTP API
             r_status = client.get(f"/api/v1/coding/tasks/{task_id}", headers=headers)
             self.assertEqual(r_status.status_code, 200, r_status.text)
-            self.assertIn(
-                str(r_status.json().get("status", "")).upper(),
-                ("COMPLETED_VERIFIED", "COMPLETED_UNVERIFIED"),
-            )
+            self.assertEqual(str(r_status.json().get("status", "")).upper(), "COMPLETED_VERIFIED")
 
             r_events = client.get(f"/api/v1/coding/tasks/{task_id}/events", headers=headers)
             self.assertEqual(r_events.status_code, 200, r_events.text)
             events = r_events.json()
-            self.assertGreaterEqual(len(events), 3, f"Expected >=3 persisted CodingTaskEvents, got {events}")
+            self.assertGreaterEqual(len(events), 8, f"Expected >=8 persisted CodingTaskEvents for full loop, got {len(events)}")
             seqs = [e["sequenceNumber"] for e in events]
             self.assertEqual(seqs, sorted(seqs))
             self.assertEqual(len(seqs), len(set(seqs)))
+            all_stdout = "\n".join(str(e.get("stdoutPreview") or e.get("message") or "") for e in events)
+            self.assertIn("CALC_TESTS_PASSED_IN_DOCKER_CHILD", all_stdout)
 
-            # 12. Cancellation & stale-worker lease fencing
+            # 11. Cancellation & stale-worker lease fencing
             r_task2 = client.post(
                 f"/api/v1/coding/workspaces/{ws_id}/tasks",
                 headers=headers,
@@ -207,7 +323,6 @@ class TestProductionRemoteCodingE2E(unittest.IsolatedAsyncioTestCase):
             r_cancel = client.post(f"/api/v1/coding/tasks/{task2_id}/cancel", headers=headers)
             self.assertEqual(r_cancel.status_code, 200, r_cancel.text)
 
-            # Stale worker with wrong attempt ID CANNOT finalize job 1 or job 2
             stale_worker = CodingJobWorker(worker_id="stale_prod_worker")
             finalized_stale = stale_worker._fenced_finalize(
                 job_id=claimed.id,

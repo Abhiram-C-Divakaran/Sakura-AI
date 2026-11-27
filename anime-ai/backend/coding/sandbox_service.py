@@ -64,7 +64,15 @@ SANDBOX_CHILD_GID = int(os.getenv("SAKURA_SANDBOX_GID", "1001"))
 
 def _ensure_workspace_root_exists() -> str:
     os.makedirs(WORKSPACE_ROOT, exist_ok=True)
+    # Ensure shared volume root is owned by UID/GID 1001 (0770) so non-root backend-api
+    # and coding-worker containers can create/read workspace directories without root!
+    ensure_workspace_ownership(WORKSPACE_ROOT, recursive=False)
     return WORKSPACE_ROOT
+
+
+@app.on_event("startup")
+async def _init_sandbox_workspace_root() -> None:
+    _ensure_workspace_root_exists()
 
 
 def ensure_workspace_ownership(ws_path: str, *, recursive: bool = True) -> None:

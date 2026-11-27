@@ -93,31 +93,68 @@ def upgrade() -> None:
             col_meta = bind.execute(
                 sa.text(
                     """
-                    SELECT data_type, udt_name
-                    FROM information_schema.columns
-                    WHERE table_schema = current_schema()
-                      AND table_name = 'document_chunks'
-                      AND column_name = 'embedding'
+                    SELECT
+                        c_info.udt_name,
+                        format_type(a.atttypid, a.atttypmod) AS formatted_type
+                    FROM information_schema.columns c_info
+                    JOIN pg_class cls
+                      ON cls.relname = c_info.table_name
+                    JOIN pg_namespace ns
+                      ON ns.oid = cls.relnamespace AND ns.nspname = c_info.table_schema
+                    JOIN pg_attribute a
+                      ON a.attrelid = cls.oid AND a.attname = c_info.column_name AND NOT a.attisdropped
+                    WHERE c_info.table_schema = current_schema()
+                      AND c_info.table_name = 'document_chunks'
+                      AND c_info.column_name = 'embedding'
                     """
                 )
             ).fetchone()
 
-            if col_meta is not None and col_meta[1] != 'vector':
-                _validate_existing_json_embeddings(bind)
-                op.execute(
-                    sa.text(
-                        """
-                        ALTER TABLE document_chunks
-                        ALTER COLUMN embedding TYPE vector(1536)
-                        USING (
-                            CASE
-                                WHEN embedding IS NULL THEN NULL
-                                ELSE regexp_replace(embedding::jsonb::text, '\\s+', '', 'g')::vector(1536)
-                            END
+            if col_meta is not None:
+                udt_name, formatted_type = col_meta[0], (col_meta[1] or "").strip().lower()
+                if formatted_type == 'vector(1536)':
+                    pass  # Already exact native vector(1536) contract
+                elif udt_name == 'vector':
+                    # Existing vector column with wrong/unconstrained typmod: validate dims before altering!
+                    bad_vecs = bind.execute(
+                        sa.text(
+                            "SELECT id, vector_dims(embedding) FROM document_chunks "
+                            "WHERE embedding IS NOT NULL AND vector_dims(embedding) != 1536 LIMIT 10"
                         )
-                        """
+                    ).fetchall()
+                    if bad_vecs:
+                        details = "; ".join(f"id={r[0]}: dims={r[1]}" for r in bad_vecs)
+                        raise RuntimeError(
+                            f"Cannot alter document_chunks.embedding from '{formatted_type}' to vector(1536): "
+                            f"incompatible existing vector dimensions: {details}."
+                        )
+                    op.execute(
+                        sa.text(
+                            "ALTER TABLE document_chunks "
+                            "ALTER COLUMN embedding TYPE vector(1536)"
+                        )
                     )
-                )
+                elif udt_name in ('json', 'jsonb'):
+                    _validate_existing_json_embeddings(bind)
+                    op.execute(
+                        sa.text(
+                            """
+                            ALTER TABLE document_chunks
+                            ALTER COLUMN embedding TYPE vector(1536)
+                            USING (
+                                CASE
+                                    WHEN embedding IS NULL THEN NULL
+                                    ELSE regexp_replace(embedding::jsonb::text, '\\s+', '', 'g')::vector(1536)
+                                END
+                            )
+                            """
+                        )
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Unsupported existing column type '{formatted_type}' (udt={udt_name}) on "
+                        "document_chunks.embedding; expected json, jsonb, or vector(1536)."
+                    )
 
     # 2. Add request_fingerprint to image_variation_batches (all dialects)
     if insp.has_table('image_variation_batches'):

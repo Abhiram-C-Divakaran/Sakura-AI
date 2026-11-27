@@ -78,6 +78,32 @@ class WorkspaceManager:
             RepositoryWorkspace.user_id == self.user.id
         ).first()
 
+    async def _provision_remote_workspace_if_configured(self, workspace_id: uuid.UUID) -> None:
+        """
+        When a remote sandbox executor is configured, provisions the workspace directory
+        via POST /workspaces/{workspace_id} first so the shared volume receives proper
+        1001:1001 (0770) ownership even on freshly mounted Docker named volumes.
+        """
+        remote_url = (
+            os.getenv("SAKURA_SANDBOX_EXECUTOR_URL") or os.getenv("SAKURA_SANDBOX_URL") or ""
+        ).strip().rstrip("/")
+        if not remote_url:
+            return
+        token = os.getenv("SAKURA_SANDBOX_SERVICE_TOKEN", "").strip()
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    f"{remote_url}/workspaces/{workspace_id}",
+                    headers={"X-Sandbox-Token": token},
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"Remote sandbox workspace provisioning returned HTTP {resp.status_code}: {resp.text[:200]}"
+                    )
+        except Exception as e:
+            logger.warning(f"Remote sandbox workspace provisioning call failed for {workspace_id}: {e}")
+
     async def create_workspace(
         self,
         name: str,
@@ -87,6 +113,7 @@ class WorkspaceManager:
     ) -> Any:
         """Allocates an isolated workspace directory and persists record."""
         workspace_id = uuid.uuid4()
+        await self._provision_remote_workspace_if_configured(workspace_id)
         os.makedirs(self.workspaces_root, exist_ok=True)
         workspace_dir = os.path.realpath(os.path.join(self.workspaces_root, str(workspace_id)))
         if os.path.commonpath([workspace_dir, self.workspaces_root]) != self.workspaces_root or workspace_dir == self.workspaces_root:

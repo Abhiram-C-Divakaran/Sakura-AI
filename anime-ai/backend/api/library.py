@@ -383,16 +383,16 @@ async def delete_library_file(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid file ID")
 
-    docs_svc.delete_document(doc_uuid, current_user.id, db)
+    del_res = docs_svc.delete_document(doc_uuid, current_user.id, db)
 
     from api.routes import ws_manager
-    await ws_manager.send_to_user(str(current_user.id), {
-        "type": "library_update",
-        "action": "deleted",
-        "data": {"id": file_id}
-    })
-
-    return {"status": "deleted", "id": file_id}
+    if del_res.get("deletion_status") == "COMPLETED":
+        await ws_manager.send_to_user(str(current_user.id), {
+            "type": "library_update",
+            "action": "deleted",
+            "data": {"id": file_id}
+        })
+    return {**del_res, "id": file_id}
 
 
 @router.post("/files/{file_id}/index")
