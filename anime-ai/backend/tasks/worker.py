@@ -91,6 +91,7 @@ class DurableTaskWorker:
         self.max_heartbeat_failures = max(1, int(max_heartbeat_failures))
         self._running = False
         self._stop_event: Optional[asyncio.Event] = None
+        self._sync_cancel_event = __import__("threading").Event()
         self.router = LLMRouter()
 
     def recover_stale_tasks(self) -> int:
@@ -471,6 +472,43 @@ class DurableTaskWorker:
                 if in_flight:
                     await asyncio.gather(*list(in_flight), return_exceptions=True)
 
+        async def _outbox_deletion_loop():
+            from services.documents import OUTBOX_WAKEUP_REDIS_KEY
+            iteration = 0
+            while self._running:
+                if max_iterations is not None and iteration >= max_iterations:
+                    break
+                iteration += 1
+                try:
+                    await asyncio.to_thread(
+                        process_storage_deletion_outbox,
+                        limit=25,
+                        worker_id=self.worker_id,
+                        worker_cancel_event=self._sync_cancel_event,
+                    )
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Unexpected error in outbox deletion loop: {e}", exc_info=True)
+                if max_iterations is not None and iteration >= max_iterations:
+                    break
+                # Wake immediately on Redis signal or poll every 1.0s
+                woke = False
+                client = get_sync_redis()
+                if client:
+                    try:
+                        res = await asyncio.to_thread(client.blpop, OUTBOX_WAKEUP_REDIS_KEY, 1)
+                        if res:
+                            woke = True
+                    except Exception:
+                        pass
+                if not woke and self._running:
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+
         async def _maintenance_loop():
             iteration = 0
             while self._running:
@@ -481,7 +519,6 @@ class DurableTaskWorker:
                     self.recover_stale_tasks()
                     if image_worker:
                         image_worker.recover_stale_jobs()
-                    process_storage_deletion_outbox(limit=25, worker_id=self.worker_id)
                     cleanup_expired_exports_and_tokens()
                 except asyncio.CancelledError:
                     break
@@ -495,7 +532,7 @@ class DurableTaskWorker:
                 except asyncio.TimeoutError:
                     pass
 
-        loops = [_background_task_loop(), _maintenance_loop()]
+        loops = [_background_task_loop(), _outbox_deletion_loop(), _maintenance_loop()]
         if image_worker:
             loops.append(image_worker.run(max_iterations=max_iterations))
 
@@ -508,6 +545,7 @@ class DurableTaskWorker:
 
     def stop(self):
         self._running = False
+        self._sync_cancel_event.set()
         if self._stop_event is not None:
             self._stop_event.set()
 

@@ -631,7 +631,7 @@ class SandboxManager:
             )
 
         # Development / Test environments
-        if pref == "remote":
+        if pref in ("remote", "remote_http"):
             if cls.is_service_available():
                 return RemoteHttpSandboxRuntime(
                     workspace_root,

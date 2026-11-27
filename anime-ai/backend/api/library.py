@@ -371,28 +371,34 @@ async def rename_library_file(
     return {"status": "success", "file": serialized}
 
 
-@router.delete("/files/{file_id}")
+@router.delete("/files/{file_id}", status_code=202)
 async def delete_library_file(
     file_id: str,
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Deletes real file from storage and database."""
+    """
+    Authoritative asynchronous document deletion endpoint:
+    Marks Document as DELETING, creates/reuses a durable StorageDeletionOutbox entry without
+    ever stealing an active PROCESSING claim, notifies the outbox worker, and returns HTTP 202.
+    Physical storage deletion, DB row removal, and `library_update: deleted` broadcast happen
+    strictly inside the lease-fenced outbox worker after physical storage deletion succeeds.
+    """
     try:
         doc_uuid = uuid.UUID(file_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid file ID")
 
-    del_res = docs_svc.delete_document(doc_uuid, current_user.id, db)
+    del_res = docs_svc.request_document_deletion(doc_uuid, current_user.id, db)
 
     from api.routes import ws_manager
-    if del_res.get("deletion_status") == "COMPLETED":
+    if del_res.get("file"):
         await ws_manager.send_to_user(str(current_user.id), {
             "type": "library_update",
-            "action": "deleted",
-            "data": {"id": file_id}
+            "action": "updated",
+            "data": del_res["file"],
         })
-    return {**del_res, "id": file_id}
+    return del_res
 
 
 @router.post("/files/{file_id}/index")

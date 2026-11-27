@@ -205,7 +205,7 @@ class TestProductionRemoteCodingE2E(unittest.IsolatedAsyncioTestCase):
 
         # Ensure DB schema is migrated to head
         cfg = Config("alembic.ini")
-        cfg.set_main_option("sqlalchemy.url", str(engine.url))
+        cfg.set_main_option("sqlalchemy.url", engine.url.render_as_string(hide_password=False))
         command.upgrade(cfg, "head")
 
         client = TestClient(app)
@@ -269,32 +269,74 @@ class TestProductionRemoteCodingE2E(unittest.IsolatedAsyncioTestCase):
             task_id = task_body.get("task_id") or task_body.get("taskId") or task_body.get("id")
             self.assertTrue(task_id)
 
-            # 4 & 5. Real CodingJobWorker claims & executes full write->fail->patch->pass->diff loop via REAL RemoteHttpSandboxRuntime
-            worker = CodingJobWorker(worker_id=f"prod_remote_worker_{uuid.uuid4().hex[:6]}")
-            full_loop_provider = _FullLoopCodingTestProvider()
-            worker.llm_router.providers["prod_e2e_loop"] = full_loop_provider
-            worker.llm_router.get_ordered_providers = lambda intent="general_chat": [
-                ("prod_e2e_loop", full_loop_provider)
-            ]
+            # 4 & 5. Real separate durable CodingJobWorker process (or in-process fallback if standalone)
+            external_worker = os.getenv("SAKURA_EXTERNAL_CODING_WORKER", "0").strip() == "1"
+            if external_worker:
+                # Poll real PostgreSQL / API while the separate coding-worker container executes the full TDD loop
+                import asyncio
+                deadline = asyncio.get_running_loop().time() + 45.0
+                final_status_body = None
+                while asyncio.get_running_loop().time() < deadline:
+                    r_poll = client.get(f"/api/v1/coding/tasks/{task_id}", headers=headers)
+                    self.assertEqual(r_poll.status_code, 200, r_poll.text)
+                    st = str(r_poll.json().get("status", "")).upper()
+                    if st in ("COMPLETED_VERIFIED", "COMPLETED_UNVERIFIED", "FAILED", "CANCELLED"):
+                        final_status_body = r_poll.json()
+                        break
+                    await asyncio.sleep(0.4)
+                self.assertIsNotNone(final_status_body, "Separate coding-worker container did not complete task within 45s!")
+                self.assertEqual(
+                    str(final_status_body.get("status", "")).upper(),
+                    "COMPLETED_VERIFIED",
+                    f"Expected COMPLETED_VERIFIED from separate coding worker, got: {final_status_body}",
+                )
 
-            claimed = worker.claim_next_job()
-            self.assertIsNotNone(claimed, "CodingJobWorker failed to claim durable job!")
-            self.assertEqual(str(claimed.task_id), str(task_id))
+                # Backend observes the exact fixed file created & patched by the separate worker on shared /workspaces volume
+                check_path = os.path.join(ws_dir, "sakura_fullstack_check.py")
+                self.assertTrue(os.path.isfile(check_path), f"Expected file {check_path} on shared volume!")
+                with open(check_path, "r", encoding="utf-8") as f:
+                    fixed_src = f.read()
+                self.assertIn("return a + b", fixed_src)
+                self.assertNotIn("intentional bug", fixed_src)
+                expected_marker = "SAKURA_REMOTE_DOCKER_TESTS_PASSED"
 
-            ok = await worker.execute_job(claimed)
-            self.assertTrue(ok, "CodingJobWorker.execute_job returned False!")
+                # Load persisted CodingJob row from DB for stale-worker fencing assertion below
+                from database.db import get_db_context
+                from database.models import CodingJob
+                with get_db_context() as db_chk:
+                    claimed = db_chk.query(CodingJob).filter(CodingJob.task_id == str(task_id)).first()
+                    self.assertIsNotNone(claimed)
+                    self.assertIsNotNone(claimed.worker_id)
+                    self.assertNotEqual(claimed.worker_id, "")
+                    claimed_id = claimed.id
+            else:
+                worker = CodingJobWorker(worker_id=f"prod_remote_worker_{uuid.uuid4().hex[:6]}")
+                full_loop_provider = _FullLoopCodingTestProvider()
+                worker.llm_router.providers["prod_e2e_loop"] = full_loop_provider
+                worker.llm_router.get_ordered_providers = lambda intent="general_chat": [
+                    ("prod_e2e_loop", full_loop_provider)
+                ]
 
-            # Verify worker ACTUALLY executed through RemoteHttpSandboxRuntime (never LocalRestrictedSandboxRuntime!)
-            self.assertIn("RemoteHttpSandboxRuntime", observed_runtimes)
-            self.assertNotIn("LocalRestrictedSandboxRuntime", observed_runtimes)
+                claimed = worker.claim_next_job()
+                self.assertIsNotNone(claimed, "CodingJobWorker failed to claim durable job!")
+                self.assertEqual(str(claimed.task_id), str(task_id))
+                claimed_id = claimed.id
 
-            # 7 & 8. Backend observes the exact fixed file on shared volume
-            calc_path = os.path.join(ws_dir, "calc.py")
-            self.assertTrue(os.path.isfile(calc_path), f"Expected file {calc_path} on shared volume!")
-            with open(calc_path, "r", encoding="utf-8") as f:
-                calc_src = f.read()
-            self.assertIn("return a + b", calc_src)
-            self.assertNotIn("intentional bug", calc_src)
+                ok = await worker.execute_job(claimed)
+                self.assertTrue(ok, "CodingJobWorker.execute_job returned False!")
+
+                # Verify worker ACTUALLY executed through RemoteHttpSandboxRuntime (never LocalRestrictedSandboxRuntime!)
+                self.assertIn("RemoteHttpSandboxRuntime", observed_runtimes)
+                self.assertNotIn("LocalRestrictedSandboxRuntime", observed_runtimes)
+
+                # 7 & 8. Backend observes the exact fixed file on shared volume
+                calc_path = os.path.join(ws_dir, "calc.py")
+                self.assertTrue(os.path.isfile(calc_path), f"Expected file {calc_path} on shared volume!")
+                with open(calc_path, "r", encoding="utf-8") as f:
+                    calc_src = f.read()
+                self.assertIn("return a + b", calc_src)
+                self.assertNotIn("intentional bug", calc_src)
+                expected_marker = "CALC_TESTS_PASSED_IN_DOCKER_CHILD"
 
             # 9 & 10. Output & monotonic CodingTaskEvents persisted and replayable via HTTP API
             r_status = client.get(f"/api/v1/coding/tasks/{task_id}", headers=headers)
@@ -309,7 +351,7 @@ class TestProductionRemoteCodingE2E(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(seqs, sorted(seqs))
             self.assertEqual(len(seqs), len(set(seqs)))
             all_stdout = "\n".join(str(e.get("stdoutPreview") or e.get("message") or "") for e in events)
-            self.assertIn("CALC_TESTS_PASSED_IN_DOCKER_CHILD", all_stdout)
+            self.assertIn(expected_marker, all_stdout)
 
             # 11. Cancellation & stale-worker lease fencing
             r_task2 = client.post(
@@ -325,7 +367,7 @@ class TestProductionRemoteCodingE2E(unittest.IsolatedAsyncioTestCase):
 
             stale_worker = CodingJobWorker(worker_id="stale_prod_worker")
             finalized_stale = stale_worker._fenced_finalize(
-                job_id=claimed.id,
+                job_id=claimed_id,
                 task_id=str(task_id),
                 attempt_id=uuid.uuid4(),
                 new_status="FAILED",

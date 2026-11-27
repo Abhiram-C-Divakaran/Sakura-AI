@@ -261,8 +261,14 @@ def _assert_fingerprint_matches(
             )
         return
 
-    # Legacy NULL-fingerprint compatibility check (never silently accept mismatched parameters)
+    # Legacy NULL-fingerprint compatibility check:
+    # NEVER silently accept an unverifiable legacy record!
     stored_ids = list(existing_batch.job_ids or [])
+    if existing_batch.parent_image_id is None:
+        raise IdempotencyConflictError(
+            "Legacy variation batch cannot be safely verified (missing parent image reference); "
+            "please retry with a new idempotency key."
+        )
     if incoming_parent_id is not None and existing_batch.parent_image_id != incoming_parent_id:
         raise IdempotencyConflictError(
             "Idempotency key was already used with a different parent image."
@@ -273,20 +279,25 @@ def _assert_fingerprint_matches(
         )
 
     existing_jobs = _load_batch_jobs(db, user_id, existing_batch)
-    if existing_jobs:
-        first_params = existing_jobs[0].parameters or {}
-        stored_conv = str(first_params.get("conversation_id") or "").strip()
-        inc_conv = str(incoming_conversation_id or "").strip()
-        if stored_conv != inc_conv:
-            raise IdempotencyConflictError(
-                "Idempotency key was already used with a different conversation context."
-            )
-        stored_int = str(first_params.get("intensity") or "medium").strip().lower()
-        inc_int = str(incoming_intensity or "medium").strip().lower()
-        if stored_int != inc_int:
-            raise IdempotencyConflictError(
-                "Idempotency key was already used with a different intensity."
-            )
+    if not existing_jobs or len(existing_jobs) != len(stored_ids):
+        raise IdempotencyConflictError(
+            "Legacy variation batch cannot be safely verified from stored job records; "
+            "please retry with a new idempotency key."
+        )
+
+    first_params = existing_jobs[0].parameters or {}
+    stored_conv = str(first_params.get("conversation_id") or "").strip()
+    inc_conv = str(incoming_conversation_id or "").strip()
+    if stored_conv != inc_conv:
+        raise IdempotencyConflictError(
+            "Idempotency key was already used with a different conversation context."
+        )
+    stored_int = str(first_params.get("intensity") or "medium").strip().lower()
+    inc_int = str(incoming_intensity or "medium").strip().lower()
+    if stored_int != inc_int:
+        raise IdempotencyConflictError(
+            "Idempotency key was already used with a different intensity."
+        )
 
     # Backfill verified fingerprint on legacy row so subsequent replays use direct SHA-256 match
     if incoming_fp:

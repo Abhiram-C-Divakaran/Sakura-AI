@@ -37,6 +37,29 @@ from services.upload import save_uploaded_file, get_file_category
 logger = logging.getLogger("sakura.services.documents")
 
 OUTBOX_LEASE_DURATION_SECONDS = 120
+OUTBOX_WAKEUP_REDIS_KEY = "sakura:outbox:wakeup"
+
+
+def notify_outbox_worker(outbox_id: uuid.UUID) -> bool:
+    """Best-effort Redis wakeup signal so DurableTaskWorker processes pending deletions immediately."""
+    try:
+        import redis as sync_redis
+        client = sync_redis.from_url(
+            os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+            decode_responses=True,
+            socket_connect_timeout=0.2,
+            socket_timeout=0.3,
+        )
+        try:
+            client.rpush(OUTBOX_WAKEUP_REDIS_KEY, str(outbox_id))
+            return True
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+    except Exception:
+        return False
 
 
 def serialize_document(doc: Document) -> Dict[str, Any]:
@@ -49,6 +72,7 @@ def serialize_document(doc: Document) -> Dict[str, Any]:
     is_kb = bool(doc.is_knowledge_base)
     idx_status = doc.indexing_status or DocumentIndexingStatus.NOT_INDEXED
     size_bytes = doc.storage_size if doc.storage_size is not None else meta.get("size", 0)
+    del_status = getattr(doc, "deletion_status", None) or "ACTIVE"
 
     return {
         "id": str(doc.id),
@@ -59,6 +83,8 @@ def serialize_document(doc: Document) -> Dict[str, Any]:
         "source": meta.get("source", "upload"),
         "status": idx_status,
         "indexing_status": idx_status,
+        "deletion_status": del_status,
+        "deletion_error": meta.get("deletion_error"),
         "size_bytes": size_bytes,
         "size": size_bytes,
         "is_knowledge_base": is_kb,
@@ -279,6 +305,7 @@ def _delete_physical_object(
     storage_key: Optional[str],
     legacy_path: Optional[str] = None,
     storage_override=None,
+    timeout_seconds: Optional[float] = None,
 ) -> tuple[bool, Optional[str]]:
     """
     Deletes an object from StorageBackend (and legacy local path if distinct).
@@ -288,7 +315,15 @@ def _delete_physical_object(
     storage = storage_override or get_storage_backend(storage_backend_name or "local")
     if storage_key:
         try:
-            deleted = storage.delete(storage_key)
+            if timeout_seconds is not None:
+                import inspect
+                sig = inspect.signature(storage.delete)
+                if "timeout_seconds" in sig.parameters:
+                    deleted = storage.delete(storage_key, timeout_seconds=timeout_seconds)
+                else:
+                    deleted = storage.delete(storage_key)
+            else:
+                deleted = storage.delete(storage_key)
             if not deleted:
                 return False, f"Storage backend '{storage.backend_type}' returned False deleting '{storage_key}'"
         except Exception as e:
@@ -305,34 +340,21 @@ def _delete_physical_object(
     return True, None
 
 
-def delete_document(
+def request_document_deletion(
     doc_id: uuid.UUID,
     user_id: uuid.UUID,
     db: Session,
-    *,
-    storage_override=None,
-    raise_on_storage_error: bool = True,
-    lease_seconds: float = OUTBOX_LEASE_DURATION_SECONDS,
-    renew_interval: Optional[float] = None,
-    operation_timeout_seconds: float = 120.0,
-    timeout_grace_seconds: float = 2.0,
 ) -> Dict[str, Any]:
     """
-    Unified, lease-safe durable document deletion lifecycle shared with the background outbox worker:
-    1. Transaction 1: Verify ownership, bump index_generation, cancel queued/running document_index
-       tasks, mark doc.deletion_status='DELETING', recover any expired claim on an existing outbox
-       row, and create (or reuse) a non-completed StorageDeletionOutbox row WITHOUT ever stealing
-       or overwriting an unexpired PROCESSING claim.
-    2. Atomic Claim: Attempt conditional claim via claim_specific_outbox_entry(). If another API
-       request or background worker already holds an unexpired PROCESSING lease, do NOT run a
-       duplicate physical deletion — return an honest idempotent 'deleting' response.
-    3. Physical Deletion: Execute through the exact same lease-renewing, timeout-safe runner
-       used by process_storage_deletion_outbox().
-    4. Fenced Finalization: Finalize strictly via finalize_claimed_outbox_entry() fenced by
-       (outbox_id, PROCESSING, worker_id, claim_token, unexpired lease).
-       - On storage success + valid lease: atomically delete GeneratedImage + Document and mark COMPLETED.
-       - On storage failure + valid lease: retain Document with deletion_status='DELETE_FAILED' + backoff.
-       - On lease loss/expiry: perform zero DB writes and never delete DB rows!
+    Authoritative asynchronous document deletion request (preferred API lifecycle):
+    1. Verifies user ownership.
+    2. Atomically bumps index_generation, removes from KB, marks deletion_status='DELETING',
+       clears any prior deletion_error, and cancels active document_index tasks.
+    3. Creates or reuses a durable non-completed StorageDeletionOutbox entry WITHOUT ever
+       stealing or overwriting an unexpired PROCESSING claim.
+    4. Wakes the background outbox worker via Redis and returns an honest async payload.
+    Physical deletion, DB row removal, and `library_update: deleted` broadcasts happen strictly
+    in the lease-fenced outbox worker after physical storage deletion succeeds.
     """
     doc = db.query(Document).filter(Document.id == doc_id, Document.user_id == user_id).first()
     if not doc:
@@ -343,10 +365,12 @@ def delete_document(
     storage_key = doc.storage_key
     legacy_path = doc.storage_path if (doc.storage_path and doc.storage_path != storage_key) else None
 
-    # Step 1: Record durable deletion intent & cancel in-flight indexing atomically
     doc.index_generation = (getattr(doc, "index_generation", 0) or 0) + 1
     doc.is_knowledge_base = False
     doc.deletion_status = "DELETING"
+    meta = dict(doc.metadata_json or {})
+    meta.pop("deletion_error", None)
+    doc.metadata_json = meta
 
     active_index_tasks = db.query(BackgroundTask).filter(
         BackgroundTask.user_id == user_id,
@@ -361,12 +385,12 @@ def delete_document(
             t.completed_at = now
             cancelled_tasks += 1
 
-    # Recover any expired stale claim on this document before inspecting existing outbox state
     outbox = db.query(StorageDeletionOutbox).filter(
         StorageDeletionOutbox.document_id == doc.id,
         StorageDeletionOutbox.status != "COMPLETED",
     ).first()
 
+    already_in_progress = False
     if not outbox:
         outbox = StorageDeletionOutbox(
             id=uuid.uuid4(),
@@ -389,25 +413,72 @@ def delete_document(
     else:
         outbox_id = outbox.id
         # NEVER steal or overwrite an active unexpired PROCESSING claim!
-        if outbox.status == "PENDING":
+        if outbox.status == "PROCESSING":
+            lease_exp = outbox.lease_expires_at
+            if lease_exp is not None:
+                if lease_exp.tzinfo is None:
+                    lease_exp = lease_exp.replace(tzinfo=timezone.utc)
+                if lease_exp > now:
+                    already_in_progress = True
+        elif outbox.status == "PENDING":
             outbox.next_retry_at = now
             outbox.updated_at = now
         elif outbox.status == "FAILED":
-            # Explicit user retry of a previously exhausted FAILED deletion re-arms PENDING cleanly
             outbox.status = "PENDING"
             outbox.attempt_count = 0
             outbox.worker_id = None
             outbox.claim_token = None
             outbox.claimed_at = None
             outbox.lease_expires_at = None
+            outbox.last_error = None
             outbox.next_retry_at = now
             outbox.updated_at = now
         db.commit()
 
+    db.refresh(doc)
+    serialized = serialize_document(doc)
+    if not already_in_progress:
+        notify_outbox_worker(outbox_id)
+
+    return {
+        "status": "deleting",
+        "deletion_status": "DELETING",
+        "id": str(doc.id),
+        "outbox_id": str(outbox_id),
+        "cancelled_index_tasks": cancelled_tasks,
+        "already_in_progress": already_in_progress,
+        "file": serialized,
+    }
+
+
+def delete_document(
+    doc_id: uuid.UUID,
+    user_id: uuid.UUID,
+    db: Session,
+    *,
+    storage_override=None,
+    raise_on_storage_error: bool = True,
+    lease_seconds: float = OUTBOX_LEASE_DURATION_SECONDS,
+    renew_interval: Optional[float] = None,
+    operation_timeout_seconds: float = 120.0,
+    timeout_grace_seconds: float = 2.0,
+    use_subprocess: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """
+    Synchronous compatibility wrapper over the EXACT same authoritative deletion lifecycle:
+    1. Calls request_document_deletion() to record durable DELETING intent + outbox row.
+    2. Recovers only expired claims and attempts conditional claim via claim_specific_outbox_entry().
+    3. Executes physical deletion through _run_leased_outbox_deletion() with lease renewal,
+       bounded termination/quarantine, and fenced finalization.
+    """
+    req_res = request_document_deletion(doc_id, user_id, db)
+    outbox_id = uuid.UUID(req_res["outbox_id"])
+    cancelled_tasks = req_res["cancelled_index_tasks"]
+
     # Recover only if an existing PROCESSING claim has actually expired
     recover_stale_outbox_claims(db)
 
-    # Step 2: Atomically acquire lease ownership through the same CAS/SKIP LOCKED claim path
+    # Atomically acquire lease ownership through the same CAS/SKIP LOCKED claim path
     sync_worker_id = f"api_sync_{os.getpid()}_{uuid.uuid4().hex[:8]}"
     entry = claim_specific_outbox_entry(
         session=db,
@@ -436,7 +507,7 @@ def delete_document(
             "already_in_progress": True,
         }
 
-    # Step 3 & 4: Execute physical deletion under lease renewal & timeout safety, then finalize fenced
+    # Execute physical deletion under lease renewal & timeout safety, then finalize fenced
     run_res = _run_leased_outbox_deletion(
         session=db,
         entry=entry,
@@ -446,6 +517,7 @@ def delete_document(
         renew_interval=renew_interval,
         operation_timeout_seconds=operation_timeout_seconds,
         timeout_grace_seconds=timeout_grace_seconds,
+        use_subprocess=use_subprocess,
     )
     outcome = run_res["outcome"]
     err_msg = run_res.get("error")
@@ -460,7 +532,6 @@ def delete_document(
         }
 
     if outcome == "stale":
-        # Ownership was lost or lease expired before finalization: zero DB writes performed
         if raise_on_storage_error:
             raise HTTPException(
                 status_code=409,
@@ -712,7 +783,11 @@ def claim_storage_deletion_outbox_entries(
     return claimed
 
 
-def _execute_outbox_physical_deletion(entry: Dict[str, Any], storage_override=None) -> tuple[bool, Optional[str]]:
+def _execute_outbox_physical_deletion(
+    entry: Dict[str, Any],
+    storage_override=None,
+    timeout_seconds: Optional[float] = None,
+) -> tuple[bool, Optional[str]]:
     """Performs the physical storage/workspace deletion described by a claimed outbox snapshot."""
     skey = entry.get("storage_key") or ""
     backend = entry.get("storage_backend") or "local"
@@ -755,6 +830,7 @@ def _execute_outbox_physical_deletion(entry: Dict[str, Any], storage_override=No
             storage_key=None,
             legacy_path=lpath,
             storage_override=storage_override,
+            timeout_seconds=timeout_seconds,
         )
 
     return _delete_physical_object(
@@ -762,6 +838,7 @@ def _execute_outbox_physical_deletion(entry: Dict[str, Any], storage_override=No
         storage_key=skey if not skey.startswith("document:") else None,
         legacy_path=lpath,
         storage_override=storage_override,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -955,6 +1032,24 @@ def finalize_claimed_outbox_entry(
                 session.delete(doc_rec)
         session.commit()
         session.expire_all()
+
+        # Broadcast completed deletion ONLY AFTER physical deletion AND DB commit succeeded!
+        if entry.get("document_id") and entry.get("user_id"):
+            try:
+                from realtime.manager import publish_user_realtime_event_sync
+                publish_user_realtime_event_sync(
+                    str(entry["user_id"]),
+                    {
+                        "type": "library_update",
+                        "action": "deleted",
+                        "data": {
+                            "id": str(entry["document_id"]),
+                            "deletion_status": "COMPLETED",
+                        },
+                    },
+                )
+            except Exception:
+                pass
         return "completed"
 
     if next_attempts >= max_att:
@@ -985,14 +1080,225 @@ def finalize_claimed_outbox_entry(
         session.rollback()
         return "stale"
 
+    failed_doc_payload = None
     if entry.get("document_id"):
         doc_rec = session.query(Document).filter(Document.id == entry["document_id"]).first()
         if doc_rec:
             doc_rec.deletion_status = "DELETE_FAILED"
             doc_rec.metadata_json = {**(doc_rec.metadata_json or {}), "deletion_error": err_msg}
+            failed_doc_payload = serialize_document(doc_rec)
     session.commit()
     session.expire_all()
+
+    if failed_doc_payload and entry.get("user_id"):
+        try:
+            from realtime.manager import publish_user_realtime_event_sync
+            publish_user_realtime_event_sync(
+                str(entry["user_id"]),
+                {
+                    "type": "library_update",
+                    "action": "updated",
+                    "data": failed_doc_payload,
+                },
+            )
+        except Exception:
+            pass
     return outcome
+
+
+def _run_leased_outbox_deletion_subprocess(
+    session: Session,
+    entry: Dict[str, Any],
+    worker_id: str,
+    *,
+    effective_lease: float,
+    effective_renew: float,
+    effective_timeout: float,
+    effective_grace: float,
+    worker_cancel_event=None,
+    subprocess_test_delay_seconds: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Executes physical storage deletion inside a killable isolated OS subprocess
+    (`python -m services.storage_delete_runner`) while periodically renewing the DB lease.
+    On timeout, lease loss, or worker cancellation: terminates -> kills -> reaps the OS
+    subprocess definitively before returning, guaranteeing zero uncontrolled storage mutation.
+    """
+    import json
+    import sys
+    import time
+    import subprocess
+
+    serializable_entry = {
+        "id": str(entry.get("id") or ""),
+        "user_id": str(entry.get("user_id") or ""),
+        "document_id": str(entry.get("document_id") or "") if entry.get("document_id") else None,
+        "storage_backend": entry.get("storage_backend") or "local",
+        "storage_key": entry.get("storage_key") or "",
+        "legacy_path": entry.get("legacy_path"),
+    }
+    stdin_payload = json.dumps(
+        {
+            "entry": serializable_entry,
+            "timeout_seconds": effective_timeout,
+            "test_delay_seconds": subprocess_test_delay_seconds,
+        }
+    )
+
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "services.storage_delete_runner"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=backend_dir,
+    )
+    if proc.stdin is not None:
+        try:
+            proc.stdin.write(stdin_payload)
+            proc.stdin.close()
+        except Exception:
+            pass
+
+    def _terminate_and_reap():
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=effective_grace)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5.0)
+                except Exception:
+                    pass
+
+    start_mono = time.monotonic()
+    last_renew_mono = start_mono
+    renewals = 0
+    lease_lost = False
+    timed_out = False
+    cancelled = False
+
+    try:
+        while proc.poll() is None:
+            if worker_cancel_event is not None and worker_cancel_event.is_set():
+                cancelled = True
+                break
+            elapsed = time.monotonic() - start_mono
+            remaining = effective_timeout - elapsed
+            if remaining <= 0:
+                timed_out = True
+                break
+            wait_slice = min(effective_renew, remaining, 0.15)
+            try:
+                proc.wait(timeout=wait_slice)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+
+            now_mono = time.monotonic()
+            if now_mono - last_renew_mono >= effective_renew * 0.9:
+                renewed = renew_outbox_claim_lease(
+                    session=session,
+                    entry_id=entry["id"],
+                    worker_id=worker_id,
+                    claim_token=entry["claim_token"],
+                    lease_seconds=effective_lease,
+                )
+                if not renewed:
+                    lease_lost = True
+                    break
+                renewals += 1
+                last_renew_mono = now_mono
+
+        if lease_lost:
+            _terminate_and_reap()
+            return {
+                "outcome": "stale",
+                "renewals": renewals,
+                "error": "Lease ownership lost during deletion; subprocess terminated",
+                "subprocess_terminated": True,
+            }
+
+        if cancelled:
+            _terminate_and_reap()
+            # Subprocess is definitively dead; release claim back to PENDING under fence for immediate retry
+            step_now = utc_now()
+            session.query(StorageDeletionOutbox).filter(
+                StorageDeletionOutbox.id == entry["id"],
+                StorageDeletionOutbox.status == "PROCESSING",
+                StorageDeletionOutbox.worker_id == worker_id,
+                StorageDeletionOutbox.claim_token == entry["claim_token"],
+            ).update(
+                {
+                    StorageDeletionOutbox.status: "PENDING",
+                    StorageDeletionOutbox.worker_id: None,
+                    StorageDeletionOutbox.claim_token: None,
+                    StorageDeletionOutbox.claimed_at: None,
+                    StorageDeletionOutbox.lease_expires_at: None,
+                    StorageDeletionOutbox.next_retry_at: step_now,
+                    StorageDeletionOutbox.last_error: "Worker cancelled before deletion completed",
+                    StorageDeletionOutbox.updated_at: step_now,
+                },
+                synchronize_session=False,
+            )
+            session.commit()
+            session.expire_all()
+            return {
+                "outcome": "cancelled",
+                "renewals": renewals,
+                "error": "Worker cancelled before deletion completed",
+                "subprocess_terminated": True,
+            }
+
+        if timed_out:
+            _terminate_and_reap()
+            timeout_err = f"Storage deletion subprocess timed out after {effective_timeout:.2f}s and was terminated"
+            outcome = finalize_claimed_outbox_entry(session, entry, worker_id, False, timeout_err)
+            return {
+                "outcome": outcome,
+                "renewals": renewals,
+                "error": timeout_err,
+                "subprocess_terminated": True,
+            }
+
+        stdout_data = proc.stdout.read() if proc.stdout else ""
+        stderr_data = proc.stderr.read() if proc.stderr else ""
+        ok_val = False
+        err_val = None
+        parsed = None
+        for line in reversed(stdout_data.splitlines()):
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    parsed = json.loads(line)
+                    break
+                except Exception:
+                    pass
+        if parsed is not None:
+            ok_val = bool(parsed.get("ok"))
+            err_val = parsed.get("error")
+        else:
+            ok_val = False
+            err_val = (stderr_data.strip() or f"Deletion subprocess exited with code {proc.returncode}")[:500]
+
+        outcome = finalize_claimed_outbox_entry(session, entry, worker_id, ok_val, err_val)
+        return {"outcome": outcome, "renewals": renewals, "error": err_val, "subprocess_terminated": False}
+    finally:
+        _terminate_and_reap()
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
 
 
 def _run_leased_outbox_deletion(
@@ -1005,39 +1311,62 @@ def _run_leased_outbox_deletion(
     renew_interval: Optional[float] = None,
     operation_timeout_seconds: float = 300.0,
     timeout_grace_seconds: float = 2.0,
+    worker_cancel_event=None,
+    use_subprocess: Optional[bool] = None,
+    subprocess_test_delay_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Unified lease-renewing, timeout-safe executor for a claimed outbox entry.
-    - Runs physical deletion in a single dedicated daemon thread with cooperative cancel_event.
-    - Renews the DB lease periodically on the caller's thread while deletion runs.
-    - If lease renewal fails: signals cancel_event and aborts immediately ('stale') with zero DB writes.
-    - If operation_timeout_seconds expires: signals cancel_event and waits up to timeout_grace_seconds
-      for the operation to stop cleanly:
-        * If it stops cleanly -> finalizes via fenced retry/failed transition.
-        * If it is STILL running (stuck I/O) -> keeps ownership quarantined in PROCESSING with an
-          error note rather than releasing back to PENDING immediately, preventing concurrent duplicate
-          physical deletion while the timed-out operation winds down!
+    - When `use_subprocess` is enabled (default for standard storage backends when no in-process
+      `storage_override` is injected and `SAKURA_OUTBOX_SUBPROCESS != "0"`): runs physical
+      deletion inside a killable isolated OS subprocess so timeout, lease loss, or worker
+      cancellation definitively terminates the operation (`SIGTERM` -> `SIGKILL` + `wait()`).
+    - When running in-process (custom `storage_override` or `use_subprocess=False`): runs on a
+      single thread with cooperative `cancel_event`, periodic lease renewal, immediate abort on
+      lease loss (`stale`, zero DB writes), and exclusive `PROCESSING` quarantine if uninterruptible
+      I/O is still running after grace so no concurrent second worker can race it.
     """
     import time
     import threading
 
     effective_lease = max(0.2, float(lease_seconds))
     effective_renew = float(renew_interval) if renew_interval is not None else max(0.05, effective_lease * 0.4)
-    effective_timeout = max(effective_lease, float(operation_timeout_seconds))
+    effective_timeout = max(0.05, float(operation_timeout_seconds))
     effective_grace = max(0.05, float(timeout_grace_seconds))
+
+    should_use_subprocess = (
+        bool(use_subprocess)
+        if use_subprocess is not None
+        else (storage_override is None and os.getenv("SAKURA_OUTBOX_SUBPROCESS", "1").strip() != "0")
+    )
+    if should_use_subprocess and storage_override is None:
+        return _run_leased_outbox_deletion_subprocess(
+            session=session,
+            entry=entry,
+            worker_id=worker_id,
+            effective_lease=effective_lease,
+            effective_renew=effective_renew,
+            effective_timeout=effective_timeout,
+            effective_grace=effective_grace,
+            worker_cancel_event=worker_cancel_event,
+            subprocess_test_delay_seconds=subprocess_test_delay_seconds,
+        )
 
     cancel_event = threading.Event()
     result_box: Dict[str, Any] = {"done": False, "ok": False, "error": None}
 
     def _target():
         try:
-            # Support cancel-aware storage adapters cooperatively while remaining compatible with standard ones
             if storage_override is not None and hasattr(storage_override, "set_cancel_event"):
                 try:
                     storage_override.set_cancel_event(cancel_event)
                 except Exception:
                     pass
-            ok_val, err_val = _execute_outbox_physical_deletion(entry, storage_override=storage_override)
+            ok_val, err_val = _execute_outbox_physical_deletion(
+                entry,
+                storage_override=storage_override,
+                timeout_seconds=effective_timeout,
+            )
             result_box["ok"] = ok_val
             result_box["error"] = err_val
         except Exception as exc:
@@ -1056,16 +1385,21 @@ def _run_leased_outbox_deletion(
     renewals = 0
     lease_lost = False
     timed_out = False
+    cancelled = False
 
     worker_thread.start()
     while worker_thread.is_alive():
+        if worker_cancel_event is not None and worker_cancel_event.is_set():
+            cancelled = True
+            cancel_event.set()
+            break
         elapsed = time.monotonic() - start_mono
         remaining = effective_timeout - elapsed
         if remaining <= 0:
             timed_out = True
             cancel_event.set()
             break
-        wait_slice = min(effective_renew, remaining, 0.25)
+        wait_slice = min(effective_renew, remaining, 0.15)
         worker_thread.join(timeout=wait_slice)
         if not worker_thread.is_alive():
             break
@@ -1086,16 +1420,41 @@ def _run_leased_outbox_deletion(
             last_renew_mono = now_mono
 
     if lease_lost:
+        worker_thread.join(timeout=min(effective_grace, 0.25))
         return {"outcome": "stale", "renewals": renewals, "error": "Lease ownership lost during deletion"}
+
+    if cancelled:
+        worker_thread.join(timeout=effective_grace)
+        if not worker_thread.is_alive():
+            step_now = utc_now()
+            session.query(StorageDeletionOutbox).filter(
+                StorageDeletionOutbox.id == entry["id"],
+                StorageDeletionOutbox.status == "PROCESSING",
+                StorageDeletionOutbox.worker_id == worker_id,
+                StorageDeletionOutbox.claim_token == entry["claim_token"],
+            ).update(
+                {
+                    StorageDeletionOutbox.status: "PENDING",
+                    StorageDeletionOutbox.worker_id: None,
+                    StorageDeletionOutbox.claim_token: None,
+                    StorageDeletionOutbox.claimed_at: None,
+                    StorageDeletionOutbox.lease_expires_at: None,
+                    StorageDeletionOutbox.next_retry_at: step_now,
+                    StorageDeletionOutbox.last_error: "Worker cancelled before deletion completed",
+                    StorageDeletionOutbox.updated_at: step_now,
+                },
+                synchronize_session=False,
+            )
+            session.commit()
+            session.expire_all()
+            return {"outcome": "cancelled", "renewals": renewals, "error": "Worker cancelled before deletion completed"}
+        # Thread is still alive -> quarantine in PROCESSING so no second worker can race it!
+        return {"outcome": "timed_out_quarantined", "renewals": renewals, "error": "Worker cancelled while storage I/O still active (quarantined)"}
 
     if timed_out:
         timeout_err = f"Storage deletion operation timed out after {effective_timeout:.2f}s"
-        # Give cooperative operations a bounded grace period to stop definitively
         worker_thread.join(timeout=effective_grace)
         if worker_thread.is_alive():
-            # Operation is STILL in flight: quarantine in PROCESSING (do NOT immediately release
-            # to PENDING) while recording error & bumping attempt_count under fence so no second
-            # worker starts a concurrent duplicate deletion until the quarantine lease expires.
             step_now = utc_now()
             quarantine_exp = step_now + timedelta(seconds=max(effective_lease, effective_grace))
             updated = session.query(StorageDeletionOutbox).filter(
@@ -1115,18 +1474,28 @@ def _run_leased_outbox_deletion(
                 synchronize_session=False,
             )
             if updated == 1:
+                failed_doc_payload = None
                 if entry.get("document_id"):
                     doc_rec = session.query(Document).filter(Document.id == entry["document_id"]).first()
                     if doc_rec:
                         doc_rec.deletion_status = "DELETE_FAILED"
                         doc_rec.metadata_json = {**(doc_rec.metadata_json or {}), "deletion_error": timeout_err}
+                        failed_doc_payload = serialize_document(doc_rec)
                 session.commit()
                 session.expire_all()
+                if failed_doc_payload and entry.get("user_id"):
+                    try:
+                        from realtime.manager import publish_user_realtime_event_sync
+                        publish_user_realtime_event_sync(
+                            str(entry["user_id"]),
+                            {"type": "library_update", "action": "updated", "data": failed_doc_payload},
+                        )
+                    except Exception:
+                        pass
                 return {"outcome": "timed_out_quarantined", "renewals": renewals, "error": timeout_err}
             session.rollback()
             return {"outcome": "stale", "renewals": renewals, "error": timeout_err}
 
-        # Thread stopped cleanly during grace period -> finalize as retry/failed cleanly
         outcome = finalize_claimed_outbox_entry(session, entry, worker_id, False, timeout_err)
         return {"outcome": outcome, "renewals": renewals, "error": timeout_err}
 
@@ -1149,12 +1518,16 @@ def process_storage_deletion_outbox(
     renew_interval: Optional[float] = None,
     operation_timeout_seconds: float = 300.0,
     timeout_grace_seconds: float = 2.0,
+    worker_cancel_event=None,
+    use_subprocess: Optional[bool] = None,
+    subprocess_test_delay_seconds: Optional[float] = None,
 ) -> Dict[str, int]:
     """
     Multi-worker-safe processor for StorageDeletionOutbox:
     1. Recovers any stale PROCESSING claims whose leases expired.
     2. Atomically claims due PENDING rows one-by-one with worker_id + claim_token + lease_expires_at.
-    3. Executes physical deletion under the unified lease-renewing, timeout-safe runner.
+    3. Executes physical deletion under the unified lease-renewing, timeout-safe runner
+       (killable isolated subprocess by default for real storage backends).
     4. Fences every completion/retry/failure update by (id, PROCESSING, worker_id, claim_token,
        unexpired lease) so expired or displaced workers never write DB state.
     """
@@ -1166,13 +1539,17 @@ def process_storage_deletion_outbox(
         "retried": 0,
         "failed": 0,
         "stale": 0,
+        "cancelled": 0,
         "timed_out_quarantined": 0,
         "renewals": 0,
+        "subprocess_terminated": 0,
     }
 
     def _run(session: Session):
         stats["recovered"] = recover_stale_outbox_claims(session)
         for _ in range(max(0, int(limit))):
+            if worker_cancel_event is not None and worker_cancel_event.is_set():
+                break
             claimed = claim_storage_deletion_outbox_entries(
                 session=session,
                 worker_id=effective_worker,
@@ -1192,8 +1569,13 @@ def process_storage_deletion_outbox(
                 renew_interval=renew_interval,
                 operation_timeout_seconds=operation_timeout_seconds,
                 timeout_grace_seconds=timeout_grace_seconds,
+                worker_cancel_event=worker_cancel_event,
+                use_subprocess=use_subprocess,
+                subprocess_test_delay_seconds=subprocess_test_delay_seconds,
             )
             stats["renewals"] += int(res.get("renewals", 0))
+            if res.get("subprocess_terminated"):
+                stats["subprocess_terminated"] += 1
             outcome = res["outcome"]
             stats[outcome] = stats.get(outcome, 0) + 1
 

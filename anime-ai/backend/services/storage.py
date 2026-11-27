@@ -503,10 +503,30 @@ class S3CompatibleStorage(StorageBackend):
         except Exception:
             return False
 
-    def delete(self, storage_key: str) -> bool:
-        client = self._get_client()
+    def delete(self, storage_key: str, timeout_seconds: Optional[float] = None) -> bool:
         norm_key = storage_key.replace("\\", "/").lstrip("/")
         try:
+            if timeout_seconds is not None and float(timeout_seconds) > 0:
+                import boto3
+                from botocore.config import Config
+                bounded_t = max(1.0, float(timeout_seconds))
+                cfg = Config(
+                    signature_version="s3v4",
+                    connect_timeout=min(3.0, bounded_t),
+                    read_timeout=bounded_t,
+                    retries={"max_attempts": 1, "mode": "standard"},
+                    s3={"addressing_style": "path"} if self.endpoint_url else {},
+                )
+                client = boto3.client(
+                    "s3",
+                    endpoint_url=self.endpoint_url,
+                    region_name=self.region_name,
+                    aws_access_key_id=self.access_key,
+                    aws_secret_access_key=self.secret_key,
+                    config=cfg,
+                )
+            else:
+                client = self._get_client()
             client.delete_object(Bucket=self.bucket_name, Key=norm_key)
             return True
         except Exception as e:

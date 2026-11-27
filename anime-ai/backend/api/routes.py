@@ -947,14 +947,21 @@ def list_documents(current_user: User = Depends(AuthManager.get_current_user), d
     docs = db.query(Document).filter(Document.user_id == current_user.id).all()
     return [docs_svc.serialize_document(d) for d in docs]
 
-@router.delete("/documents/{document_id}")
-def delete_document(document_id: str, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
+@router.delete("/documents/{document_id}", status_code=202)
+async def delete_document(document_id: str, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
     import services.documents as docs_svc
     try:
         doc_uuid = uuid.UUID(document_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid document ID format")
-    return docs_svc.delete_document(doc_uuid, current_user.id, db)
+    del_res = docs_svc.request_document_deletion(doc_uuid, current_user.id, db)
+    if del_res.get("file"):
+        await ws_manager.send_to_user(str(current_user.id), {
+            "type": "library_update",
+            "action": "updated",
+            "data": del_res["file"],
+        })
+    return del_res
 
 class RenameRequest(BaseModel):
     filename: str
