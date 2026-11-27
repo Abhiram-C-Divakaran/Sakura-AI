@@ -136,7 +136,7 @@ Optional feature variables:
 
 ## 12. GitHub Branch Protection & Repository Governance *(Manual Repository Setting)*
 
-> **Current Status:** `main` branch protection is **NOT YET ENABLED** (must be configured manually by a repository administrator in GitHub Settings → Branches → Branch protection rules for `main`).
+> **Current Status:** `main` branch protection reports **`protected=false`** (must be configured manually by a repository administrator in GitHub Settings → Branches → Branch protection rules for `main`).
 
 Required settings before staging/production release:
 - Require a pull request before merging (`>= 1` approving review; dismiss stale reviews on new commits).
@@ -148,5 +148,21 @@ Required settings before staging/production release:
 - Block force pushes and branch deletions on `main`.
 - Require linear history or signed commits per organizational policy.
 - Dedicated `image-worker` service (`python -m media.image_worker`) runs independently from `worker` (`SAKURA_WORKER_HANDLE_IMAGES=false`) in `docker-compose.prod.yml` so long-running background tasks cannot starve image generation or storage deletion maintenance.
-- PostgreSQL backups (`ops/scripts/backup_postgres.sh`) and restore verifications (`ops/scripts/verify_restore.sh`) MUST run with a client whose major version matches the PostgreSQL server (e.g., official `postgres:15` container for PG 15); both scripts enforce major-version parity and `verify_restore.sh` fails non-zero if `alembic_version`, core tables, `pgvector`, or restored data checks fail.
+- PostgreSQL backups (`ops/scripts/backup_postgres.sh`) and restore verifications (`ops/scripts/verify_restore.sh`) MUST run with a client whose major version matches the PostgreSQL server (e.g., official `postgres:15` container for PG 15); both scripts enforce major-version parity and `verify_restore.sh` requires the `.sha256` sidecar and fails non-zero if `alembic_version`, core tables, `pgvector` extension, `vector(1536)` column type, or restored data checks fail.
+
+---
+
+## 13. Manual Staging & Production Provisioning Checklist *(No Hosting Provider Assumed)*
+
+The repository is deployment-neutral and has no confirmed hosting provider or public production deployment. Before opening private staging or public launch, an operator must manually provision and configure:
+1. **Compute / Hosting:** Dedicated VM, container cluster, or isolated host(s) separating `sandbox-executor` from database/storage networks.
+2. **PostgreSQL 15 + `pgvector`:** Managed or self-hosted PostgreSQL 15 instance with `pgvector` available (`alembic upgrade head` installs `CREATE EXTENSION IF NOT EXISTS vector` and `vector(1536)`).
+3. **Redis 7 (AOF enabled):** Private-network Redis instance for rate limiting, WebSocket pub/sub, worker dispatch, and sandbox capability replay protection.
+4. **S3-Compatible Object Storage:** Bucket with SSE, versioning, lifecycle rules, and scoped IAM credentials (`SAKURA_STORAGE_BACKEND=s3`).
+5. **LLM & Embedding Credentials:** Production keys for desired providers (`OPENAI_API_KEY` for semantic embeddings / GPT, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, or private `OLLAMA_BASE_URL`). Never enable `SAKURA_DETERMINISTIC_TEST_PROVIDERS` outside `ENVIRONMENT=test`.
+6. **SMTP Delivery:** Configured transactional SMTP credentials (`SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`) and canonical HTTPS `PUBLIC_APP_URL` for password recovery.
+7. **Domain & TLS:** DNS records, TLS 1.2/1.3 certificates, reverse proxy (`ops/nginx.conf.example`), `TRUSTED_PROXY_CIDRS`, `CORS_ALLOWED_ORIGINS`, and `NEXT_PUBLIC_SITE_URL`.
+8. **Monitoring & Alerts:** Health/readiness checks (`/health`, `/readiness`), queue depth, `storage_deletion_outbox` `FAILED` count, HTTP 429/503 spikes, and workspace disk utilization alerts.
+9. **Backup Scheduling & Restore Drills:** Scheduled daily `backup_postgres.sh` uploads to off-host encrypted storage plus regular automated `verify_restore.sh` drills with `REQUIRE_CHECKSUM=true` and `REQUIRE_PGVECTOR=true`.
+10. **Support & Legal Review:** Set `NEXT_PUBLIC_SUPPORT_EMAIL` for `/contact` and obtain formal legal counsel review/sign-off on `/privacy` and `/terms` before public launch.
 

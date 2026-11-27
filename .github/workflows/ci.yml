@@ -91,6 +91,22 @@ jobs:
         run: |
           python -m unittest tests/test_scheduler_resilience.py -v
 
+      - name: Run PostgreSQL pgvector, Outbox Concurrency & Variation Idempotency Tests (Zero Skips)
+        env:
+          DATABASE_URL: "postgresql+psycopg2://sakura_ci:sakura_ci_password@localhost:5432/sakura_ci_db"
+          SAKURA_POSTGRES_TEST: "1"
+        run: |
+          python -c '
+          import sys, unittest
+          loader = unittest.TestLoader()
+          suite = loader.loadTestsFromName("tests.test_postgres_pgvector_and_concurrency")
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          if result.testsRun == 0 or len(result.skipped) > 0 or not result.wasSuccessful():
+              print(f"ERROR: PG suite failed or skipped (ran={result.testsRun}, skipped={len(result.skipped)})", file=sys.stderr)
+              sys.exit(1)
+          print(f"SUCCESS: Executed {result.testsRun} PostgreSQL pgvector/concurrency tests with 0 skips.")
+          '
+
       - name: Verify PostgreSQL 15 Backup and Restore Scripts (Official postgres:15 Client)
         env:
           DATABASE_URL: "postgresql+psycopg2://sakura_ci:sakura_ci_password@localhost:5432/sakura_ci_db"
@@ -104,15 +120,25 @@ jobs:
             exit 1
           fi
 
-          # Seed a deterministic probe user row so backup/restore verifies real data survival
+          # Seed a deterministic probe user AND a real non-null 1536-dim vector chunk
           python -c "
           import uuid
           from database.db import get_db_context
-          from database.models import User, utc_now
+          from database.models import User, Document, DocumentChunk, utc_now
           with get_db_context() as db:
-              if not db.query(User).filter(User.username == 'ci_restore_probe').first():
-                  db.add(User(id=uuid.uuid4(), username='ci_restore_probe', email='ci_restore_probe@example.com', hashed_password='probe_hash_not_for_login', created_at=utc_now()))
-                  db.commit()
+              user = db.query(User).filter(User.username == 'ci_restore_probe').first()
+              if not user:
+                  user = User(id=uuid.uuid4(), username='ci_restore_probe', email='ci_restore_probe@example.com', hashed_password='probe_hash_not_for_login', created_at=utc_now())
+                  db.add(user)
+                  db.flush()
+              doc = Document(id=uuid.uuid4(), user_id=user.id, filename='restore_vec_probe.md', mime_type='text/markdown', storage_path='/tmp/restore_vec_probe.md', is_knowledge_base=True, indexing_status='READY')
+              db.add(doc)
+              db.flush()
+              vec = [0.0] * 1536
+              vec[0] = 0.8
+              vec[1] = 0.6
+              db.add(DocumentChunk(id=uuid.uuid4(), document_id=doc.id, chunk_index=0, content='CI restore pgvector probe', embedding=vec))
+              db.commit()
           "
 
           # Run backup & restore strictly inside official postgres:15 container (version-pinned to PG 15 server)
@@ -126,7 +152,9 @@ jobs:
             -e EXPECTED_ALEMBIC_HEAD="${ALEMBIC_HEAD}" \
             -e REQUIRED_MIN_USERS=1 \
             -e EXPECTED_USER_USERNAME=ci_restore_probe \
+            -e REQUIRE_CHECKSUM=true \
             -e REQUIRE_PGVECTOR=true \
+            -e REQUIRE_RESTORED_VECTOR=true \
             -v /tmp/sakura_pg_backups:/backups \
             -v "${GITHUB_WORKSPACE}/anime-ai/ops/scripts:/scripts:ro" \
             postgres:15 \
@@ -136,14 +164,26 @@ jobs:
               LATEST_DUMP=$(ls -1t /backups/sakura_sakura_ci_db_*.dump | head -n1)
               bash /scripts/verify_restore.sh "$LATEST_DUMP"
 
-              # Negative check: corrupted dump archive MUST fail verification non-zero
-              CORRUPT_DUMP=/backups/corrupt_probe.dump
-              printf "NOT_A_VALID_PG_DUMP_ARCHIVE" > "$CORRUPT_DUMP"
-              if bash /scripts/verify_restore.sh "$CORRUPT_DUMP"; then
-                echo "ERROR: verify_restore.sh accepted a corrupted dump!" >&2
+              # Negative check 1: checksum-tampered dump MUST fail verification non-zero
+              TAMPER_DUMP=/backups/tampered_probe.dump
+              cp "$LATEST_DUMP" "$TAMPER_DUMP"
+              cp "${LATEST_DUMP}.sha256" "${TAMPER_DUMP}.sha256"
+              sed -i "s|$(basename "$LATEST_DUMP")|$(basename "$TAMPER_DUMP")|g" "${TAMPER_DUMP}.sha256"
+              printf "CORRUPTED_BYTES" >> "$TAMPER_DUMP"
+              if bash /scripts/verify_restore.sh "$TAMPER_DUMP"; then
+                echo "ERROR: verify_restore.sh accepted a checksum-tampered dump!" >&2
                 exit 1
               fi
-              echo "[verify] Confirmed corrupted dump archive fails non-zero as required."
+
+              # Negative check 2: corrupted archive WITH matching checksum MUST ALSO fail non-zero
+              CORRUPT_DUMP=/backups/corrupt_probe.dump
+              printf "NOT_A_VALID_PG_DUMP_ARCHIVE" > "$CORRUPT_DUMP"
+              sha256sum "$CORRUPT_DUMP" > "${CORRUPT_DUMP}.sha256"
+              if bash /scripts/verify_restore.sh "$CORRUPT_DUMP"; then
+                echo "ERROR: verify_restore.sh accepted a corrupted archive!" >&2
+                exit 1
+              fi
+              echo "[verify] Confirmed both tampered-checksum and corrupted-archive dumps fail non-zero."
             '
 
       - name: Run Storage Persistence Integration Test
@@ -300,20 +340,23 @@ jobs:
             exit 1
           fi
 
-      - name: Run Real Docker Sandbox E2E & Topology Tests Inside Container (Zero Skips Allowed)
+      - name: Run Real Docker Sandbox E2E, Topology & Production Coding Tests Inside Container (Zero Skips Allowed)
         run: |
           docker run --rm \
             --network sakura_ci_net \
             -v sakura_workspaces_vol:/workspaces \
             -e SAKURA_SANDBOX_E2E=1 \
             -e SAKURA_SANDBOX_URL=http://sakura-sandbox-executor:9000 \
+            -e SAKURA_SANDBOX_EXECUTOR_URL=http://sakura-sandbox-executor:9000 \
             -e SAKURA_SANDBOX_SERVICE_TOKEN=ci_test_sandbox_token_abc123 \
             -e SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY=ci_test_capability_signing_key_32chars \
             -e SAKURA_WORKSPACE_ROOT=/workspaces \
             -e SAKURA_SHARED_WORKSPACE_ROOT=/workspaces \
+            -e DATABASE_URL=sqlite:////tmp/sakura_remote_coding_e2e.db \
             -e REDIS_URL=redis://sakura-ci-redis:6379/0 \
             -e POSTGRES_PASSWORD=ci_secret_super_secret_pg_pwd \
             -e JWT_SECRET=ci_secret_super_secret_jwt_key_32c \
+            -e INTEGRATION_ENCRYPTION_KEY=ci_secret_integration_key_32_chr! \
             -e HOST_SENSITIVE_SECRET=very_sensitive_host_secret_should_never_leak \
             sakura-backend:ci-test \
             python -c '
@@ -322,6 +365,7 @@ jobs:
           suite = unittest.TestSuite()
           suite.addTests(loader.loadTestsFromName("tests.test_sandbox_e2e_docker"))
           suite.addTests(loader.loadTestsFromName("tests.test_workspace_topology_e2e"))
+          suite.addTests(loader.loadTestsFromName("tests.test_production_remote_coding_e2e"))
           runner = unittest.TextTestRunner(verbosity=2)
           result = runner.run(suite)
           if result.testsRun == 0:

@@ -127,10 +127,18 @@ test.describe('Sakura AI Real Full-Stack Integration Suite (Zero API Mocks)', ()
     expect(pngCheck.size).toBeGreaterThanOrEqual(8192);
     expect(pngCheck.isPng).toBe(true);
 
-    // Variation batch idempotency (uses 2 quota slots -> total 3 of 3) + replay (0 extra slots) + quota 429 on 4th
+    // Variation batch idempotency (uses 2 quota slots -> total 3 of 3) + replay (0 extra slots)
+    // + missing idempotency key (400) + same-key mismatched count (409) + quota 429 on 4th
     const varBatchRes = await page.evaluate(async (parentId) => {
       const tok = localStorage.getItem('access_token') || '';
       const h = { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' };
+
+      const missingKey = await fetch('/api/v1/images/variation', {
+        method: 'POST',
+        headers: h,
+        body: JSON.stringify({ parent_image_id: parentId, count: 2 }),
+      });
+
       const first = await fetch('/api/v1/images/variation', {
         method: 'POST',
         headers: h,
@@ -145,6 +153,12 @@ test.describe('Sakura AI Real Full-Stack Integration Suite (Zero API Mocks)', ()
       });
       const replayBody = await replay.json();
 
+      const conflict = await fetch('/api/v1/images/variation', {
+        method: 'POST',
+        headers: h,
+        body: JSON.stringify({ parent_image_id: parentId, count: 3, idempotency_key: 'fs-var-batch-1' }),
+      });
+
       // Quota is configured to 3/day in fullstack integration; next image must return HTTP 429
       const overQuota = await fetch('/api/v1/images/generate', {
         method: 'POST',
@@ -153,22 +167,26 @@ test.describe('Sakura AI Real Full-Stack Integration Suite (Zero API Mocks)', ()
       });
 
       return {
+        missingKeyStatus: missingKey.status,
         firstStatus: first.status,
         firstIds: (firstBody.jobs || []).map((j: any) => j.id),
         firstReplay: firstBody.idempotent_replay,
         replayStatus: replay.status,
         replayIds: (replayBody.jobs || []).map((j: any) => j.id),
         replayFlag: replayBody.idempotent_replay,
+        conflictStatus: conflict.status,
         overQuotaStatus: overQuota.status,
       };
     }, completedImgJob.output_image_id);
 
+    expect(varBatchRes.missingKeyStatus).toBe(400);
     expect(varBatchRes.firstStatus).toBe(202);
     expect(varBatchRes.firstIds).toHaveLength(2);
     expect(varBatchRes.firstReplay).toBe(false);
     expect(varBatchRes.replayStatus).toBe(202);
     expect(varBatchRes.replayIds).toEqual(varBatchRes.firstIds);
     expect(varBatchRes.replayFlag).toBe(true);
+    expect(varBatchRes.conflictStatus).toBe(409);
     expect(varBatchRes.overQuotaStatus).toBe(429);
 
     // 7 & 8. Real Library upload -> real storage preview -> KB indexing (real DurableTaskWorker) -> KB removal
@@ -395,6 +413,66 @@ test.describe('Sakura AI Real Full-Stack Integration Suite (Zero API Mocks)', ()
     expect(zipCheck.size).toBeGreaterThan(50);
     expect(zipCheck.isZip).toBe(true);
 
+    // 11b. Cross-user authorization boundary + WebSocket ticket issuance + user-scoped document deletion
+    const securityChecks = await page.evaluate(
+      async ({ targetFileId, targetImgJobId, targetCodingTaskId, runSuffix }) => {
+        const tok1 = localStorage.getItem('access_token') || '';
+        const h1 = { Authorization: `Bearer ${tok1}`, 'Content-Type': 'application/json' };
+
+        // Issue single-use WS ticket for user 1
+        const wsTicketRes = await fetch('/api/v1/auth/ws-ticket', { method: 'POST', headers: h1 });
+        const wsTicketBody = await wsTicketRes.json();
+
+        // Register a second isolated user and verify strict 404 boundaries on user 1's resources
+        const u2Email = `other_${runSuffix}@example.com`;
+        const u2Pass = 'OtherStrongPass123!';
+        await fetch('/api/v1/auth/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: u2Email, password: u2Pass }),
+        });
+        const u2TokRes = await fetch('/api/v1/auth/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ username: u2Email, password: u2Pass }).toString(),
+        });
+        const u2Tok = (await u2TokRes.json()).access_token;
+        const h2 = { Authorization: `Bearer ${u2Tok}` };
+
+        const xFile = await fetch(`/api/v1/library/files/${targetFileId}`, { headers: h2 });
+        const xImgJob = await fetch(`/api/v1/images/jobs/${targetImgJobId}`, { headers: h2 });
+        const xCoding = await fetch(`/api/v1/coding/tasks/${targetCodingTaskId}`, { headers: h2 });
+
+        // User 1 deletes their own uploaded library file and verifies removal (404 afterwards)
+        const delFile = await fetch(`/api/v1/library/files/${targetFileId}`, { method: 'DELETE', headers: h1 });
+        const afterDel = await fetch(`/api/v1/library/files/${targetFileId}`, { headers: h1 });
+
+        return {
+          wsTicketStatus: wsTicketRes.status,
+          hasTicket: Boolean(wsTicketBody.ticket),
+          xFileStatus: xFile.status,
+          xImgJobStatus: xImgJob.status,
+          xCodingStatus: xCoding.status,
+          delFileStatus: delFile.status,
+          afterDelStatus: afterDel.status,
+        };
+      },
+      {
+        targetFileId: fileId,
+        targetImgJobId: imgJobId,
+        targetCodingTaskId: codingTaskId,
+        runSuffix: suffix,
+      }
+    );
+
+    expect(securityChecks.wsTicketStatus).toBe(200);
+    expect(securityChecks.hasTicket).toBe(true);
+    expect(securityChecks.xFileStatus).toBe(404);
+    expect(securityChecks.xImgJobStatus).toBe(404);
+    expect(securityChecks.xCodingStatus).toBe(404);
+    expect(securityChecks.delFileStatus).toBe(200);
+    expect(securityChecks.afterDelStatus).toBe(404);
+
     // 12. Real Account Deletion -> cleanup status verified & credentials permanently invalidated
     const deleteRes = await page.evaluate(
       async ({ pwd, userEmail }) => {
@@ -421,7 +499,7 @@ test.describe('Sakura AI Real Full-Stack Integration Suite (Zero API Mocks)', ()
     );
 
     expect(deleteRes.deleteStatus).toBe(200);
-    expect(['COMPLETE', 'PENDING_RETRY']).toContain(deleteRes.cleanupStatus);
+    expect(['COMPLETE', 'PENDING_ASYNC_CLEANUP']).toContain(deleteRes.cleanupStatus);
     expect(deleteRes.loginRetryStatus).toBe(400);
   });
 });

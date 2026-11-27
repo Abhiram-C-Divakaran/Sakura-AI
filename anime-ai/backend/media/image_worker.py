@@ -186,6 +186,35 @@ def create_image_generation_job(
     return job, True
 
 
+class IdempotencyConflictError(ValueError):
+    """Raised when an idempotency key is reused with different normalized request parameters."""
+    pass
+
+
+def compute_variation_request_fingerprint(
+    parent_image_id: uuid.UUID,
+    count: int,
+    conversation_id: Optional[str] = None,
+    aspect_ratio: Optional[str] = None,
+    intensity: Optional[str] = None,
+    requested_pipeline: Optional[str] = None,
+) -> str:
+    """Computes a canonical SHA-256 fingerprint for an image variation batch request."""
+    import hashlib
+    import json
+
+    canonical = {
+        "parent_image_id": str(parent_image_id),
+        "count": int(count),
+        "conversation_id": str(conversation_id).strip() if conversation_id else "",
+        "aspect_ratio": (aspect_ratio or "1:1").strip(),
+        "intensity": (intensity or "medium").strip().lower(),
+        "requested_pipeline": (requested_pipeline or "auto").strip().lower(),
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _load_batch_jobs(db: Session, user_id: uuid.UUID, batch: ImageVariationBatch) -> list[ImageGenerationJob]:
     """Loads persisted ImageGenerationJob records belonging to an ImageVariationBatch in original order."""
     raw_ids = list(batch.job_ids or [])
@@ -207,6 +236,17 @@ def _load_batch_jobs(db: Session, user_id: uuid.UUID, batch: ImageVariationBatch
     return [by_id[u] for u in uuids if u in by_id]
 
 
+def _assert_fingerprint_matches(existing_batch: ImageVariationBatch, incoming_fp: Optional[str]) -> None:
+    if (
+        incoming_fp
+        and existing_batch.request_fingerprint
+        and existing_batch.request_fingerprint != incoming_fp
+    ):
+        raise IdempotencyConflictError(
+            "Idempotency key was already used with different image variation parameters."
+        )
+
+
 def create_batch_image_generation_jobs(
     db: Session,
     user_id: uuid.UUID,
@@ -214,13 +254,16 @@ def create_batch_image_generation_jobs(
     enforce_quota: bool = True,
     idempotency_key: Optional[str] = None,
     parent_image_id: Optional[uuid.UUID] = None,
+    request_fingerprint: Optional[str] = None,
+    require_idempotency_key: bool = False,
 ) -> Tuple[list[ImageGenerationJob], bool]:
     """
     Atomically reserves quota for `len(job_specs)` jobs and persists all ImageGenerationJob rows
     in a single transaction. When `idempotency_key` is supplied, persists a per-user unique
-    ImageVariationBatch row in the SAME transaction so duplicate or concurrent retries roll back
-    both quota and job inserts on IntegrityError and replay the exact original batch with
-    zero additional quota consumed.
+    ImageVariationBatch row with normalized `request_fingerprint` in the SAME transaction:
+    - Replay with matching key + fingerprint returns original job IDs with zero extra quota.
+    - Reuse of the same key with a different fingerprint raises IdempotencyConflictError (HTTP 409).
+    - Concurrent duplicate requests roll back quota + job inserts cleanly on IntegrityError.
 
     Returns: (jobs, created)
     """
@@ -228,12 +271,18 @@ def create_batch_image_generation_jobs(
         return [], False
 
     clean_idem = idempotency_key.strip()[:128] if idempotency_key and idempotency_key.strip() else None
+    if require_idempotency_key and not clean_idem:
+        raise ValueError("idempotency_key is required for image variation requests.")
+
+    clean_fp = request_fingerprint.strip()[:128] if request_fingerprint and request_fingerprint.strip() else None
+
     if clean_idem:
         existing_batch = db.query(ImageVariationBatch).filter(
             ImageVariationBatch.user_id == user_id,
             ImageVariationBatch.idempotency_key == clean_idem,
         ).first()
         if existing_batch:
+            _assert_fingerprint_matches(existing_batch, clean_fp)
             return _load_batch_jobs(db, user_id, existing_batch), False
 
     now = utc_now()
@@ -267,6 +316,7 @@ def create_batch_image_generation_jobs(
             id=uuid.uuid4(),
             user_id=user_id,
             idempotency_key=clean_idem,
+            request_fingerprint=clean_fp,
             parent_image_id=parent_image_id,
             job_ids=[str(j.id) for j in jobs],
             created_at=now,
@@ -293,6 +343,7 @@ def create_batch_image_generation_jobs(
                 ImageVariationBatch.idempotency_key == clean_idem,
             ).first()
             if existing_batch:
+                _assert_fingerprint_matches(existing_batch, clean_fp)
                 return _load_batch_jobs(db, user_id, existing_batch), False
         raise
     except Exception:

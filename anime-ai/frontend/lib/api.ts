@@ -60,3 +60,44 @@ export function websocketUrl(path: string): string {
 
   return `ws://localhost:8000${cleanPath}`;
 }
+
+/**
+ * Generates a unique client-side idempotency key for a single user action
+ * so retries preserve the exact same key without duplicating jobs or quota charges.
+ */
+export function createIdempotencyKey(prefix = 'req'): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `${prefix}_${crypto.randomUUID()}`;
+  }
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
+}
+
+export interface ImageVariationRequestOptions {
+  parentImageId: string;
+  count?: number;
+  conversationId?: string;
+  intensity?: string;
+  idempotencyKey: string;
+  accessToken: string;
+}
+
+/**
+ * Submits an idempotent image variation batch request preserving the caller's
+ * idempotency_key across retries of a single user action.
+ */
+export async function requestImageVariation(options: ImageVariationRequestOptions): Promise<Response> {
+  return fetch(apiUrl('/api/v1/images/variation'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${options.accessToken}`,
+    },
+    body: JSON.stringify({
+      parent_image_id: options.parentImageId,
+      count: options.count ?? 2,
+      conversation_id: options.conversationId,
+      intensity: options.intensity ?? 'medium',
+      idempotency_key: options.idempotencyKey,
+    }),
+  });
+}

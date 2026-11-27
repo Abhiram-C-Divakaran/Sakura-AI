@@ -383,6 +383,285 @@ class TestSchemaParity(unittest.TestCase):
             self.assertEqual(db.query(ImageVariationBatch).filter(ImageVariationBatch.id == vbatch.id).count(), 1)
             self.assertEqual(db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == outbox_rec.id).count(), 1)
 
+    def _orm_type_family(self, col: sa.Column, dialect: str) -> str:
+        """Maps an ORM column type to a canonical dialect-aware type family."""
+        t = col.type
+        if isinstance(t, sa.types.Variant):
+            t = t.mapping.get(dialect, t.impl)
+        # Unwrap SQLAlchemy 2.0 _VariantMapping if present
+        if hasattr(t, "_variant_mapping") and dialect in getattr(t, "_variant_mapping", {}):
+            t = t._variant_mapping[dialect]
+
+        cls_name = type(t).__name__.upper()
+        if cls_name == "VECTOR":
+            return "VECTOR(1536)" if dialect == "postgresql" else "JSON"
+        if cls_name == "UUID":
+            return "UUID" if dialect == "postgresql" else "CHAR_OR_UUID"
+        if cls_name in ("JSON", "JSONB"):
+            return "JSON"
+        if cls_name in ("STRING", "VARCHAR", "TEXT"):
+            return "TEXT"
+        if cls_name in ("INTEGER", "BIGINTEGER", "SMALLINTEGER"):
+            return "INTEGER"
+        if cls_name in ("FLOAT", "NUMERIC", "DOUBLE_PRECISION", "REAL"):
+            return "FLOAT"
+        if cls_name == "BOOLEAN":
+            return "BOOLEAN"
+        if cls_name == "DATETIME":
+            return "TIMESTAMPTZ" if dialect == "postgresql" else "DATETIME"
+        return cls_name
+
+    def _db_type_family(self, db_type_str: str, dialect: str) -> str:
+        """Maps an inspected database column type string to a canonical type family."""
+        s = (db_type_str or "").strip().upper()
+        if dialect == "postgresql":
+            if s.startswith("VECTOR"):
+                return s.replace(" ", "")
+            if s == "UUID":
+                return "UUID"
+            if s in ("JSON", "JSONB"):
+                return "JSON"
+            if s.startswith("CHARACTER VARYING") or s.startswith("VARCHAR") or s == "TEXT":
+                return "TEXT"
+            if s in ("INTEGER", "INT4", "BIGINT", "INT8", "SMALLINT", "INT2"):
+                return "INTEGER"
+            if s in ("DOUBLE PRECISION", "REAL", "FLOAT8", "FLOAT4", "NUMERIC"):
+                return "FLOAT"
+            if s in ("BOOLEAN", "BOOL"):
+                return "BOOLEAN"
+            if "TIMESTAMP" in s:
+                return "TIMESTAMPTZ"
+            return s
+
+        # SQLite
+        if "JSON" in s:
+            return "JSON"
+        if "CHAR" in s or "TEXT" in s or "CLOB" in s or "UUID" in s:
+            return "TEXT_OR_UUID"
+        if "INT" in s:
+            return "INTEGER"
+        if "REAL" in s or "FLOA" in s or "DOUB" in s or "NUM" in s:
+            return "FLOAT"
+        if "BOOL" in s:
+            return "BOOLEAN"
+        if "DATE" in s or "TIME" in s:
+            return "DATETIME"
+        return s
+
+    def test_schema_column_types_nullability_keys_and_indexes_match_orm(self):
+        """
+        Dialect-aware structural parity check across ALL ORM tables:
+        - Column types (strictly fails if PostgreSQL has JSON where ORM expects vector(1536))
+        - Primary keys
+        - Foreign keys
+        - Critical unique constraints and indexes
+        - PostgreSQL pgvector extension availability
+        """
+        insp = sa.inspect(self.engine)
+        dialect = self.engine.dialect.name
+
+        if dialect == "postgresql":
+            with self.engine.connect() as conn:
+                has_vec = conn.execute(
+                    sa.text("SELECT count(*) FROM pg_extension WHERE extname = 'vector'")
+                ).scalar()
+                self.assertEqual(has_vec, 1, "PostgreSQL 'vector' extension MUST be installed by Alembic migrations!")
+
+                emb_fmt = conn.execute(
+                    sa.text(
+                        """
+                        SELECT format_type(a.atttypid, a.atttypmod)
+                        FROM pg_attribute a
+                        JOIN pg_class c ON a.attrelid = c.oid
+                        WHERE c.relname = 'document_chunks'
+                          AND a.attname = 'embedding'
+                          AND NOT a.attisdropped
+                        """
+                    )
+                ).scalar()
+                self.assertEqual(
+                    emb_fmt,
+                    "vector(1536)",
+                    f"PostgreSQL document_chunks.embedding MUST be vector(1536), found '{emb_fmt}'!",
+                )
+
+        # Fetch PostgreSQL format_type map for exact type verification
+        pg_types = {}
+        if dialect == "postgresql":
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    sa.text(
+                        """
+                        SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod)
+                        FROM pg_attribute a
+                        JOIN pg_class c ON a.attrelid = c.oid
+                        JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname = current_schema()
+                          AND a.attnum > 0
+                          AND NOT a.attisdropped
+                        """
+                    )
+                ).fetchall()
+                for tname, cname, ftype in rows:
+                    pg_types[(tname, cname)] = ftype
+
+        # 1. Column types & PKs & FKs across every ORM table
+        for table_name, table in Base.metadata.tables.items():
+            db_cols = {c["name"]: c for c in insp.get_columns(table_name)}
+            for col in table.columns:
+                self.assertIn(col.name, db_cols, f"Missing column {table_name}.{col.name}")
+                orm_fam = self._orm_type_family(col, dialect)
+                raw_db_type = (
+                    pg_types.get((table_name, col.name), str(db_cols[col.name]["type"]))
+                    if dialect == "postgresql"
+                    else str(db_cols[col.name]["type"])
+                )
+                db_fam = self._db_type_family(raw_db_type, dialect)
+
+                if dialect == "sqlite" and orm_fam == "CHAR_OR_UUID" and db_fam in ("TEXT_OR_UUID", "FLOAT"):
+                    # SQLAlchemy generic sa.UUID() compiles to NUMERIC/CHAR on SQLite
+                    continue
+                if dialect == "sqlite" and orm_fam == "TEXT" and db_fam == "TEXT_OR_UUID":
+                    continue
+                self.assertEqual(
+                    db_fam,
+                    orm_fam,
+                    f"Type mismatch on {table_name}.{col.name} ({dialect}): ORM expects {orm_fam}, DB has {raw_db_type} ({db_fam})",
+                )
+
+            # Primary key columns must match
+            db_pk = set(insp.get_pk_constraint(table_name).get("constrained_columns") or [])
+            orm_pk = {c.name for c in table.primary_key.columns}
+            self.assertEqual(db_pk, orm_pk, f"Primary key mismatch on table '{table_name}': db={db_pk}, orm={orm_pk}")
+
+            # Every ORM FK target must exist in migrated DB
+            db_fks = {
+                (tuple(fk["constrained_columns"]), fk["referred_table"], tuple(fk["referred_columns"]))
+                for fk in insp.get_foreign_keys(table_name)
+            }
+            for fk in table.foreign_key_constraints:
+                expected_fk = (
+                    tuple(c.name for c in fk.columns),
+                    fk.referred_table.name,
+                    tuple(elem.column.name for elem in fk.elements),
+                )
+                self.assertIn(
+                    expected_fk,
+                    db_fks,
+                    f"Missing foreign key on table '{table_name}': expected {expected_fk}, found {db_fks}",
+                )
+
+        # 2. Verify nullability on critical NOT NULL columns of core & new tables
+        critical_not_null = [
+            ("users", "username"),
+            ("users", "hashed_password"),
+            ("documents", "user_id"),
+            ("document_chunks", "document_id"),
+            ("document_chunks", "content"),
+            ("image_generation_jobs", "user_id"),
+            ("image_generation_jobs", "prompt"),
+            ("image_variation_batches", "user_id"),
+            ("image_variation_batches", "idempotency_key"),
+            ("storage_deletion_outbox", "storage_key"),
+            ("storage_deletion_outbox", "status"),
+            ("user_usage_quotas", "user_id"),
+            ("user_usage_quotas", "category"),
+            ("user_usage_quotas", "window_key"),
+            ("user_data_exports", "user_id"),
+        ]
+        for tname, cname in critical_not_null:
+            col_info = {c["name"]: c for c in insp.get_columns(tname)}[cname]
+            self.assertFalse(
+                col_info["nullable"],
+                f"Critical column {tname}.{cname} must be NOT NULL in migrated schema!",
+            )
+
+        # 3. Verify critical unique constraints exist (either as unique constraint or unique index)
+        critical_uniques = [
+            ("image_generation_jobs", ("user_id", "idempotency_key")),
+            ("image_variation_batches", ("user_id", "idempotency_key")),
+            ("user_usage_quotas", ("user_id", "category", "window_key")),
+            ("coding_task_events", ("task_id", "sequence_number")),
+            ("scheduled_task_runs", ("task_id", "scheduled_for")),
+        ]
+        for tname, cols in critical_uniques:
+            uqs = {tuple(u["column_names"]) for u in insp.get_unique_constraints(tname)}
+            uidxs = {tuple(i["column_names"]) for i in insp.get_indexes(tname) if i.get("unique")}
+            self.assertIn(
+                cols,
+                uqs | uidxs,
+                f"Missing unique constraint/index on {tname}{cols}: found uqs={uqs}, uidxs={uidxs}",
+            )
+
+        # 4. Verify critical indexes exist
+        critical_indexes = [
+            ("document_chunks", ("document_id",)),
+            ("storage_deletion_outbox", ("lease_expires_at",)),
+            ("storage_deletion_outbox", ("claim_token",)),
+            ("image_variation_batches", ("idempotency_key",)),
+            ("image_variation_batches", ("request_fingerprint",)),
+        ]
+        for tname, cols in critical_indexes:
+            idxs = {tuple(i["column_names"]) for i in insp.get_indexes(tname)}
+            self.assertIn(cols, idxs, f"Missing index on {tname}{cols}: found {idxs}")
+
+    def test_real_non_null_1536_vector_persistence(self):
+        """Persists and reads back a real 1536-dim non-null embedding vector on migrated DB."""
+        vec = [0.0] * 1536
+        vec[0] = 0.75
+        vec[1] = 0.25
+        vec[1535] = 0.5
+
+        with self.Session() as db:
+            u = User(
+                id=uuid.uuid4(),
+                username=f"vec_parity_{uuid.uuid4().hex[:8]}",
+                hashed_password="hashed_pw_parity",
+                created_at=utc_now(),
+            )
+            db.add(u)
+            doc = Document(
+                id=uuid.uuid4(),
+                user_id=u.id,
+                filename="vec_test.md",
+                mime_type="text/markdown",
+                storage_path="/tmp/vec_test.md",
+                is_knowledge_base=True,
+                indexing_status="READY",
+            )
+            db.add(doc)
+            chunk = DocumentChunk(
+                id=uuid.uuid4(),
+                document_id=doc.id,
+                chunk_index=0,
+                content="Vector persistence check",
+                embedding=vec,
+            )
+            null_chunk = DocumentChunk(
+                id=uuid.uuid4(),
+                document_id=doc.id,
+                chunk_index=1,
+                content="Null embedding check",
+                embedding=None,
+            )
+            db.add(chunk)
+            db.add(null_chunk)
+            db.commit()
+            cid = chunk.id
+            ncid = null_chunk.id
+
+        with self.Session() as db:
+            loaded = db.query(DocumentChunk).filter(DocumentChunk.id == cid).first()
+            self.assertIsNotNone(loaded.embedding)
+            vals = list(loaded.embedding)
+            self.assertEqual(len(vals), 1536)
+            self.assertAlmostEqual(float(vals[0]), 0.75, places=5)
+            self.assertAlmostEqual(float(vals[1]), 0.25, places=5)
+            self.assertAlmostEqual(float(vals[1535]), 0.5, places=5)
+
+            loaded_null = db.query(DocumentChunk).filter(DocumentChunk.id == ncid).first()
+            self.assertIsNone(loaded_null.embedding)
+
     def test_downgrade_and_upgrade_cycle(self):
         """Verifies migration rollback of the latest revision and re-upgrade to head."""
         alembic_cfg = Config("alembic.ini")

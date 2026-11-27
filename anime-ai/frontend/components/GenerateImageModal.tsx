@@ -1,10 +1,11 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { SakuraLogo } from './SakuraLogo';
+import { createIdempotencyKey } from '../lib/api';
 
 interface GenerateImageModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onGenerate: (prompt: string, filename?: string) => Promise<void>;
+  onGenerate: (prompt: string, filename?: string, idempotencyKey?: string) => Promise<void>;
 }
 
 export const GenerateImageModal: React.FC<GenerateImageModalProps> = ({
@@ -16,20 +17,32 @@ export const GenerateImageModal: React.FC<GenerateImageModalProps> = ({
   const [filename, setFilename] = useState('');
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Preserves the same idempotency key across retries of one user action;
+  // resets whenever prompt/filename changes or submission completes.
+  const actionKeyRef = useRef<{ signature: string; key: string } | null>(null);
 
   if (!isOpen) return null;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!prompt.trim()) {
+    const trimmedPrompt = prompt.trim();
+    const trimmedFilename = filename.trim();
+    if (!trimmedPrompt) {
       setError('Please provide an image prompt.');
       return;
     }
 
+    const sig = `${trimmedPrompt}::${trimmedFilename}`;
+    if (!actionKeyRef.current || actionKeyRef.current.signature !== sig) {
+      actionKeyRef.current = { signature: sig, key: createIdempotencyKey('img_gen') };
+    }
+    const idempotencyKey = actionKeyRef.current.key;
+
     setGenerating(true);
     setError(null);
     try {
-      await onGenerate(prompt.trim(), filename.trim() ? filename.trim() : undefined);
+      await onGenerate(trimmedPrompt, trimmedFilename || undefined, idempotencyKey);
+      actionKeyRef.current = null;
       setPrompt('');
       setFilename('');
       onClose();

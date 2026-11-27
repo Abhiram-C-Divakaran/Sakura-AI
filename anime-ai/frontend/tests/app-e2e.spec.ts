@@ -571,7 +571,7 @@ test.describe('Sakura AI Authenticated Application Browser E2E Suite', () => {
       const varCreate = await fetch('/api/v1/images/variation', {
         method: 'POST',
         headers: h,
-        body: JSON.stringify({ parent_image_id: 'img-out-1', count: 1 }),
+        body: JSON.stringify({ parent_image_id: 'img-out-1', count: 1, idempotency_key: 'e2e-var-1' }),
       }).then((r) => r.json());
       const varCancelled = await fetch(`/api/v1/images/jobs/${varCreate.jobs[0].id}/cancel`, {
         method: 'POST',

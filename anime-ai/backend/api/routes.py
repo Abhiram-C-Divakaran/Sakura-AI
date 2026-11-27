@@ -1599,6 +1599,7 @@ class ImageVariationAPIRequest(BaseModel):
     parent_image_id: str
     count: Optional[int] = 2
     conversation_id: Optional[str] = None
+    intensity: Optional[str] = "medium"
     idempotency_key: Optional[str] = None
 
 class ImageUpscaleAPIRequest(BaseModel):
@@ -1704,8 +1705,23 @@ async def api_variation_image(
     current_user: User = Depends(AuthManager.get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Enqueues durable worker-backed prompt-variation ImageGenerationJobs with atomic batch quota reservation."""
-    from media.image_worker import create_batch_image_generation_jobs
+    """
+    Enqueues durable worker-backed prompt-variation ImageGenerationJobs with strict
+    batch idempotency, request fingerprint validation (HTTP 409 on payload mismatch),
+    and atomic batch quota reservation.
+    """
+    from media.image_worker import (
+        create_batch_image_generation_jobs,
+        compute_variation_request_fingerprint,
+        IdempotencyConflictError,
+    )
+    clean_idem = (req.idempotency_key or "").strip()
+    if not clean_idem:
+        raise HTTPException(
+            status_code=400,
+            detail="idempotency_key is required for image variation requests.",
+        )
+
     try:
         parent_id = uuid.UUID(req.parent_image_id)
         if req.conversation_id:
@@ -1721,26 +1737,45 @@ async def api_variation_image(
         raise HTTPException(status_code=404, detail="Parent image not found.")
 
     count = max(1, min(int(req.count or 2), 4))
+    intensity = (req.intensity or "medium").strip().lower()
+    aspect_ratio = parent.aspect_ratio or "1:1"
+    request_fp = compute_variation_request_fingerprint(
+        parent_image_id=parent_id,
+        count=count,
+        conversation_id=req.conversation_id,
+        aspect_ratio=aspect_ratio,
+        intensity=intensity,
+        requested_pipeline="auto",
+    )
     specs = [
         {
             "prompt": f"{parent.prompt} (variation {i + 1})",
             "requested_pipeline": "auto",
             "parameters": {
                 "parent_image_id": str(parent_id),
-                "aspect_ratio": parent.aspect_ratio or "1:1",
+                "aspect_ratio": aspect_ratio,
+                "intensity": intensity,
                 "conversation_id": req.conversation_id,
                 "workflow": "VARIATION",
             },
         }
         for i in range(count)
     ]
-    jobs, created = create_batch_image_generation_jobs(
-        db=db,
-        user_id=current_user.id,
-        job_specs=specs,
-        idempotency_key=req.idempotency_key,
-        parent_image_id=parent_id,
-    )
+    try:
+        jobs, created = create_batch_image_generation_jobs(
+            db=db,
+            user_id=current_user.id,
+            job_specs=specs,
+            idempotency_key=clean_idem,
+            parent_image_id=parent_id,
+            request_fingerprint=request_fp,
+            require_idempotency_key=True,
+        )
+    except IdempotencyConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     return {
         "status": "queued",
         "workflow": "PROMPT_VARIATION",

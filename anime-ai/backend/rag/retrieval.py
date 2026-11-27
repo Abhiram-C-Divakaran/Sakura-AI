@@ -163,20 +163,20 @@ class HybridRetriever:
         return results
 
     def _search_semantic(self, doc_ids: List[Any], query_vec: Optional[List[float]], limit: int) -> List[DocumentChunk]:
-        """Runs vector database search with cosine similarity."""
+        """Runs vector database search with native PostgreSQL pgvector cosine distance (or NumPy on SQLite)."""
         if not query_vec or not doc_ids:
             return []
 
-        try:
-            from database.db import DATABASE_URL
-            bind_url = DATABASE_URL
-        except Exception:
-            bind_url = "sqlite"
+        bind = self.db.get_bind() if hasattr(self.db, "get_bind") else getattr(self.db, "bind", None)
+        is_postgres = bool(bind is not None and bind.dialect.name == "postgresql")
 
-        if "postgresql" in bind_url:
+        if is_postgres:
             return (
                 self.db.query(DocumentChunk)
-                .filter(DocumentChunk.document_id.in_(doc_ids))
+                .filter(
+                    DocumentChunk.document_id.in_(doc_ids),
+                    DocumentChunk.embedding.isnot(None),
+                )
                 .order_by(DocumentChunk.embedding.cosine_distance(query_vec))
                 .limit(limit)
                 .all()
@@ -185,19 +185,24 @@ class HybridRetriever:
         # Fallback NumPy calculation for SQLite testing envs
         chunks = (
             self.db.query(DocumentChunk)
-            .filter(DocumentChunk.document_id.in_(doc_ids))
+            .filter(
+                DocumentChunk.document_id.in_(doc_ids),
+                DocumentChunk.embedding.isnot(None),
+            )
             .all()
         )
         if not chunks:
             return []
 
-        q_arr = np.array(query_vec)
+        q_arr = np.array(query_vec, dtype=float)
         matches = []
         for c in chunks:
-            if c.embedding:
-                c_arr = np.array(c.embedding)
+            if c.embedding is not None and len(c.embedding) > 0:
+                c_arr = np.array(c.embedding, dtype=float)
+                if c_arr.shape != q_arr.shape:
+                    continue
                 denom = np.linalg.norm(q_arr) * np.linalg.norm(c_arr)
-                similarity = np.dot(q_arr, c_arr) / denom if denom > 0 else 0.0
+                similarity = float(np.dot(q_arr, c_arr) / denom) if denom > 0 else 0.0
                 matches.append((c, similarity))
 
         matches.sort(key=lambda x: -x[1])

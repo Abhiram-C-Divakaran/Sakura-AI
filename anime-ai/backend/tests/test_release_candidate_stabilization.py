@@ -117,6 +117,9 @@ class TestDurableTaskWorkerHeartbeatsAndSemaphores(unittest.IsolatedAsyncioTestC
 
     async def test_transient_heartbeat_db_errors_recover_cleanly(self):
         with get_db_context() as db:
+            db.query(BackgroundTask).filter(BackgroundTask.status == "Queued").update(
+                {BackgroundTask.status: "Cancelled"}, synchronize_session=False
+            )
             user = _make_user(db, "hb_recover")
             task = BackgroundTask(
                 id=uuid.uuid4(),
@@ -172,6 +175,9 @@ class TestDurableTaskWorkerHeartbeatsAndSemaphores(unittest.IsolatedAsyncioTestC
 
     async def test_consecutive_heartbeat_failures_cancel_handler_with_zero_stale_writes(self):
         with get_db_context() as db:
+            db.query(BackgroundTask).filter(BackgroundTask.status == "Queued").update(
+                {BackgroundTask.status: "Cancelled"}, synchronize_session=False
+            )
             user = _make_user(db, "hb_abort")
             task = BackgroundTask(
                 id=uuid.uuid4(),

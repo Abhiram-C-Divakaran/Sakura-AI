@@ -560,7 +560,7 @@ def claim_storage_deletion_outbox_entries(
     session: Session,
     worker_id: str,
     limit: int = 50,
-    lease_seconds: int = OUTBOX_LEASE_DURATION_SECONDS,
+    lease_seconds: float = OUTBOX_LEASE_DURATION_SECONDS,
 ) -> List[Dict[str, Any]]:
     """
     Atomically claims up to `limit` due PENDING StorageDeletionOutbox rows by transitioning
@@ -569,7 +569,7 @@ def claim_storage_deletion_outbox_entries(
     conditional UPDATE on SQLite so concurrent workers never double-claim the same row.
     """
     now = utc_now()
-    lease_exp = now + timedelta(seconds=max(5, int(lease_seconds)))
+    lease_exp = now + timedelta(seconds=max(0.2, float(lease_seconds)))
     is_postgres = bool(session.bind and session.bind.dialect.name == "postgresql")
     claimed: List[Dict[str, Any]] = []
 
@@ -729,6 +729,41 @@ def _execute_outbox_physical_deletion(entry: Dict[str, Any], storage_override=No
     )
 
 
+def renew_outbox_claim_lease(
+    session: Session,
+    entry_id: uuid.UUID,
+    worker_id: str,
+    claim_token: uuid.UUID,
+    lease_seconds: float = OUTBOX_LEASE_DURATION_SECONDS,
+) -> bool:
+    """
+    Atomically renews an active PROCESSING lease for a long-running storage deletion.
+    Fenced by (id, status='PROCESSING', worker_id, claim_token, unexpired lease).
+    Returns True ONLY if this worker still holds a valid unexpired lease.
+    """
+    now = utc_now()
+    new_exp = now + timedelta(seconds=max(0.2, float(lease_seconds)))
+    rows = session.query(StorageDeletionOutbox).filter(
+        StorageDeletionOutbox.id == entry_id,
+        StorageDeletionOutbox.status == "PROCESSING",
+        StorageDeletionOutbox.worker_id == worker_id,
+        StorageDeletionOutbox.claim_token == claim_token,
+        StorageDeletionOutbox.lease_expires_at.isnot(None),
+        StorageDeletionOutbox.lease_expires_at > now,
+    ).update(
+        {
+            StorageDeletionOutbox.lease_expires_at: new_exp,
+            StorageDeletionOutbox.updated_at: now,
+        },
+        synchronize_session=False,
+    )
+    if rows == 1:
+        session.commit()
+        return True
+    session.rollback()
+    return False
+
+
 def finalize_claimed_outbox_entry(
     session: Session,
     entry: Dict[str, Any],
@@ -738,8 +773,9 @@ def finalize_claimed_outbox_entry(
 ) -> str:
     """
     Fenced finalization of a claimed StorageDeletionOutbox row.
-    Verifies (id, status='PROCESSING', worker_id, claim_token) before writing so a stale
-    worker whose lease was recovered can NEVER overwrite a newer attempt or delete DB rows.
+    Verifies (id, status='PROCESSING', worker_id, claim_token, unexpired lease) BEFORE
+    writing or deleting any DB records so a stale or expired worker can NEVER overwrite
+    a recovered entry or delete Document/GeneratedImage rows after lease expiration.
     Returns one of: 'completed', 'retried', 'failed', 'stale'.
     """
     step_now = utc_now()
@@ -750,6 +786,8 @@ def finalize_claimed_outbox_entry(
         StorageDeletionOutbox.status == "PROCESSING",
         StorageDeletionOutbox.worker_id == worker_id,
         StorageDeletionOutbox.claim_token == entry["claim_token"],
+        StorageDeletionOutbox.lease_expires_at.isnot(None),
+        StorageDeletionOutbox.lease_expires_at > step_now,
     ]
 
     if ok:
@@ -817,29 +855,85 @@ def process_storage_deletion_outbox(
     limit: int = 50,
     storage_override=None,
     worker_id: Optional[str] = None,
-    lease_seconds: int = OUTBOX_LEASE_DURATION_SECONDS,
+    lease_seconds: float = OUTBOX_LEASE_DURATION_SECONDS,
+    renew_interval: Optional[float] = None,
+    operation_timeout_seconds: float = 300.0,
 ) -> Dict[str, int]:
     """
     Multi-worker-safe processor for StorageDeletionOutbox:
     1. Recovers any stale PROCESSING claims whose leases expired.
     2. Atomically claims due PENDING rows with worker_id + claim_token + lease_expires_at.
-    3. Executes physical deletion outside any DB row lock.
-    4. Fences every completion/retry/failure update by (id, PROCESSING, worker_id, claim_token).
+    3. Executes physical deletion outside DB row locks while renewing the lease periodically
+       on the main thread for long-running deletions (bounded by operation_timeout_seconds).
+    4. Fences every completion/retry/failure update by (id, PROCESSING, worker_id, claim_token,
+       unexpired lease) so expired or displaced workers never write DB state.
     """
+    import time
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
     effective_worker = worker_id or f"outbox_worker_{os.getpid()}_{uuid.uuid4().hex[:8]}"
-    stats = {"recovered": 0, "processed": 0, "completed": 0, "retried": 0, "failed": 0, "stale": 0}
+    effective_lease = max(0.2, float(lease_seconds))
+    effective_renew = float(renew_interval) if renew_interval is not None else max(0.05, effective_lease * 0.4)
+    effective_timeout = max(effective_lease, float(operation_timeout_seconds))
+    stats = {"recovered": 0, "processed": 0, "completed": 0, "retried": 0, "failed": 0, "stale": 0, "renewals": 0}
 
     def _run(session: Session):
         stats["recovered"] = recover_stale_outbox_claims(session)
-        claimed = claim_storage_deletion_outbox_entries(
-            session=session,
-            worker_id=effective_worker,
-            limit=limit,
-            lease_seconds=lease_seconds,
-        )
-        for entry in claimed:
+        # Claim entries one-by-one up to `limit` so a slow deletion never causes
+        # head-of-line lease expiration on subsequent entries and multiple workers
+        # load-balance naturally.
+        for _ in range(max(0, int(limit))):
+            claimed = claim_storage_deletion_outbox_entries(
+                session=session,
+                worker_id=effective_worker,
+                limit=1,
+                lease_seconds=effective_lease,
+            )
+            if not claimed:
+                break
+            entry = claimed[0]
             stats["processed"] += 1
-            ok, err_msg = _execute_outbox_physical_deletion(entry, storage_override=storage_override)
+            start_mono = time.monotonic()
+            last_renew_mono = start_mono
+            lease_lost = False
+            ok = False
+            err_msg: Optional[str] = None
+
+            pool = ThreadPoolExecutor(max_workers=1)
+            future = pool.submit(_execute_outbox_physical_deletion, entry, storage_override)
+            try:
+                while True:
+                    remaining_timeout = effective_timeout - (time.monotonic() - start_mono)
+                    if remaining_timeout <= 0:
+                        err_msg = f"Storage deletion operation timed out after {effective_timeout:.1f}s"
+                        ok = False
+                        break
+                    wait_slice = min(effective_renew, remaining_timeout)
+                    try:
+                        ok, err_msg = future.result(timeout=wait_slice)
+                        break
+                    except FutureTimeoutError:
+                        now_mono = time.monotonic()
+                        if now_mono - last_renew_mono >= effective_renew * 0.9:
+                            renewed = renew_outbox_claim_lease(
+                                session=session,
+                                entry_id=entry["id"],
+                                worker_id=effective_worker,
+                                claim_token=entry["claim_token"],
+                                lease_seconds=effective_lease,
+                            )
+                            if not renewed:
+                                lease_lost = True
+                                break
+                            stats["renewals"] += 1
+                            last_renew_mono = now_mono
+            finally:
+                pool.shutdown(wait=False)
+
+            if lease_lost:
+                stats["stale"] += 1
+                continue
+
             outcome = finalize_claimed_outbox_entry(session, entry, effective_worker, ok, err_msg)
             stats[outcome] = stats.get(outcome, 0) + 1
 

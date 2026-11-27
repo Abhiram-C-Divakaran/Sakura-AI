@@ -8,18 +8,18 @@ from database.db import Base
 def utc_now():
     return datetime.now(timezone.utc)
 
-# Dynamic fallback if pgvector is not installed locally or running SQLite
-import os
-if os.getenv("DATABASE_URL", "").startswith("sqlite"):
-    from sqlalchemy import JSON as Vector
+# Dialect-aware pgvector type: native vector(dim) on PostgreSQL, JSON on SQLite
+try:
+    from pgvector.sqlalchemy import Vector as _PgVector
+    HAS_PGVECTOR = True
+
+    def Vector(dim: int = 1536):
+        return _PgVector(dim).with_variant(JSON(), "sqlite")
+except ImportError:
     HAS_PGVECTOR = False
-else:
-    try:
-        from pgvector.sqlalchemy import Vector
-        HAS_PGVECTOR = True
-    except ImportError:
-        from sqlalchemy import JSON as Vector
-        HAS_PGVECTOR = False
+
+    def Vector(dim: int = 1536):
+        return JSON()
 
 class User(Base):
     __tablename__ = "users"
@@ -665,6 +665,7 @@ class ImageVariationBatch(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     idempotency_key = Column(String(128), nullable=False, index=True)
+    request_fingerprint = Column(String(128), nullable=True, index=True)
     parent_image_id = Column(UUID(as_uuid=True), ForeignKey("generated_images.id", ondelete="SET NULL"), nullable=True)
     job_ids = Column(JSON, default=list, nullable=False)
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)

@@ -206,14 +206,14 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     fetchFiles();
   };
 
-  // Image generator handler (durable worker-backed job lifecycle)
-  const handleGenerateImage = async (prompt: string, filename?: string) => {
+  // Image generator handler (durable worker-backed job lifecycle with idempotency key preservation)
+  const handleGenerateImage = async (prompt: string, filename?: string, idempotencyKey?: string) => {
     const res = await authFetch(`${apiBase}/api/v1/library/generate-image`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ prompt, filename })
+      body: JSON.stringify({ prompt, filename, idempotency_key: idempotencyKey })
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));

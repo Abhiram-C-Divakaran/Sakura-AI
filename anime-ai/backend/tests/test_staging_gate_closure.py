@@ -146,7 +146,7 @@ class TestStagingGateClosure(unittest.IsolatedAsyncioTestCase):
         # 1. Cross-user parent image ID rejected with 404 on /images/edit, /variation, /upscale
         for ep, body in [
             ("/api/v1/images/edit", {"parent_image_id": str(img_b), "edit_instruction": "Make it dusk"}),
-            ("/api/v1/images/variation", {"parent_image_id": str(img_b), "count": 2}),
+            ("/api/v1/images/variation", {"parent_image_id": str(img_b), "count": 2, "idempotency_key": "sgc-var-xuser"}),
             ("/api/v1/images/upscale", {"parent_image_id": str(img_b), "scale": 2}),
         ]:
             res = self.client.post(ep, headers=self.headers_a, json=body)
@@ -177,7 +177,7 @@ class TestStagingGateClosure(unittest.IsolatedAsyncioTestCase):
             r_batch_over = self.client.post(
                 "/api/v1/images/variation",
                 headers=self.headers_a,
-                json={"parent_image_id": str(img_a), "count": 4},
+                json={"parent_image_id": str(img_a), "count": 4, "idempotency_key": "sgc-var-over"},
             )
             self.assertEqual(r_batch_over.status_code, 429)
 
@@ -185,7 +185,7 @@ class TestStagingGateClosure(unittest.IsolatedAsyncioTestCase):
             r_batch_ok = self.client.post(
                 "/api/v1/images/variation",
                 headers=self.headers_a,
-                json={"parent_image_id": str(img_a), "count": 2},
+                json={"parent_image_id": str(img_a), "count": 2, "idempotency_key": "sgc-var-ok"},
             )
             self.assertEqual(r_batch_ok.status_code, 202, r_batch_ok.text)
             self.assertEqual(len(r_batch_ok.json()["jobs"]), 2)
