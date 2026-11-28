@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { FilePreviewModal, LibraryFile } from './FilePreviewModal';
+import { AuthenticatedImage, downloadAuthenticatedFile } from './AuthenticatedImage';
 import { CreateDocumentModal } from './CreateDocumentModal';
 import { GenerateImageModal } from './GenerateImageModal';
 import { getAccessToken, authFetch } from '../lib/auth';
@@ -782,11 +783,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                         <div className="flex items-center gap-3 min-w-0">
                           <div className="w-8 h-8 rounded-lg bg-[#181818] border border-[#282828] flex items-center justify-center flex-shrink-0 group-hover:border-[#383838] transition-colors overflow-hidden">
                             {file.category === 'images' ? (
-                              <img
+                              <AuthenticatedImage
                                 src={`${apiBase}/api/v1/library/files/${file.id}/download`}
-                                alt=""
+                                alt={file.name}
                                 className="w-full h-full object-cover"
-                                loading="lazy"
                               />
                             ) : (
                               getFileIcon(file, 'w-4 h-4')
@@ -916,11 +916,19 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                               <span>{file.is_knowledge_base ? 'Remove from AI' : 'Add to AI Index'}</span>
                             </button>
 
-                            <a
-                              href={`${apiBase}/api/v1/library/files/${file.id}/download`}
-                              download={file.name}
-                              onClick={() => setActiveMenuFileId(null)}
-                              className="w-full px-3 py-1.5 text-[12.5px] text-white hover:bg-[#2C2C2C] rounded-lg transition-colors flex items-center gap-2"
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setActiveMenuFileId(null);
+                                void downloadAuthenticatedFile(
+                                  `${apiBase}/api/v1/library/files/${file.id}/download`,
+                                  file.name
+                                ).catch((err) => {
+                                  console.error('File download failed:', err);
+                                  setDeleteBanner({ type: 'error', message: `Failed to download ${file.name}.` });
+                                });
+                              }}
+                              className="w-full px-3 py-1.5 text-[12.5px] text-white hover:bg-[#2C2C2C] rounded-lg transition-colors flex items-center gap-2 cursor-pointer"
                             >
                               <svg className="w-3.5 h-3.5 text-[#888888]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
@@ -928,7 +936,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                                 <line x1="12" x2="12" y1="15" y2="3" />
                               </svg>
                               <span>Download</span>
-                            </a>
+                            </button>
 
                             <div className="h-px bg-[#303030] my-1" />
 
@@ -975,11 +983,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                 {/* Thumbnail / Large Icon */}
                 <div className="w-full h-32 rounded-xl bg-[#0A0A0A] border border-[#1E1E1E] flex items-center justify-center overflow-hidden mb-3">
                   {file.category === 'images' ? (
-                    <img
+                    <AuthenticatedImage
                       src={`${apiBase}/api/v1/library/files/${file.id}/download`}
-                      alt=""
+                      alt={file.name}
                       className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                      loading="lazy"
                     />
                   ) : (
                     getFileIcon(file, 'w-10 h-10')

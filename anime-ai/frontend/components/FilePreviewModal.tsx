@@ -2,6 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import { authFetch } from '../lib/auth';
 import { API_BASE } from '../lib/api';
+import { AuthenticatedImage, downloadAuthenticatedFile } from './AuthenticatedImage';
 
 export interface LibraryFile {
   id: string;
@@ -111,7 +112,7 @@ export const FilePreviewModal: React.FC<FilePreviewModalProps> = ({
       const imgUrl = `${apiBase}/api/v1/library/files/${file.id}/download`;
       return (
         <div className="flex flex-col items-center justify-center p-6 bg-[#080808] rounded-xl overflow-hidden min-h-[300px] border border-[#222222]">
-          <img
+          <AuthenticatedImage
             src={imgUrl}
             alt={file.name}
             className="max-h-[500px] max-w-full object-contain rounded-lg shadow-2xl"
@@ -305,9 +306,14 @@ export const FilePreviewModal: React.FC<FilePreviewModalProps> = ({
               {file.is_knowledge_base ? '✓ Indexed in AI Memory' : '+ Add to AI Memory'}
             </button>
 
-            <a
-              href={`${apiBase}/api/v1/library/files/${file.id}/download`}
-              download={file.name}
+            <button
+              type="button"
+              onClick={() => {
+                void downloadAuthenticatedFile(
+                  `${apiBase}/api/v1/library/files/${file.id}/download`,
+                  file.name
+                ).catch((err) => console.error('File download failed:', err));
+              }}
               className="px-3 py-1.5 text-[12px] font-medium rounded-lg transition-colors cursor-pointer bg-[#222222] text-[#CCCCCC] hover:bg-[#2C2C2C] border border-[#333333] flex items-center gap-1.5"
             >
               <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -316,7 +322,7 @@ export const FilePreviewModal: React.FC<FilePreviewModalProps> = ({
                 <line x1="12" x2="12" y1="15" y2="3" />
               </svg>
               <span>Download</span>
-            </a>
+            </button>
 
             <button
               onClick={() => onDeleteFile(file)}
