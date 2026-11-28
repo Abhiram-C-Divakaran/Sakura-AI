@@ -768,6 +768,18 @@ class TestFailClosedSecurityRegression(unittest.IsolatedAsyncioTestCase):
                 collected.append(token)
         self.assertEqual("".join(collected), "Hello world")
 
+    # 17. AuthManager uses maintained PyJWT (not unmaintained python-jose) and enforces HS256
+    def test_auth_manager_uses_pyjwt_and_rejects_tampered_tokens(self):
+        import auth.manager as am
+        self.assertEqual(am.jwt.__name__, "jwt")
+        tok = AuthManager.create_access_token({"sub": "pyjwt_user@example.com"})
+        self.assertIsInstance(tok, str)
+        decoded = AuthManager.decode_token(tok)
+        self.assertEqual(decoded["sub"], "pyjwt_user@example.com")
+        # Tampered token must fail closed
+        with self.assertRaises(Exception):
+            AuthManager.decode_token(tok[:-4] + "XXXX")
+
 
 if __name__ == "__main__":
     unittest.main()
