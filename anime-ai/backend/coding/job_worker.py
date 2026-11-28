@@ -125,10 +125,13 @@ def create_and_enqueue_coding_job(
     intensity: str = "high",
     idempotency_key: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    enforce_quota: bool = False,
 ) -> Tuple[CodingTask, CodingJob, bool]:
     """
     Authoritative transactional creation of CodingTask + CodingJob + durable enqueue.
     Idempotent when idempotency_key is provided (scoped per user).
+    When enforce_quota=True, reserves coding_task quota atomically in the SAME transaction
+    so concurrent duplicate replays and DB failures never double-charge or leak quota.
     Returns (task, job, created).
     """
     clean_idem = idempotency_key.strip()[:128] if idempotency_key and idempotency_key.strip() else None
@@ -180,6 +183,11 @@ def create_and_enqueue_coding_job(
     try:
         db.add(task)
         db.add(job)
+        # Flush unique (user_id, idempotency_key) first so concurrent duplicates fail fast before quota increment
+        db.flush()
+        if enforce_quota:
+            from services.quotas import reserve_user_quota_in_session
+            reserve_user_quota_in_session(db, user.id, "coding_task", amount=1)
         db.commit()
         db.refresh(task)
         db.refresh(job)
@@ -197,6 +205,9 @@ def create_and_enqueue_coding_job(
                 ).first()
                 if existing_task:
                     return existing_task, existing_job, False
+        raise
+    except Exception:
+        db.rollback()
         raise
 
     # Best-effort immediate enqueue; workers fall back to DB polling if Redis is down
@@ -238,11 +249,14 @@ def append_coding_task_event(
     for _attempt in range(5):
         with get_db_context() as db:
             if expected_worker_id is not None and expected_attempt_id is not None and job_id is not None:
+                evt_now = utc_now()
                 owned = db.query(CodingJob).filter(
                     CodingJob.id == job_id,
                     CodingJob.worker_id == expected_worker_id,
                     CodingJob.execution_attempt_id == expected_attempt_id,
                     CodingJob.status == "RUNNING",
+                    CodingJob.lease_expires_at.isnot(None),
+                    CodingJob.lease_expires_at > evt_now,
                 ).first()
                 if not owned:
                     return None
@@ -655,6 +669,8 @@ class CodingJobWorker:
                 CodingJob.worker_id == self.worker_id,
                 CodingJob.execution_attempt_id == attempt_id,
                 CodingJob.status == "RUNNING",
+                CodingJob.lease_expires_at.isnot(None),
+                CodingJob.lease_expires_at > now,
             ]
             if not allow_when_cancel_requested:
                 filters.append(CodingJob.cancel_requested == False)  # noqa: E712
@@ -697,7 +713,8 @@ class CodingJobWorker:
         task_status: Optional[str] = None,
         files_modified: Optional[list] = None,
     ) -> bool:
-        """Updates CodingTask progress ONLY if this worker still holds the RUNNING lease."""
+        """Updates CodingTask progress ONLY if this worker still holds an unexpired RUNNING lease."""
+        prog_now = utc_now()
         with get_db_context() as db:
             owned = db.query(CodingJob).filter(
                 CodingJob.id == job_id,
@@ -705,6 +722,8 @@ class CodingJobWorker:
                 CodingJob.execution_attempt_id == attempt_id,
                 CodingJob.status == "RUNNING",
                 CodingJob.cancel_requested == False,  # noqa: E712
+                CodingJob.lease_expires_at.isnot(None),
+                CodingJob.lease_expires_at > prog_now,
             ).first()
             if not owned:
                 return False
@@ -819,6 +838,8 @@ class CodingJobWorker:
                             CodingJob.execution_attempt_id == attempt_id,
                             CodingJob.status == "RUNNING",
                             CodingJob.cancel_requested == False,  # noqa: E712
+                            CodingJob.lease_expires_at.isnot(None),
+                            CodingJob.lease_expires_at > now,
                         ).update(
                             {
                                 CodingJob.heartbeat_at: now,

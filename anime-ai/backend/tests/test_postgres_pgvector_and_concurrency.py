@@ -1033,6 +1033,144 @@ class TestDatabaseContractAndHardening(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(local_store.exists(key_a))
                 self.assertIsNone(db.query(Document).filter(Document.id == doc_a).first())
 
+    async def test_coding_and_image_workers_reject_terminal_writes_after_lease_expiry_before_recovery(self):
+        """
+        Proves CodingJobWorker and ImageJobWorker enforce unexpired lease fencing on every
+        write (not only at entry), preventing stale workers from overwriting DB state if their
+        lease expires before periodic stale-job recovery runs.
+        """
+        from coding.job_worker import (
+            CodingJobWorker,
+            append_coding_task_event,
+            create_and_enqueue_coding_job,
+        )
+        from media.image_worker import ImageJobWorker, create_image_generation_job
+        from database.models import CodingJob, CodingTask, RepositoryWorkspace
+
+        with get_db_context() as db:
+            user = _make_user(db, "lease_uni")
+            ws = RepositoryWorkspace(
+                id=uuid.uuid4(),
+                user_id=user.id,
+                name="lease-test-ws",
+                workspace_path=self.tmp_dir,
+                active_branch="main",
+                status="READY",
+            )
+            db.add(ws)
+            db.commit()
+            db.refresh(ws)
+
+            # 1. Atomic coding quota reservation under concurrent duplicate idempotency_key
+            uid = user.id
+            ws_id = ws.id
+            idem = f"code-idem-{uuid.uuid4().hex[:8]}"
+
+        def _submit_coding():
+            with get_db_context() as s:
+                u_obj = s.query(User).filter(User.id == uid).first()
+                w_obj = s.query(RepositoryWorkspace).filter(RepositoryWorkspace.id == ws_id).first()
+                return create_and_enqueue_coding_job(
+                    db=s,
+                    user=u_obj,
+                    workspace=w_obj,
+                    title="Atomic quota check",
+                    objective="Ensure duplicate key charges quota once",
+                    idempotency_key=idem,
+                    enforce_quota=True,
+                )
+
+        with patch.dict(os.environ, {"SAKURA_QUOTA_CODING_DAILY": "5"}):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                sub_res = [f.result() for f in [pool.submit(_submit_coding) for _ in range(4)]]
+            self.assertEqual(sum(int(c) for _, _, c in sub_res), 1)
+            job_ids = {j.id for _, j, _ in sub_res}
+            self.assertEqual(len(job_ids), 1)
+            with get_db_context() as db:
+                q = db.query(UserUsageQuota).filter(
+                    UserUsageQuota.user_id == uid, UserUsageQuota.category == "coding_task"
+                ).first()
+                self.assertEqual(q.usage_count, 1)
+
+        # 2. CodingJobWorker rejects finalization, progress update, and event append after lease expiry
+        c_worker = CodingJobWorker(worker_id="exp_code_w", lease_duration=30)
+        claimed_code = c_worker.claim_next_job()
+        self.assertIsNotNone(claimed_code)
+        with get_db_context() as db:
+            db.query(CodingJob).filter(CodingJob.id == claimed_code.id).update(
+                {CodingJob.lease_expires_at: utc_now() - timedelta(seconds=5)},
+                synchronize_session=False,
+            )
+            db.commit()
+
+        self.assertFalse(
+            c_worker._fenced_finalize(
+                job_id=claimed_code.id,
+                task_id=str(claimed_code.task_id),
+                attempt_id=claimed_code.execution_attempt_id,
+                new_status="COMPLETED_VERIFIED",
+            ),
+            "Expired coding worker MUST NOT finalize before recovery!",
+        )
+        self.assertFalse(
+            c_worker._fenced_update_task_progress(
+                job_id=claimed_code.id,
+                task_id=str(claimed_code.task_id),
+                attempt_id=claimed_code.execution_attempt_id,
+                task_status="TESTING",
+            ),
+            "Expired coding worker MUST NOT update task progress!",
+        )
+        self.assertIsNone(
+            append_coding_task_event(
+                task_id=str(claimed_code.task_id),
+                job_id=claimed_code.id,
+                phase="STEP",
+                event_type="status",
+                message="stale event must be dropped",
+                expected_worker_id=c_worker.worker_id,
+                expected_attempt_id=claimed_code.execution_attempt_id,
+            ),
+            "Expired coding worker MUST NOT append fenced events!",
+        )
+        # Clean up coding job so it doesn't linger for later tests
+        with get_db_context() as db:
+            db.query(CodingJob).filter(CodingJob.id == claimed_code.id).update(
+                {CodingJob.status: "CANCELLED", CodingJob.lease_expires_at: None},
+                synchronize_session=False,
+            )
+            db.commit()
+
+        # 3. ImageJobWorker rejects completion when lease expires mid-generation before recovery
+        with get_db_context() as db:
+            img_job, created_img = create_image_generation_job(
+                db=db, user_id=uid, prompt="Lease expiry test", enforce_quota=False
+            )
+            self.assertTrue(created_img)
+            img_job_id = img_job.id
+
+        img_worker = ImageJobWorker(worker_id="exp_img_w", lease_duration=30, heartbeat_interval=60)
+        claimed_img = img_worker.claim_next_job()
+        self.assertIsNotNone(claimed_img)
+
+        async def _expire_mid_gen(user_id, prompt, params):
+            with get_db_context() as s:
+                s.query(ImageGenerationJob).filter(ImageGenerationJob.id == claimed_img.id).update(
+                    {ImageGenerationJob.lease_expires_at: utc_now() - timedelta(seconds=5)},
+                    synchronize_session=False,
+                )
+                s.commit()
+            return {"id": str(uuid.uuid4()), "provider": "test", "model": "test"}
+
+        ok_img = await img_worker.execute_job(claimed_img, generator_fn=_expire_mid_gen)
+        self.assertFalse(ok_img, "Expired image worker MUST NOT mark job COMPLETED before recovery!")
+        with get_db_context() as db:
+            reloaded = db.query(ImageGenerationJob).filter(ImageGenerationJob.id == img_job_id).first()
+            self.assertEqual(reloaded.status, "RUNNING")
+            reloaded.status = "CANCELLED"
+            reloaded.lease_expires_at = None
+            db.commit()
+
 
 @unittest.skipUnless(
     os.getenv("SAKURA_POSTGRES_TEST", "0") == "1",

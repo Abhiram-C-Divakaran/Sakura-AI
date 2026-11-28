@@ -808,6 +808,8 @@ class ImageJobWorker:
                             ImageGenerationJob.execution_attempt_id == attempt_id,
                             ImageGenerationJob.status == ImageGenerationJobStatus.RUNNING,
                             ImageGenerationJob.cancel_requested == False,  # noqa: E712
+                            ImageGenerationJob.lease_expires_at.isnot(None),
+                            ImageGenerationJob.lease_expires_at > hb_now,
                         ).update(
                             {
                                 ImageGenerationJob.heartbeat_at: hb_now,
@@ -917,6 +919,8 @@ class ImageJobWorker:
                     ImageGenerationJob.execution_attempt_id == attempt_id,
                     ImageGenerationJob.status == ImageGenerationJobStatus.RUNNING,
                     ImageGenerationJob.cancel_requested == False,  # noqa: E712
+                    ImageGenerationJob.lease_expires_at.isnot(None),
+                    ImageGenerationJob.lease_expires_at > done_at,
                 ).update(
                     {
                         ImageGenerationJob.status: ImageGenerationJobStatus.COMPLETED,
@@ -939,6 +943,8 @@ class ImageJobWorker:
                     ImageGenerationJob.execution_attempt_id == attempt_id,
                     ImageGenerationJob.status == ImageGenerationJobStatus.RUNNING,
                     ImageGenerationJob.cancel_requested == True,  # noqa: E712
+                    ImageGenerationJob.lease_expires_at.isnot(None),
+                    ImageGenerationJob.lease_expires_at > done_at,
                 ).update(
                     {
                         ImageGenerationJob.status: ImageGenerationJobStatus.CANCELLED,
@@ -962,6 +968,8 @@ class ImageJobWorker:
                     ImageGenerationJob.worker_id == self.worker_id,
                     ImageGenerationJob.execution_attempt_id == attempt_id,
                     ImageGenerationJob.status == ImageGenerationJobStatus.RUNNING,
+                    ImageGenerationJob.lease_expires_at.isnot(None),
+                    ImageGenerationJob.lease_expires_at > cancel_at,
                 ).update(
                     {
                         ImageGenerationJob.status: ImageGenerationJobStatus.CANCELLED,
@@ -992,6 +1000,8 @@ class ImageJobWorker:
                         ImageGenerationJob.execution_attempt_id == attempt_id,
                         ImageGenerationJob.status == ImageGenerationJobStatus.RUNNING,
                         ImageGenerationJob.cancel_requested == False,  # noqa: E712
+                        ImageGenerationJob.lease_expires_at.isnot(None),
+                        ImageGenerationJob.lease_expires_at > fail_at,
                     ).update(
                         {
                             ImageGenerationJob.status: ImageGenerationJobStatus.QUEUED,
@@ -1015,6 +1025,8 @@ class ImageJobWorker:
                         ImageGenerationJob.worker_id == self.worker_id,
                         ImageGenerationJob.execution_attempt_id == attempt_id,
                         ImageGenerationJob.status == ImageGenerationJobStatus.RUNNING,
+                        ImageGenerationJob.lease_expires_at.isnot(None),
+                        ImageGenerationJob.lease_expires_at > fail_at,
                     ).update(
                         {
                             ImageGenerationJob.status: ImageGenerationJobStatus.FAILED,
