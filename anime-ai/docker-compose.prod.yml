@@ -188,6 +188,11 @@ services:
     volumes:
       - sakura_workspaces:/workspaces
       - sakura_library_data:/data/library
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"from database.db import engine; from sqlalchemy import text; conn = engine.connect(); conn.execute(text('SELECT 1')); conn.close()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 3
     depends_on:
       postgres:
         condition: service_healthy
@@ -257,6 +262,11 @@ services:
       - TAVILY_API_KEY=${TAVILY_API_KEY:-}
     volumes:
       - sakura_workspaces:/workspaces
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"from database.db import engine; from sqlalchemy import text; conn = engine.connect(); conn.execute(text('SELECT 1')); conn.close()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 3
     depends_on:
       postgres:
         condition: service_healthy
@@ -282,6 +292,11 @@ services:
       - SAKURA_SANDBOX_SERVICE_TOKEN=${SAKURA_SANDBOX_SERVICE_TOKEN:?Production requires SAKURA_SANDBOX_SERVICE_TOKEN}
       - SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY=${SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY:?Production requires SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY}
       - ENVIRONMENT=production
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"from database.db import engine; from sqlalchemy import text; conn = engine.connect(); conn.execute(text('SELECT 1')); conn.close()\""]
+      interval: 20s
+      timeout: 5s
+      retries: 3
     depends_on:
       postgres:
         condition: service_healthy
@@ -304,6 +319,11 @@ services:
     # Bind strictly to loopback so public traffic must pass through the TLS reverse proxy
     ports:
       - "${FRONTEND_BIND_HOST:-127.0.0.1}:3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/login').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 3
     depends_on:
       backend-api:
         condition: service_healthy

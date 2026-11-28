@@ -579,8 +579,14 @@ class S3CompatibleStorage(StorageBackend):
             body = s3_obj["Body"]
 
             def chunk_generator():
-                for chunk in body.iter_chunks(chunk_size=64 * 1024):
-                    yield chunk
+                try:
+                    for chunk in body.iter_chunks(chunk_size=64 * 1024):
+                        yield chunk
+                finally:
+                    try:
+                        body.close()
+                    except Exception:
+                        pass
 
             safe_filename = re.sub(r'[\r\n"\\]', "_", str(filename or "download"))
             return StreamingResponse(
