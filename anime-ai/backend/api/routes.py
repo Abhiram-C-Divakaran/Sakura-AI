@@ -841,7 +841,11 @@ async def update_conversation(conversation_id: str, update_data: ConversationUpd
 
 @router.get("/conversations/{conversation_id}/messages", response_model=List[Dict[str, Any]])
 def list_messages(conversation_id: str, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
-    conv = db.query(Conversation).filter(Conversation.id == uuid.UUID(conversation_id), Conversation.user_id == current_user.id).first()
+    try:
+        conv_uuid = uuid.UUID(conversation_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid conversation ID")
+    conv = db.query(Conversation).filter(Conversation.id == conv_uuid, Conversation.user_id == current_user.id).first()
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
     messages = db.query(Message).filter(Message.conversation_id == conv.id).order_by(Message.created_at.asc()).all()
@@ -913,7 +917,11 @@ def list_memory(current_user: User = Depends(AuthManager.get_current_user), db: 
 
 @router.delete("/memory/{memory_id}")
 def delete_memory(memory_id: str, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
-    memory = db.query(UserMemory).filter(UserMemory.id == uuid.UUID(memory_id), UserMemory.user_id == current_user.id).first()
+    try:
+        mem_uuid = uuid.UUID(memory_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid memory ID")
+    memory = db.query(UserMemory).filter(UserMemory.id == mem_uuid, UserMemory.user_id == current_user.id).first()
     if not memory:
         raise HTTPException(status_code=404, detail="Memory not found")
     db.delete(memory)
@@ -968,7 +976,11 @@ class RenameRequest(BaseModel):
 
 @router.post("/documents/{document_id}/rename")
 def rename_document(document_id: str, req: RenameRequest, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
-    doc = db.query(Document).filter(Document.id == uuid.UUID(document_id), Document.user_id == current_user.id).first()
+    try:
+        doc_uuid = uuid.UUID(document_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid document ID format")
+    doc = db.query(Document).filter(Document.id == doc_uuid, Document.user_id == current_user.id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     

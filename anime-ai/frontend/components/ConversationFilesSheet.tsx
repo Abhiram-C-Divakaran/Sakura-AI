@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { X, Download, Eye, Paperclip, FileText, Image as ImageIcon, Code, FileSpreadsheet, Film } from 'lucide-react';
 import { authFetch } from '../lib/auth';
 import { API_BASE } from '../lib/api';
+import { AuthenticatedImage, downloadAuthenticatedFile } from './AuthenticatedImage';
 
 export interface ConversationFile {
   id: string;
@@ -179,7 +180,7 @@ export const ConversationFilesSheet: React.FC<ConversationFilesSheetProps> = ({
                       onClick={() => setPreviewImage(file.url || file.thumbnail || null)}
                       className="w-10 h-10 rounded-lg overflow-hidden bg-black flex-shrink-0 cursor-pointer border border-white/[0.08]"
                     >
-                      <img src={file.thumbnail} alt={file.name} className="w-full h-full object-cover" />
+                      <AuthenticatedImage src={file.thumbnail} alt={file.name} className="w-full h-full object-cover" />
                     </div>
                   ) : (
                     <div className="w-10 h-10 rounded-lg bg-[#181818] flex items-center justify-center flex-shrink-0 border border-white/[0.05]">
@@ -221,16 +222,19 @@ export const ConversationFilesSheet: React.FC<ConversationFilesSheetProps> = ({
                   )}
 
                   {file.url && (
-                    <a
-                      href={file.url}
-                      download={file.filename}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!file.url) return;
+                        void downloadAuthenticatedFile(file.url, file.filename).catch((err) =>
+                          console.error('Conversation file download failed:', err)
+                        );
+                      }}
                       title="Download file"
                       className="p-1.5 text-[#8E8E8E] hover:text-white hover:bg-[#333333] rounded-lg transition-colors cursor-pointer"
                     >
                       <Download className="w-4 h-4" />
-                    </a>
+                    </button>
                   )}
 
                   {onAttachToChat && (
@@ -259,7 +263,7 @@ export const ConversationFilesSheet: React.FC<ConversationFilesSheetProps> = ({
           onClick={() => setPreviewImage(null)}
           className="fixed inset-0 z-60 bg-black/80 flex items-center justify-center p-4 cursor-zoom-out animate-in fade-in duration-150"
         >
-          <img
+          <AuthenticatedImage
             src={previewImage}
             alt="Preview"
             className="max-w-[90vw] max-h-[90vh] object-contain rounded-lg shadow-2xl border border-white/10"

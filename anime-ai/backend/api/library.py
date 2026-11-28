@@ -100,14 +100,21 @@ def get_library_file_content(
 
 
 def authenticate_user_from_req(token: Optional[str], req_headers: Any, db: Session) -> User:
-    """Extracts and verifies user from query token or Authorization header."""
-    raw_token = token
+    """
+    Extracts and verifies user strictly from the Authorization: Bearer header.
+    Query-string JWT tokens (?token=...) are rejected to prevent credential leakage
+    in reverse-proxy access logs, browser history, and Referer headers.
+    """
+    raw_token = None
     auth_header = req_headers.get("authorization") if hasattr(req_headers, "get") else None
-    if not raw_token and auth_header and auth_header.lower().startswith("bearer "):
+    if auth_header and auth_header.lower().startswith("bearer "):
         raw_token = auth_header[7:].strip()
 
     if not raw_token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication credentials required")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization Bearer header is required; query-string tokens are not permitted.",
+        )
 
     try:
         payload = AuthManager.decode_token(raw_token)
