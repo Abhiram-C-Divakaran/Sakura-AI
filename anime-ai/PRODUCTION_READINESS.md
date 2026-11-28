@@ -134,19 +134,20 @@ Optional feature variables:
 
 ---
 
-## 12. GitHub Branch Protection & Repository Governance *(Manual Repository Setting)*
+## 12. GitHub Branch Protection & Repository Governance *(Verified Live on GitHub)*
 
-> **Current Status:** `main` branch protection reports **`protected=false`** (must be configured manually by a repository administrator in GitHub Settings → Branches → Branch protection rules for `main`).
+> **Verified Status (GitHub API — `GET /repos/Abhiram-C-Divakaran/Sakura-AI/branches/main/protection`):** `main` branch protection is **ENABLED (`protected=true`)** with:
+> - `required_pull_request_reviews`: `required_approving_review_count = 1`, `dismiss_stale_reviews = true`
+> - `required_status_checks`: `strict = true` (branch must be up to date) requiring all 4 checks:
+>   - `Backend Tests & Schema Verification`
+>   - `Frontend Typecheck & Build`
+>   - `Docker Sandbox E2E Integration`
+>   - `Full-Stack Integration Tests`
+> - `allow_force_pushes = false`, `allow_deletions = false`
+> - **Optional Governance Hardening (currently `false`):** `enforce_admins = false`, `required_signatures = false`, `required_linear_history = false`, `required_conversation_resolution = false`. Enable `enforce_admins` before opening production/multi-maintainer operations so repository administrators cannot bypass PR checks.
+> - **Main-vs-Hardening Discrepancy Resolution:** Prior to PR #1, `main:anime-ai/PRODUCTION_READINESS.md` recorded `protected=false` from before branch protection was configured on GitHub. Live GitHub API inspection confirms `protected=true` on `main`; merging PR #1 resolves that historical documentation discrepancy on `main`. PR #1 itself currently reports `reviewDecision: REVIEW_REQUIRED` (`reviews: []`) and requires an independent human approving review before merge.
 
-Required settings before staging/production release:
-- Require a pull request before merging (`>= 1` approving review; dismiss stale reviews on new commits).
-- Require status checks to pass before merging (strict — branch must be up to date):
-  - `Backend Tests & Schema Verification`
-  - `Frontend Typecheck & Build`
-  - `Docker Sandbox E2E Integration`
-  - `Full-Stack Integration Tests`
-- Block force pushes and branch deletions on `main`.
-- Require linear history or signed commits per organizational policy.
+Operational service isolation notes:
 - Dedicated `image-worker` service (`python -m media.image_worker`) runs independently from `worker` (`SAKURA_WORKER_HANDLE_IMAGES=false`) in `docker-compose.prod.yml` so long-running background tasks cannot starve image generation or storage deletion maintenance.
 - PostgreSQL backups (`ops/scripts/backup_postgres.sh`) and restore verifications (`ops/scripts/verify_restore.sh`) MUST run with a client whose major version matches the PostgreSQL server (e.g., official `postgres:15` container for PG 15); both scripts enforce major-version parity and `verify_restore.sh` requires the `.sha256` sidecar and fails non-zero if `alembic_version`, core tables, `pgvector` extension, `vector(1536)` column type, or restored data checks fail.
 
@@ -165,4 +166,108 @@ The repository is deployment-neutral and has no confirmed hosting provider or pu
 8. **Monitoring & Alerts:** Health/readiness checks (`/health`, `/readiness`), queue depth, `storage_deletion_outbox` `FAILED` count, HTTP 429/503 spikes, and workspace disk utilization alerts.
 9. **Backup Scheduling & Restore Drills:** Scheduled daily `backup_postgres.sh` uploads to off-host encrypted storage plus regular automated `verify_restore.sh` drills with `REQUIRE_CHECKSUM=true` and `REQUIRE_PGVECTOR=true`.
 10. **Support & Legal Review:** Set `NEXT_PUBLIC_SUPPORT_EMAIL` for `/contact` and obtain formal legal counsel review/sign-off on `/privacy` and `/terms` before public launch.
+
+### Pre-Public-Launch Gate (Beyond Private Staging)
+- Independent security assessment / penetration review of auth, multi-tenant isolation, and sandbox egress controls.
+- Load & concurrency testing against staging PostgreSQL, Redis, and worker replicas.
+- Full end-to-end backup + restore drill into a clean staging PostgreSQL 15 instance (`verify_restore.sh` with `REQUIRE_CHECKSUM=true`, `REQUIRE_PGVECTOR=true`, `REQUIRE_RESTORED_VECTOR=true`).
+- User acceptance testing (UAT) covering desktop & mobile chat, Library, Knowledge Base semantic RAG, image generation/quotas, scheduled tasks, Sakura Code, data export, and account deletion.
+
+### Frontend Image Variation Entry-Point Note
+- `GenerateImageModal.tsx` (`LibraryView.tsx`) generates and preserves a retry-stable `idempotency_key` via `createIdempotencyKey('img_gen')` for `POST /api/v1/library/generate-image`.
+- `POST /api/v1/images/variation` enforces required `idempotency_key` (`HTTP 400`, max 128 chars, collision-safe child job keys), normalized request fingerprint replay (`HTTP 202`, zero extra quota, idempotent re-enqueue of still-`QUEUED` jobs), payload conflict rejection (`HTTP 409`), and legacy `NULL`-fingerprint compatibility validation on the backend. No mounted frontend UI button currently calls `/api/v1/images/variation` (`ImageLightboxModal.tsx` is unmounted), so no dead frontend client helper is shipped.
+
+---
+
+## 14. Evidence-Based Release Readiness Assessment *(PR #1 Release Candidate Status)*
+
+> **Truthfulness Policy:** No live public deployment exists, no external hosting provider is assumed, and no unexecuted or infrastructure-blocked check is claimed as passed. Every capability below is classified strictly by direct verification evidence.
+
+### 1. Implemented
+- Unified lease-fenced `StorageDeletionOutbox` + async `HTTP 202` document deletion + killable isolated subprocess runner (`services/storage_delete_runner.py`, Win32/POSIX process-tree cleanup, bounded stdout/stderr pipe draining).
+- Unexpired-lease fencing and per-row conditional CAS stale-job recovery across all four durable workers: `StorageDeletionOutbox`, `DurableTaskWorker` (`tasks/worker.py`, `tasks/task_manager.py`), `ImageJobWorker` (`media/image_worker.py`), and `CodingJobWorker` (`coding/job_worker.py`).
+- PostgreSQL 15 + `pgvector` native `vector(1536)` Alembic migration (`j9f7a263b56c`) with strict historical JSON/vector validation, rollback/downgrade safety, and version-pinned backup/restore verification scripts (`ops/scripts/backup_postgres.sh`, `ops/scripts/verify_restore.sh`).
+- Image variation idempotency (`HTTP 400` on missing/blank/>128-char keys, `HTTP 202` replay with zero extra quota, `HTTP 409` on payload mismatch, collision-safe child keys, legacy `NULL`-fingerprint compatibility) and atomic `coding_task` quota reservation across both `/api/v1/coding/workspaces/{id}/tasks` and `/api/v1/chat/stream`.
+- Fail-closed production security guards (`config/settings.py`, `coding/capabilities.py`, `coding/sandbox.py`, `coding/sandbox_service.py` with kill-before-remove container cleanup fencing, `services/rate_limit.py`, `ops/scripts/validate_env.py` enforcing secret independence, non-wildcard `CORS_ALLOWED_ORIGINS`, and disabling `SAKURA_DETERMINISTIC_TEST_PROVIDERS`), strict header-only Bearer auth on file downloads/thumbnails (`api/library.py`), strict scheduled-task cross-user ownership + `POST /api/v1/tasks` public task-type allowlist + manual scheduled-run quota enforcement (`tasks/task_manager.py`, `api/routes.py`, `api/scheduled.py`), bounded streaming audio upload & extension allowlist (`api/audio.py`), StorageBackend-aware S3 chat attachment loading (`llm/agent.py`) + S3 stream body cleanup (`services/storage.py`), bounded LLM & embedding provider timeouts (`llm/providers/openai.py`, `anthropic.py`, `rag/embeddings/manager.py`), authenticated Blob-based Library & conversation file previews/downloads (`frontend/components/AuthenticatedImage.tsx`, `LibraryView.tsx`, `FilePreviewModal.tsx`, `ConversationFilesSheet.tsx`), non-root container sandbox isolation (`--user 1001:1001`, `--network none` default, `--cap-drop ALL`, single-workspace mount), `docker-compose.prod.yml` / `frontend/Dockerfile` Redis `--maxmemory-policy noeviction`, healthchecks across all long-running services (`postgres`, `redis`, `sandbox-executor`, `backend-api`, `worker`, `image-worker`, `coding-worker`, `scheduler`, `frontend`), and forwarding of `CORS_ALLOWED_ORIGINS`, `SAKURA_EMBEDDED_WORKER=false`, `NEXT_PUBLIC_SITE_URL`, and `NEXT_PUBLIC_SUPPORT_EMAIL`, plus explicit account-deletion cleanup including `ImageVariationBatch` and prior `FAILED` outbox row reconciliation (`services/account.py`).
+
+### 2. Locally Tested *(Windows Workstation — Python 3.14.3, Node v24.13.0, npm 11.19.0, Docker Compose v5.6.0)*
+- **Python static compilation (`python -m compileall -q .`):** Passed (`exit 0`).
+- **Docker Compose production configuration (`docker compose -f docker-compose.prod.yml config -q`):** Passed (`exit 0`).
+- **Backend test suites (SQLite):** Full backend suite (`unittest discover`) verified with **0 failures** (18 infrastructure-gated skips: 7 PG-only, 10 Docker Sandbox E2E, 1 local Docker daemon check), including **21/21 `test_fail_closed_security_regression.py`** (covering `validate_env.py`, `cancel_execution` kill-before-remove, header-only file downloads, HTTP 400 UUID validation, and bounded AI provider timeouts), `test_image_variation_idempotency_regression.py`, `test_subprocess_hardening_regression.py`, `test_coding_verification_semantics.py`, and `test_postgres_pgvector_and_concurrency.py` cross-dialect checks:
+  - `tests/test_fail_closed_security_regression.py` (all passed)
+  - `tests/test_image_variation_idempotency_regression.py` (all passed)
+  - `tests/test_subprocess_hardening_regression.py` (all passed)
+  - `tests/test_coding_verification_semantics.py` (all passed)
+  - `tests/test_postgres_pgvector_and_concurrency.py` cross-dialect suite (`TestDatabaseContractAndHardening`, including `DurableTaskWorker` lease-resurrection fencing, CAS recovery, and account-deletion outbox/`ImageVariationBatch` cleanup — all passed).
+- **Frontend verification (`anime-ai/frontend`):** `npm ci` (`exit 0`, 364 packages), `npm run typecheck` (`exit 0`, 0 errors), `npm run lint` (`exit 0`, 0 errors; non-blocking warnings only), and `npm run build` (`exit 0`, all 12 routes compiled).
+
+### 3. GitHub CI Verified *(Sakura AI CI — Ubuntu Linux with Real PG 15, Redis 7, Docker & Playwright Chromium)*
+All four required GitHub Actions workflows run on every PR #1 head commit with zero silent skips on PostgreSQL and Docker E2E suites:
+1. **`Backend Tests & Schema Verification`:** Real PostgreSQL 15 + `pgvector` (`pgvector/pgvector:pg15`) and Redis 7 (`redis:7-alpine`): `alembic upgrade head`, `test_schema_parity.py`, `test_scheduler_resilience.py`, `test_postgres_pgvector_and_concurrency.py` (0 skips), official `postgres:15` `backup_postgres.sh` + `verify_restore.sh` (positive + tampered-checksum + corrupted-archive negative checks), `docker-compose.prod.yml config`, backend Docker image build, and full backend test suite.
+2. **`Frontend Typecheck & Build`:** `npm ci`, `npm run typecheck`, `npm run lint`, `npm run build`, Playwright Chromium browser E2E (`npm run test:e2e`, desktop + mobile), and production frontend Docker image build.
+3. **`Docker Sandbox E2E Integration`:** Builds `sakura-sandbox`, `sakura-sandbox-executor`, and `sakura-backend` images; runs PG 15 + Redis + remote Docker `sandbox-executor` + separate `coding.job_worker` container; executes `test_sandbox_e2e_docker.py`, `test_workspace_topology_e2e.py`, and `test_production_remote_coding_e2e.py` (0 skips) and asserts 0 orphaned `sakura-exec-*` / `sakura-smoke-*` containers.
+4. **`Full-Stack Integration Tests`:** Runs PG 15 + Redis + remote Docker `sandbox-executor` + FastAPI API + 3 separate worker containers (`tasks.worker`, `media.image_worker`, `coding.job_worker`) + Next.js frontend and executes unmocked Playwright `npm run test:e2e:fullstack` plus 0 orphaned container check.
+
+### 4. Live Staging Tested
+- **None.** No private staging environment has been provisioned or tested yet.
+
+### 5. Not Tested
+- Live S3-compatible object storage roundtrip (AWS S3 / Cloudflare R2 / MinIO upload, streaming download, signed URL, outbox deletion, SSE/versioning).
+- Live third-party LLM & embedding provider calls (`OpenAI`, `Anthropic`, `Groq`, or live `Ollama`) under production rate limits and semantic RAG ingestion.
+- Live transactional SMTP password-reset delivery and SPF/DKIM/DMARC deliverability.
+- Live Nginx reverse proxy TLS 1.2/1.3 termination, `/api/v1/ws` WebSocket upgrade, unbuffered SSE streaming, and `/readiness` public block.
+- Sustained multi-replica staging concurrency/load tests and manual desktop/mobile UAT.
+
+### 6. Blocked by Missing Infrastructure
+- **On Local Windows Workstation (cannot run locally; verified in GitHub Linux CI instead):**
+  - Docker Desktop Linux Engine daemon is not running (`//./pipe/dockerDesktopLinuxEngine` unavailable) -> blocks local Docker image builds (`backend`, `frontend`, `sandbox-runtime`, `sandbox-executor`), local PostgreSQL 15 + `pgvector` tests (`psql` not installed locally), local Redis 7 integration (`redis-server` not installed locally), local remote Docker sandbox E2E, and local multi-process full-stack integration.
+  - Playwright Chromium headless binary (`chromium_headless_shell-1255`) is not installed locally -> blocks local Playwright browser execution (executed in GitHub CI `Frontend Typecheck & Build` and `Full-Stack Integration Tests`).
+- **For Private Staging & Public Launch:** Provisioning of hosting/isolated sandbox-executor host, PostgreSQL 15 + `pgvector`, Redis 7 (AOF), S3-compatible storage, live LLM/embedding credentials, SMTP relay, domain/DNS/TLS, secret manager, monitoring/alerting, and off-host backup storage.
+
+### 7. Requires Human Approval
+- **PR #1 Independent Approving Review:** Required by live `main` branch protection (`reviewDecision: REVIEW_REQUIRED`, `required_approving_review_count = 1`) before PR #1 can be merged into `main`.
+- **Governance Decision (`enforce_admins`):** Repository owner decision to enable `enforce_admins=true` on `main` before multi-maintainer/public operations.
+- **Security & Infrastructure Sign-Off:** Dedicated isolated host/VM and host egress firewall (`169.254.169.254` and DB subnets blocked) for `sandbox-executor`, plus secret-manager injection and rotation dry-run.
+- **Legal & Support Sign-Off (Public Launch Gate):** Formal legal counsel review of `/privacy` and `/terms` pre-launch drafts and confirmation of production `NEXT_PUBLIC_SUPPORT_EMAIL` on `/contact`.
+- **Explicit Deployment Authorization:** Human operator authorization for private staging deployment and later public launch.
+
+### Component-by-Component Readiness Matrix
+
+| Component | Implemented | Locally Tested (Windows) | GitHub CI Verified | Live Staging Tested | Remaining Gate |
+| --- | --- | --- | --- | --- | --- |
+| PostgreSQL 15 + `pgvector` | Yes | Blocked (no local PG/Docker) | Yes (`pgvector/pgvector:pg15`, 0 skips) | No | Provision staging PG 15 + `pgvector` |
+| Redis 7 (AOF persistence) | Yes | Blocked (no local Redis/Docker) | Yes (`redis:7-alpine`) | No | Provision staging Redis 7 (AOF + `noeviction`) |
+| S3-compatible object storage | Yes | Unit tests only | Unit tests only (CI uses local vol) | No | Provision bucket (SSE + versioning) + staging roundtrip |
+| Live LLM & embedding credentials | Yes | Deterministic/unit only | Deterministic CI only | No | Provision live API keys + staging smoke check |
+| SMTP & password reset delivery | Yes | Fail-closed unit tests | Unit tests only | No | Provision SMTP relay + staging email test |
+| Domain, DNS, TLS & Nginx proxy | Template + validator | `validate_env` unit tests | Not live-tested | No | Provision DNS/TLS + deploy proxy + WS/SSE verify |
+| Secret manager & secret rotation | Guards + runbook | Guard regression suite | Guard regression suite | No | Inject via secret manager + dry-run rotation |
+| Monitoring, alerting & queue health | `/health`, `/readiness` | Endpoint unit tests | Endpoint probes | No | Wire external scraper & alert rules |
+| Backup & restore verification | `backup_postgres.sh`, `verify_restore.sh` | Blocked (no local Docker/PG) | Yes (`postgres:15`, pos + neg) | No | Schedule off-host backups + staging restore drill |
+| Multi-worker concurrency & leases | Unified CAS + unexpired fencing | SQLite concurrency tests | PG `SKIP LOCKED` + 3-worker CI | No | Multi-replica staging load test |
+| Sandbox host & container isolation | Remote HTTP + non-root + caps | Fail-closed + subprocess suites | Docker Sandbox E2E CI (0 skips) | No | Dedicated hardened host + egress firewall |
+| Frontend build & browser E2E | Yes | `npm ci`, `typecheck`, `lint`, `build` (Playwright blocked locally) | Build + Playwright E2E + Full-Stack E2E | No | Desktop & mobile manual staging UAT |
+| Privacy, Terms & Support contact | Pre-launch drafts mounted | Build verified | Browser smoke tested | No | Legal counsel sign-off + `NEXT_PUBLIC_SUPPORT_EMAIL` |
+| GitHub `main` governance | Enabled (`protected=true`) | Verified via `gh api` | 4/4 required checks enforced | N/A | 1 human approving review on PR #1; optional `enforce_admins=true` |
+
+---
+
+## 15. Controlled Private Staging Deployment Checklist *(Deployment-Neutral)*
+
+> **Staging Verdict:** Ready for **controlled private staging deployment** once PR #1 receives an independent approving review, is merged into `main`, and the 12 operator steps below are completed. **No public deployment exists and Sakura AI is not yet approved for public/commercial launch** until live external integrations, security/legal sign-off, and staging restore/load/UAT gates pass.
+
+1. **Hosting & Isolated Sandbox-Executor Infrastructure:** Provision private-network compute separating `sandbox-executor` onto a dedicated hardened VM/host (or rootless Docker / gVisor runtime) with host egress firewall blocking cloud metadata (`169.254.169.254`) and database subnets; ensure only `sandbox-executor` mounts `/var/run/docker.sock` and verify `GET http://sandbox-executor:9000/readiness` returns HTTP 200 (`ready=true`, `non_root_execution=true`, `service_token_configured=true`, `capability_signing_key_configured=true`).
+2. **PostgreSQL 15 with `pgvector`:** Provision private-network PostgreSQL 15 with `pgvector` available; run `docker compose -f docker-compose.prod.yml run --rm migration` (`alembic upgrade head`) and confirm `alembic current` matches head and `document_chunks.embedding` has type `vector(1536)`.
+3. **Redis 7 with AOF Persistence:** Provision private-network Redis 7 with `--appendonly yes --appendfsync everysec` and `maxmemory-policy noeviction` so rate-limit windows and capability replay nonces survive restarts.
+4. **S3-Compatible Object Storage (Encryption & Versioning):** Provision an S3-compatible bucket with server-side encryption (SSE), bucket versioning, and lifecycle rules; configure `SAKURA_STORAGE_BACKEND=s3` with scoped IAM credentials and verify upload/preview/async outbox deletion roundtrip.
+5. **Production LLM & Embedding Credentials:** Inject live provider keys (`OPENAI_API_KEY` for embeddings/GPT, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, or private `OLLAMA_BASE_URL`), ensure `SAKURA_DETERMINISTIC_TEST_PROVIDERS` is unset/disabled, and verify real chat streaming + semantic RAG retrieval.
+6. **SMTP & Password Reset Delivery:** Configure transactional SMTP credentials (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`) and canonical HTTPS `PUBLIC_APP_URL`; execute a real password-reset email delivery and confirmation test.
+7. **Domain, DNS, TLS & Reverse Proxy:** Configure DNS records, TLS 1.2/1.3 certificates, and reverse proxy per `ops/nginx.conf.example` (HTTP/1.1 WebSocket upgrade on `/api/v1/ws`, `proxy_buffering off` on SSE routes, public access to `/readiness` blocked, loopback-only backend/frontend binds, explicit `TRUSTED_PROXY_CIDRS`, `CORS_ALLOWED_ORIGINS`, `NEXT_PUBLIC_SITE_URL`).
+8. **Secret Manager & Secret Rotation:** Inject all independent high-entropy secrets (`POSTGRES_PASSWORD`, `JWT_SECRET`, `INTEGRATION_ENCRYPTION_KEY`, `SAKURA_SANDBOX_SERVICE_TOKEN`, `SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY`) via secret manager (never `.env` in Git), run `python anime-ai/ops/scripts/validate_env.py` (must exit `0`), and dry-run the Section 4 rotation procedure.
+9. **Monitoring, Alerting & Queue Health:** Wire external probes and alerts for `/health`, internal `/readiness` (HTTP 200 `READY`), queue lag (`sakura:tasks:queue`, `sakura:coding:jobs`, `sakura:image:jobs`), `storage_deletion_outbox` `FAILED > 0`, HTTP 401/403/429/503 spikes, and `/workspaces` disk >75%.
+10. **Automated Off-Host Backups & Restore Drills:** Schedule daily `ops/scripts/backup_postgres.sh` (using a `postgres:15` client) with encrypted off-host upload and execute a clean staging restore drill via `ops/scripts/verify_restore.sh` (`REQUIRE_CHECKSUM=true`, `REQUIRE_PGVECTOR=true`, `REQUIRE_RESTORED_VECTOR=true`).
+11. **Multi-Worker Concurrency & Load Tests:** Run staging multi-replica concurrency tests against `worker`, `image-worker`, `coding-worker`, and `backend-api` verifying PostgreSQL `FOR UPDATE SKIP LOCKED` claims, lease renewal/fencing, Redis pub/sub fanout, quota atomicity, and `0` orphaned sandbox containers (`sakura-exec-*`, `sakura-smoke-*`).
+12. **Desktop & Mobile User Acceptance Testing (UAT):** Execute end-to-end manual UAT on desktop and mobile browsers covering registration/login, SMTP password reset, chat streaming + live LLM, Library upload/RAG indexing/async deletion on S3, image generation/variation idempotency/quotas, scheduled tasks, Sakura Code remote sandbox TDD workflow, async data export, and self-service account deletion.
+
+
 

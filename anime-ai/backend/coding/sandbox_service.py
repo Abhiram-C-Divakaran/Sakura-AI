@@ -64,7 +64,15 @@ SANDBOX_CHILD_GID = int(os.getenv("SAKURA_SANDBOX_GID", "1001"))
 
 def _ensure_workspace_root_exists() -> str:
     os.makedirs(WORKSPACE_ROOT, exist_ok=True)
+    # Ensure shared volume root is owned by UID/GID 1001 (0770) so non-root backend-api
+    # and coding-worker containers can create/read workspace directories without root!
+    ensure_workspace_ownership(WORKSPACE_ROOT, recursive=False)
     return WORKSPACE_ROOT
+
+
+@app.on_event("startup")
+async def _init_sandbox_workspace_root() -> None:
+    _ensure_workspace_root_exists()
 
 
 def ensure_workspace_ownership(ws_path: str, *, recursive: bool = True) -> None:
@@ -404,6 +412,14 @@ async def readiness():
     redis_required = is_prod or bool(os.getenv("REDIS_URL", "").strip())
     redis_gate_ok = redis_ok if redis_required else True
 
+    from config.settings import KNOWN_DEV_SECRETS
+    svc_token_val = os.getenv("SAKURA_SANDBOX_SERVICE_TOKEN", SERVICE_TOKEN).strip()
+    cap_key_val = os.getenv("SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY", "").strip()
+    service_token_configured = bool(svc_token_val and svc_token_val not in KNOWN_DEV_SECRETS)
+    capability_signing_key_configured = bool(
+        cap_key_val and len(cap_key_val) >= 32 and cap_key_val not in KNOWN_DEV_SECRETS
+    )
+
     if is_prod:
         is_ready = (
             docker_ok
@@ -414,6 +430,8 @@ async def readiness():
             and ws_root_ok
             and volume_ok
             and redis_gate_ok
+            and service_token_configured
+            and capability_signing_key_configured
         )
     else:
         is_ready = docker_ok and image_ok and container_can_start and non_root and ws_root_ok and volume_ok
@@ -435,6 +453,8 @@ async def readiness():
         "workspace_root": WORKSPACE_ROOT,
         "redis_available": redis_ok,
         "redis_error": redis_error if not redis_ok else None,
+        "service_token_configured": service_token_configured,
+        "capability_signing_key_configured": capability_signing_key_configured,
         "image": SANDBOX_IMAGE,
         "timestamp": now
     }
@@ -560,12 +580,31 @@ async def clone_repository(
             "isolation_unavailable": True
         }
 
+    env = os.getenv("ENVIRONMENT", "development").lower()
+    is_prod = env in ("production", "prod")
+    workspaces_volume = os.getenv("SAKURA_WORKSPACES_VOLUME", WORKSPACES_VOLUME).strip()
+    host_root = get_volume_host_mountpoint(workspaces_volume) if workspaces_volume else None
+    if workspaces_volume and not host_root:
+        return {
+            "success": False,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"Volume resolution failure: Configured Docker workspaces volume '{workspaces_volume}' cannot be resolved on host.",
+            "duration_ms": int((time.time() - start_time) * 1000),
+            "isolation_unavailable": True
+        }
+    if is_prod and not host_root:
+        return {
+            "success": False,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": "Volume resolution failure: Docker workspace volume resolution is required in production.",
+            "duration_ms": int((time.time() - start_time) * 1000),
+            "isolation_unavailable": True
+        }
+
     container_name = f"sakura-clone-{uuid.uuid4().hex[:12]}"
-    mount_source = canonical_ws
-    if WORKSPACES_VOLUME:
-        host_root = get_volume_host_mountpoint(WORKSPACES_VOLUME)
-        if host_root:
-            mount_source = os.path.join(host_root, canonical_ws_id)
+    mount_source = os.path.join(host_root, canonical_ws_id) if host_root else canonical_ws
 
     safe_env = WorkspaceSecurity.build_safe_child_environment()
     env_args = []
@@ -589,6 +628,7 @@ async def clone_repository(
         *expected_clone_cmd
     ]
 
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *docker_run_cmd,
@@ -613,8 +653,23 @@ async def clone_repository(
             "timed_out": False,
             "blocked": False
         }
+    except asyncio.CancelledError:
+        subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
+                pass
+        raise
     except asyncio.TimeoutError:
         subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
+                pass
         return {
             "success": False,
             "exit_code": -1,
@@ -625,6 +680,11 @@ async def clone_repository(
         }
     finally:
         subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
 
 @app.post("/execute")
@@ -985,6 +1045,18 @@ async def execute_command(
                 return so_bytes, se_bytes
 
             stdout_bytes, stderr_bytes = await asyncio.wait_for(drain_all(), timeout=timeout)
+        except asyncio.CancelledError:
+            try:
+                subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3, check=False)
+            except Exception:
+                pass
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except Exception:
+                    pass
+            raise
         except asyncio.TimeoutError:
             timed_out = True
             try:
@@ -994,6 +1066,7 @@ async def execute_command(
             if proc:
                 try:
                     proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
                 except Exception:
                     pass
             stdout_bytes = bytes(stdout_drainer.captured) if stdout_drainer else b""
@@ -1049,7 +1122,14 @@ async def execute_command(
         }
     finally:
         _ACTIVE_EXECUTIONS.pop(exec_id, None)
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
+                pass
         # Idempotent cleanup: unconditionally ensure execution container is removed from Docker
+        # after the CLI process has terminated (prevents Created-state orphan race).
         try:
             subprocess.run(
                 ["docker", "rm", "-f", container_name],
@@ -1073,6 +1153,12 @@ async def cancel_execution(
         return {"cancelled": False, "execution_id": execution_id, "reason": "not_running"}
 
     container_name, proc = entry
+    if proc is not None and proc.returncode is None:
+        try:
+            proc.kill()
+            await asyncio.wait_for(proc.wait(), timeout=1.5)
+        except Exception:
+            pass
     try:
         subprocess.run(
             ["docker", "rm", "-f", container_name],
@@ -1083,11 +1169,6 @@ async def cancel_execution(
         )
     except Exception:
         pass
-    if proc is not None:
-        try:
-            proc.kill()
-        except Exception:
-            pass
     return {"cancelled": True, "execution_id": execution_id, "container_name": container_name}
 
 

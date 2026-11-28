@@ -136,41 +136,104 @@ class DeterministicTestProvider(LLMProvider):
             for t in (tools or [])
             if isinstance(t, dict)
         }
-        # CodingAgent tool set: execute one real workspace write + finish cleanly so
-        # real CodingJobWorker + CodingTaskEvent streaming + git diff execute end-to-end.
+        # CodingAgent tool set: execute full canonical engineering loop:
+        # EXPLORE -> IMPLEMENT (buggy + test) -> TEST (fail) -> FIX (patch) -> RETEST (pass) -> REVIEW DIFF -> DELIVER
         if "write_file" in tool_names and "repository_tree" in tool_names:
             tool_msgs = [m for m in (messages or []) if m.get("role") == "tool"]
-            if len(tool_msgs) == 0:
+            step = len(tool_msgs)
+            if step == 0:
                 return {
-                    "content": "Creating deterministic verification artifact in workspace.",
+                    "content": "Exploring repository and implementing initial module and test suite.",
                     "tool_calls": [
+                        {
+                            "id": "call_det_tree_0",
+                            "name": "repository_tree",
+                            "arguments": {"max_depth": 2},
+                        },
                         {
                             "id": "call_det_write_1",
                             "name": "write_file",
                             "arguments": {
                                 "path": "sakura_fullstack_check.py",
-                                "content": "def add(a, b):\n    return a + b\n\nassert add(2, 3) == 5\n",
+                                "content": "def add(a, b):\n    return a - b  # intentional bug\n",
+                            },
+                        },
+                        {
+                            "id": "call_det_write_2",
+                            "name": "write_file",
+                            "arguments": {
+                                "path": "test_sakura_fullstack.py",
+                                "content": (
+                                    "import os\n"
+                                    "from sakura_fullstack_check import add\n"
+                                    "assert not os.path.exists('/workspaces'), 'parent /workspaces leaked!'\n"
+                                    "assert not os.environ.get('HOST_SENSITIVE_SECRET'), 'host secret leaked!'\n"
+                                    "assert add(2, 3) == 5, f'Expected 5, got {add(2, 3)}'\n"
+                                    "print('SAKURA_REMOTE_DOCKER_TESTS_PASSED')\n"
+                                ),
+                            },
+                        },
+                    ],
+                    "finish_reason": "tool_calls",
+                }
+            if step == 3 and "run_tests" in tool_names:
+                return {
+                    "content": "Running initial test suite inside isolated sandbox.",
+                    "tool_calls": [
+                        {
+                            "id": "call_det_test_fail",
+                            "name": "run_tests",
+                            "arguments": {
+                                "command": "python3 test_sakura_fullstack.py",
                             },
                         }
                     ],
                     "finish_reason": "tool_calls",
                 }
-            if len(tool_msgs) == 1 and "run_tests" in tool_names:
+            if step == 4 and "apply_patch" in tool_names:
                 return {
-                    "content": "Running verification command in workspace.",
+                    "content": "Inspecting failing test output and patching add() in sakura_fullstack_check.py.",
                     "tool_calls": [
                         {
-                            "id": "call_det_test_2",
+                            "id": "call_det_patch",
+                            "name": "apply_patch",
+                            "arguments": {
+                                "path": "sakura_fullstack_check.py",
+                                "target_content": "return a - b  # intentional bug",
+                                "replacement_content": "return a + b",
+                            },
+                        }
+                    ],
+                    "finish_reason": "tool_calls",
+                }
+            if step == 5 and "run_tests" in tool_names:
+                return {
+                    "content": "Re-running verification tests after fix.",
+                    "tool_calls": [
+                        {
+                            "id": "call_det_test_pass",
                             "name": "run_tests",
                             "arguments": {
-                                "command": "python sakura_fullstack_check.py",
+                                "command": "python3 test_sakura_fullstack.py",
                             },
+                        }
+                    ],
+                    "finish_reason": "tool_calls",
+                }
+            if step == 6 and "git_diff" in tool_names:
+                return {
+                    "content": "Reviewing git diff prior to delivery.",
+                    "tool_calls": [
+                        {
+                            "id": "call_det_diff",
+                            "name": "git_diff",
+                            "arguments": {},
                         }
                     ],
                     "finish_reason": "tool_calls",
                 }
             return {
-                "content": "Completed deterministic full-stack workspace update and verification.",
+                "content": "Fixed add() in sakura_fullstack_check.py and verified tests pass inside the isolated Docker sandbox.",
                 "tool_calls": [],
                 "finish_reason": "stop",
             }

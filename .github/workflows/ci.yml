@@ -292,7 +292,7 @@ jobs:
         run: |
           docker build -t sakura-backend:ci-test -f anime-ai/backend/Dockerfile anime-ai/backend
 
-      - name: Start Redis and Sandbox Executor with Shared Workspace Volume
+      - name: Start PostgreSQL 15 (pgvector), Redis, Sandbox Executor & Separate Durable Coding Worker
         env:
           POSTGRES_PASSWORD: "ci_secret_super_secret_pg_pwd"
           JWT_SECRET: "ci_secret_super_secret_jwt_key_32c"
@@ -301,6 +301,11 @@ jobs:
           SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY: "ci_test_capability_signing_key_32chars"
         run: |
           docker network create sakura_ci_net
+          docker run -d --name sakura-ci-postgres --network sakura_ci_net \
+            -e POSTGRES_USER=sakura_sb \
+            -e POSTGRES_PASSWORD=sakura_sb_password \
+            -e POSTGRES_DB=sakura_sb_db \
+            pgvector/pgvector:pg15
           docker run -d --name sakura-ci-redis --network sakura_ci_net -p 6379:6379 redis:7-alpine
           docker volume create sakura_workspaces_vol
           docker run -d --name sakura-sandbox-executor \
@@ -319,6 +324,41 @@ jobs:
             -e ENVIRONMENT="production" \
             -p 9000:9000 \
             sakura-sandbox-executor:latest
+
+          # Wait for PostgreSQL 15 readiness & apply Alembic migrations before starting separate coding worker
+          for i in $(seq 1 30); do
+            if docker exec sakura-ci-postgres pg_isready -U sakura_sb -d sakura_sb_db >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          docker run --rm --network sakura_ci_net \
+            -e DATABASE_URL=postgresql+psycopg2://sakura_sb:sakura_sb_password@sakura-ci-postgres:5432/sakura_sb_db \
+            -e JWT_SECRET=ci_secret_super_secret_jwt_key_32c \
+            -e INTEGRATION_ENCRYPTION_KEY=ci_secret_integration_key_32_chr! \
+            sakura-backend:ci-test \
+            python -m alembic upgrade head
+
+          # Start REAL SEPARATE durable coding.job_worker process using remote HTTP Docker sandbox (ZERO local fallback)
+          docker run -d --name sakura-ci-coding-worker \
+            --network sakura_ci_net \
+            -v sakura_workspaces_vol:/workspaces \
+            -e ENVIRONMENT=test \
+            -e SAKURA_DETERMINISTIC_TEST_PROVIDERS=1 \
+            -e SAKURA_SANDBOX_RUNTIME=remote \
+            -e SAKURA_SANDBOX_URL=http://sakura-sandbox-executor:9000 \
+            -e SAKURA_SANDBOX_EXECUTOR_URL=http://sakura-sandbox-executor:9000 \
+            -e SAKURA_SANDBOX_SERVICE_TOKEN=ci_test_sandbox_token_abc123 \
+            -e SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY=ci_test_capability_signing_key_32chars \
+            -e SAKURA_WORKSPACE_ROOT=/workspaces \
+            -e SAKURA_SHARED_WORKSPACE_ROOT=/workspaces \
+            -e DATABASE_URL=postgresql+psycopg2://sakura_sb:sakura_sb_password@sakura-ci-postgres:5432/sakura_sb_db \
+            -e REDIS_URL=redis://sakura-ci-redis:6379/0 \
+            -e JWT_SECRET=ci_secret_super_secret_jwt_key_32c \
+            -e INTEGRATION_ENCRYPTION_KEY=ci_secret_integration_key_32_chr! \
+            -e HOST_SENSITIVE_SECRET=very_sensitive_host_secret_should_never_leak \
+            sakura-backend:ci-test \
+            python -m coding.job_worker
 
       - name: Wait for Executor /readiness (Fail if Not Ready)
         run: |
@@ -340,19 +380,21 @@ jobs:
             exit 1
           fi
 
-      - name: Run Real Docker Sandbox E2E, Topology & Production Coding Tests Inside Container (Zero Skips Allowed)
+      - name: Run Real Docker Sandbox E2E, Topology & Production Coding Tests Inside Container (PostgreSQL + Separate Worker, Zero Skips)
         run: |
           docker run --rm \
             --network sakura_ci_net \
             -v sakura_workspaces_vol:/workspaces \
             -e SAKURA_SANDBOX_E2E=1 \
+            -e SAKURA_EXTERNAL_CODING_WORKER=1 \
+            -e SAKURA_SANDBOX_RUNTIME=remote \
             -e SAKURA_SANDBOX_URL=http://sakura-sandbox-executor:9000 \
             -e SAKURA_SANDBOX_EXECUTOR_URL=http://sakura-sandbox-executor:9000 \
             -e SAKURA_SANDBOX_SERVICE_TOKEN=ci_test_sandbox_token_abc123 \
             -e SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY=ci_test_capability_signing_key_32chars \
             -e SAKURA_WORKSPACE_ROOT=/workspaces \
             -e SAKURA_SHARED_WORKSPACE_ROOT=/workspaces \
-            -e DATABASE_URL=sqlite:////tmp/sakura_remote_coding_e2e.db \
+            -e DATABASE_URL=postgresql+psycopg2://sakura_sb:sakura_sb_password@sakura-ci-postgres:5432/sakura_sb_db \
             -e REDIS_URL=redis://sakura-ci-redis:6379/0 \
             -e POSTGRES_PASSWORD=ci_secret_super_secret_pg_pwd \
             -e JWT_SECRET=ci_secret_super_secret_jwt_key_32c \
@@ -397,6 +439,8 @@ jobs:
           docker ps -a || true
           echo "=== docker logs sakura-sandbox-executor ==="
           docker logs sakura-sandbox-executor || true
+          echo "=== docker logs sakura-ci-coding-worker ==="
+          docker logs sakura-ci-coding-worker || true
           echo "=== docker version & info inside sakura-sandbox-executor ==="
           docker exec sakura-sandbox-executor which docker || true
           docker exec sakura-sandbox-executor docker version || true
@@ -415,62 +459,19 @@ jobs:
   fullstack-integration:
     name: Full-Stack Integration Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    services:
-      postgres:
-        image: pgvector/pgvector:pg15
-        env:
-          POSTGRES_USER: sakura_fs
-          POSTGRES_PASSWORD: sakura_fs_password
-          POSTGRES_DB: sakura_fs_db
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    timeout-minutes: 20
 
     env:
-      DATABASE_URL: "postgresql+psycopg2://sakura_fs:sakura_fs_password@localhost:5432/sakura_fs_db"
-      REDIS_URL: "redis://localhost:6379/0"
       JWT_SECRET: "test-secret-key-for-fullstack-ci-min-32-chars"
       INTEGRATION_ENCRYPTION_KEY: "test_integration_key_32_chars_fs!"
       SAKURA_SANDBOX_SERVICE_TOKEN: "test_sandbox_service_token_fs_ci"
       SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY: "test_capability_signing_key_32fs!"
-      ENVIRONMENT: "test"
-      SAKURA_DETERMINISTIC_TEST_PROVIDERS: "1"
-      SAKURA_SANDBOX_RUNTIME: "local_restricted"
-      SAKURA_WORKSPACE_ROOT: "/tmp/sakura_fullstack_workspaces"
-      SAKURA_STORAGE_BACKEND: "local"
-      SAKURA_STORAGE_ROOT: "/tmp/sakura_fullstack_storage"
-      SAKURA_EMBEDDED_WORKER: "false"
-      SAKURA_EMBEDDED_SCHEDULER: "false"
-      SAKURA_EMBEDDED_CODING_WORKER: "false"
-      SAKURA_WORKER_HANDLE_IMAGES: "false"
-      SAKURA_QUOTA_IMAGE_DAILY: "3"
+      HOST_SENSITIVE_SECRET: "very_sensitive_host_secret_should_never_leak"
       SAKURA_API_PROXY_TARGET: "http://127.0.0.1:8000"
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v5
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: anime-ai/backend/requirements.txt
 
       - name: Set up Node.js 22
         uses: actions/setup-node@v6
@@ -479,37 +480,128 @@ jobs:
           cache: 'npm'
           cache-dependency-path: anime-ai/frontend/package-lock.json
 
-      - name: Install Backend & Frontend Dependencies
+      - name: Install Frontend Dependencies & Playwright Chromium
+        working-directory: anime-ai/frontend
         run: |
-          python -m pip install --upgrade pip
-          pip install -r anime-ai/backend/requirements.txt
-          cd anime-ai/frontend && npm ci && npx playwright install --with-deps chromium
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run build
 
-      - name: Migrate PostgreSQL & Build Production Frontend
+      - name: Build Sandbox, Executor & Backend Docker Images
         run: |
-          mkdir -p /tmp/sakura_fullstack_workspaces /tmp/sakura_fullstack_storage
-          cd anime-ai/backend && python -m alembic upgrade head
-          cd ../frontend && npm run build
+          docker build -t sakura-sandbox:latest -f anime-ai/sandbox/Dockerfile anime-ai/sandbox
+          docker build -t sakura-sandbox-executor:latest -f anime-ai/backend/Dockerfile.sandbox-executor anime-ai/backend
+          docker build -t sakura-backend:fs-test -f anime-ai/backend/Dockerfile anime-ai/backend
 
-      - name: Start Real Backend, Durable Workers & Frontend and Run Full-Stack Browser E2E
+      - name: Start Integrated Production-Topology Stack (PG15+pgvector, Redis, Remote Docker Executor, API, 3 Separate Workers & Frontend) and Run Full-Stack Browser E2E
         run: |
           set -euo pipefail
-          cd anime-ai/backend
-          uvicorn main:app --host 127.0.0.1 --port 8000 >/tmp/sakura_api.log 2>&1 &
-          API_PID=$!
-          python -m tasks.worker >/tmp/sakura_worker.log 2>&1 &
-          WORKER_PID=$!
-          python -m media.image_worker >/tmp/sakura_img_worker.log 2>&1 &
-          IMG_WORKER_PID=$!
-          python -m coding.job_worker >/tmp/sakura_code_worker.log 2>&1 &
-          CODE_WORKER_PID=$!
+          docker network create sakura_fs_net
+          docker volume create sakura_fs_workspaces
+          docker volume create sakura_fs_storage
 
-          cd ../frontend
+          # Ensure non-root UID 1001 backend/worker containers can write shared library storage volume
+          docker run --rm -u 0 -v sakura_fs_storage:/data/library sakura-backend:fs-test \
+            sh -c "chown -R 1001:1001 /data/library && chmod 770 /data/library"
+
+          docker run -d --name sakura-fs-postgres --network sakura_fs_net \
+            -e POSTGRES_USER=sakura_fs \
+            -e POSTGRES_PASSWORD=sakura_fs_password \
+            -e POSTGRES_DB=sakura_fs_db \
+            pgvector/pgvector:pg15
+
+          docker run -d --name sakura-fs-redis --network sakura_fs_net redis:7-alpine
+
+          docker run -d --name sakura-sandbox-executor \
+            --network sakura_fs_net \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v sakura_fs_workspaces:/workspaces \
+            -e REDIS_URL=redis://sakura-fs-redis:6379/0 \
+            -e SAKURA_SANDBOX_SERVICE_TOKEN="${SAKURA_SANDBOX_SERVICE_TOKEN}" \
+            -e SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY="${SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY}" \
+            -e SAKURA_SANDBOX_IMAGE=sakura-sandbox:latest \
+            -e SAKURA_WORKSPACES_VOLUME=sakura_fs_workspaces \
+            -e SAKURA_WORKSPACE_ROOT=/workspaces \
+            -e HOST_SENSITIVE_SECRET="${HOST_SENSITIVE_SECRET}" \
+            -e ENVIRONMENT=production \
+            -p 127.0.0.1:9000:9000 \
+            sakura-sandbox-executor:latest
+
+          for i in $(seq 1 30); do
+            if docker exec sakura-fs-postgres pg_isready -U sakura_fs -d sakura_fs_db >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+
+          READY=0
+          for i in $(seq 1 30); do
+            BODY=$(curl -sS -w "\nHTTP_STATUS:%{http_code}" http://127.0.0.1:9000/readiness || true)
+            STATUS=$(echo "$BODY" | tail -n1 | sed 's/HTTP_STATUS://')
+            JSON=$(echo "$BODY" | sed '$d')
+            if [ "$STATUS" = "200" ] && echo "$JSON" | grep -q '"ready":true'; then
+              READY=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$READY" != "1" ]; then
+            echo "ERROR: Full-stack remote sandbox executor did not become ready." >&2
+            exit 1
+          fi
+
+          COMMON_ENV=(
+            -e DATABASE_URL=postgresql+psycopg2://sakura_fs:sakura_fs_password@sakura-fs-postgres:5432/sakura_fs_db
+            -e REDIS_URL=redis://sakura-fs-redis:6379/0
+            -e JWT_SECRET="${JWT_SECRET}"
+            -e INTEGRATION_ENCRYPTION_KEY="${INTEGRATION_ENCRYPTION_KEY}"
+            -e SAKURA_SANDBOX_SERVICE_TOKEN="${SAKURA_SANDBOX_SERVICE_TOKEN}"
+            -e SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY="${SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY}"
+            -e HOST_SENSITIVE_SECRET="${HOST_SENSITIVE_SECRET}"
+            -e ENVIRONMENT=test
+            -e SAKURA_DETERMINISTIC_TEST_PROVIDERS=1
+            -e SAKURA_SANDBOX_RUNTIME=remote
+            -e SAKURA_SANDBOX_URL=http://sakura-sandbox-executor:9000
+            -e SAKURA_SANDBOX_EXECUTOR_URL=http://sakura-sandbox-executor:9000
+            -e SAKURA_WORKSPACE_ROOT=/workspaces
+            -e SAKURA_SHARED_WORKSPACE_ROOT=/workspaces
+            -e SAKURA_STORAGE_BACKEND=local
+            -e SAKURA_STORAGE_ROOT=/data/library
+            -e SAKURA_EMBEDDED_WORKER=false
+            -e SAKURA_EMBEDDED_SCHEDULER=false
+            -e SAKURA_EMBEDDED_CODING_WORKER=false
+            -e SAKURA_WORKER_HANDLE_IMAGES=false
+            -e SAKURA_QUOTA_IMAGE_DAILY=3
+          )
+
+          # Migrate PostgreSQL 15 schema to head
+          docker run --rm --network sakura_fs_net "${COMMON_ENV[@]}" sakura-backend:fs-test \
+            python -m alembic upgrade head
+
+          # Start FastAPI backend + 3 SEPARATE durable worker containers (using remote HTTP Docker sandbox!)
+          docker run -d --name sakura-fs-api --network sakura_fs_net \
+            -v sakura_fs_workspaces:/workspaces -v sakura_fs_storage:/data/library \
+            -p 127.0.0.1:8000:8000 "${COMMON_ENV[@]}" sakura-backend:fs-test \
+            uvicorn main:app --host 0.0.0.0 --port 8000
+
+          docker run -d --name sakura-fs-worker --network sakura_fs_net \
+            -v sakura_fs_workspaces:/workspaces -v sakura_fs_storage:/data/library \
+            "${COMMON_ENV[@]}" sakura-backend:fs-test python -m tasks.worker
+
+          docker run -d --name sakura-fs-img-worker --network sakura_fs_net \
+            -v sakura_fs_workspaces:/workspaces -v sakura_fs_storage:/data/library \
+            "${COMMON_ENV[@]}" sakura-backend:fs-test python -m media.image_worker
+
+          docker run -d --name sakura-fs-coding-worker --network sakura_fs_net \
+            -v sakura_fs_workspaces:/workspaces -v sakura_fs_storage:/data/library \
+            "${COMMON_ENV[@]}" sakura-backend:fs-test python -m coding.job_worker
+
+          cd anime-ai/frontend
           npx next start -H 127.0.0.1 -p 3000 >/tmp/sakura_frontend.log 2>&1 &
           FRONT_PID=$!
 
           cleanup() {
-            kill $FRONT_PID $CODE_WORKER_PID $IMG_WORKER_PID $WORKER_PID $API_PID 2>/dev/null || true
+            kill $FRONT_PID 2>/dev/null || true
           }
           trap cleanup EXIT
 
@@ -518,10 +610,23 @@ jobs:
 
           PLAYWRIGHT_BASE_URL=http://127.0.0.1:3000 npm run test:e2e:fullstack
 
+      - name: Verify Zero Orphaned Sandbox Child Containers (Full-Stack)
+        if: always()
+        run: |
+          ORPHANS=$(docker ps -a --filter "name=sakura-exec-" --filter "name=sakura-smoke-" --format "{{.ID}} {{.Names}} {{.Status}}")
+          if [ -n "$ORPHANS" ]; then
+            echo "ERROR: Lingering sandbox child containers detected after full-stack run:"
+            echo "$ORPHANS"
+            exit 1
+          fi
+          echo "Verified 0 lingering sandbox child containers after full-stack run."
+
       - name: Print Service Logs on Failure
         if: failure()
         run: |
-          for log in /tmp/sakura_api.log /tmp/sakura_worker.log /tmp/sakura_img_worker.log /tmp/sakura_code_worker.log /tmp/sakura_frontend.log; do
-            echo "=== $log ==="
-            tail -n 120 "$log" || true
+          for cname in sakura-fs-api sakura-fs-worker sakura-fs-img-worker sakura-fs-coding-worker sakura-sandbox-executor; do
+            echo "=== docker logs $cname ==="
+            docker logs --tail 120 "$cname" || true
           done
+          echo "=== /tmp/sakura_frontend.log ==="
+          tail -n 120 /tmp/sakura_frontend.log || true

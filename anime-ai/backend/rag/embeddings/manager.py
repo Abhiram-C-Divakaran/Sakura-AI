@@ -20,7 +20,8 @@ class EmbeddingManager:
         self.client: Optional[OpenAI] = None
         if self.api_key:
             try:
-                self.client = OpenAI(api_key=self.api_key)
+                timeout_secs = float(os.getenv("EMBEDDING_TIMEOUT_SECONDS", "30.0"))
+                self.client = OpenAI(api_key=self.api_key, timeout=timeout_secs, max_retries=2)
             except Exception as e:
                 print(f"EmbeddingManager: Failed to initialize OpenAI client: {e}")
 

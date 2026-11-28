@@ -257,3 +257,35 @@ class RealtimeManager:
 
 # Singleton manager instance
 ws_manager = RealtimeManager()
+
+
+def publish_user_realtime_event_sync(user_id: str, message: dict) -> bool:
+    """
+    Synchronous cross-worker realtime event publisher for background workers (e.g. outbox
+    deletion worker). Publishes directly to the user's Redis pub/sub channel so connected
+    API instances deliver the event to WebSocket clients immediately.
+    """
+    user_id_str = str(user_id)
+    event_payload = dict(message)
+    event_payload.setdefault("event_id", str(uuid.uuid4()))
+    event_payload["origin_worker_id"] = f"sync_pub_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+    event_payload.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+
+    try:
+        import redis as sync_redis
+        client = sync_redis.from_url(
+            os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+            decode_responses=True,
+            socket_connect_timeout=0.3,
+            socket_timeout=0.5,
+        )
+        try:
+            client.publish(f"sakura:realtime:{user_id_str}", json.dumps(event_payload))
+            return True
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+    except Exception:
+        return False

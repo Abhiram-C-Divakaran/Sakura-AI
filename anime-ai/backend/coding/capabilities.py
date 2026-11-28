@@ -59,15 +59,23 @@ class CapabilityMismatchError(CapabilityError):
 
 
 def get_capability_signing_key() -> str:
-    """Resolves the dedicated signing secret from environment."""
+    """Resolves the dedicated signing secret from environment, failing closed in production."""
     key = os.getenv("SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY", "").strip()
+    env = os.getenv("ENVIRONMENT", "development").lower()
+    is_prod = env in ["production", "prod"]
     if not key:
-        env = os.getenv("ENVIRONMENT", "development").lower()
-        if env in ["production", "prod"]:
+        if is_prod:
             raise RuntimeError(
                 "FATAL PRODUCTION SECURITY ERROR: SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY must be configured in production."
             )
         return "sakura_dev_capability_signing_key_32_chars_ok!"
+    if is_prod:
+        from config.settings import KNOWN_DEV_SECRETS
+        if key in KNOWN_DEV_SECRETS or len(key) < 32:
+            raise RuntimeError(
+                "FATAL PRODUCTION SECURITY ERROR: SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY must be a non-default secret "
+                "of at least 32 characters in production."
+            )
     return key
 
 

@@ -216,7 +216,7 @@ fi
 if [[ -n "${EXPECTED_USER_USERNAME}" ]]; then
   FOUND_PROBE="$(psql --host="${POSTGRES_HOST}" --port="${POSTGRES_PORT}" --username="${POSTGRES_USER}" \
     -d "${VERIFY_DB}" -Atv ON_ERROR_STOP=1 -v uname="${EXPECTED_USER_USERNAME}" \
-    -c "SELECT count(*) FROM users WHERE username = :'uname';")"
+    <<< "SELECT count(*) FROM users WHERE username = :'uname';")"
   if [[ "${FOUND_PROBE}" -lt 1 ]]; then
     echo "ERROR: Expected restored probe user '${EXPECTED_USER_USERNAME}' was not found in restored DB!" >&2
     exit 1

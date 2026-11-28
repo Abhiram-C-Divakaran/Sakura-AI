@@ -404,6 +404,964 @@ class TestDatabaseContractAndHardening(unittest.IsolatedAsyncioTestCase):
         # Valid 1536-dim array passes cleanly
         mod._validate_existing_json_embeddings(_FakeBind([(uuid.uuid4(), _make_unit_vec(7))]))
 
+        # Booleans, strings, and non-finite floats (NaN/Inf) MUST all fail safely with chunk IDs
+        bad_bool_id = uuid.uuid4()
+        with self.assertRaises(RuntimeError) as ctx_bool:
+            mod._validate_existing_json_embeddings(_FakeBind([(bad_bool_id, [True] + [0.0] * 1535)]))
+        self.assertIn(str(bad_bool_id), str(ctx_bool.exception))
+
+        bad_str_id = uuid.uuid4()
+        with self.assertRaises(RuntimeError) as ctx_str:
+            mod._validate_existing_json_embeddings(_FakeBind([(bad_str_id, ["0.1"] + [0.0] * 1535)]))
+        self.assertIn(str(bad_str_id), str(ctx_str.exception))
+
+        bad_nan_id = uuid.uuid4()
+        with self.assertRaises(RuntimeError) as ctx_nan:
+            mod._validate_existing_json_embeddings(_FakeBind([(bad_nan_id, [float("nan")] + [0.0] * 1535)]))
+        self.assertIn(str(bad_nan_id), str(ctx_nan.exception))
+
+        bad_inf_id = uuid.uuid4()
+        with self.assertRaises(RuntimeError) as ctx_inf:
+            mod._validate_existing_json_embeddings(_FakeBind([(bad_inf_id, [float("inf")] + [0.0] * 1535)]))
+        self.assertIn(str(bad_inf_id), str(ctx_inf.exception))
+
+        bad_ninf_id = uuid.uuid4()
+        with self.assertRaises(RuntimeError) as ctx_ninf:
+            mod._validate_existing_json_embeddings(_FakeBind([(bad_ninf_id, [float("-inf")] + [0.0] * 1535)]))
+        self.assertIn(str(bad_ninf_id), str(ctx_ninf.exception))
+
+    def test_unified_delete_document_slow_storage_renewal_concurrent_and_worker_race(self):
+        """
+        Phase 1 comprehensive tests for unified delete_document():
+        1. API deletion with slow storage > initial lease renews lease & completes cleanly.
+        2. Two simultaneous API deletion calls NEVER duplicate physical deletion or steal claim.
+        3. API deletion racing with active worker claim NEVER steals claim or deletes DB row.
+        4. Storage failure retains Document (DELETE_FAILED) and repeated deletion succeeds once storage recovers.
+        5. Timeout + late completion quarantines outbox, retains Document, and late finish cannot delete DB row.
+        6. DB failure after physical deletion recovers cleanly via outbox worker.
+        """
+        import threading
+        from services.documents import delete_document
+
+        # 1. Slow storage deletion exceeding initial lease -> renews lease & completes cleanly
+        slow_storage = _SlowLocalStorage(root_dir=self.tmp_dir, delay_seconds=0.45)
+        with get_db_context() as db:
+            user = _make_user(db, "del_slow")
+            doc_id = uuid.uuid4()
+            key = f"users/{user.id}/documents/{doc_id}/slow.txt"
+            slow_storage.put(key, b"slow_api_delete", content_type="text/plain", user_id=user.id)
+            db.add(Document(
+                id=doc_id, user_id=user.id, filename="slow.txt", mime_type="text/plain",
+                storage_path=key, storage_key=key, storage_backend="local",
+            ))
+            db.commit()
+
+            res = delete_document(
+                doc_id, user.id, db,
+                storage_override=slow_storage,
+                lease_seconds=0.25,
+                renew_interval=0.08,
+                operation_timeout_seconds=5.0,
+            )
+            self.assertEqual(res["deletion_status"], "COMPLETED")
+            self.assertGreaterEqual(res["lease_renewals"], 2)
+            self.assertFalse(slow_storage.exists(key))
+            self.assertIsNone(db.query(Document).filter(Document.id == doc_id).first())
+
+        # 2. Two simultaneous API deletion calls -> physical delete invoked ONCE; second sees in-progress/completed
+        class _BarrierCountingStorage(LocalFilesystemStorage):
+            def __init__(self, root_dir: str):
+                super().__init__(root_dir=root_dir)
+                self.started = threading.Event()
+                self.allow_finish = threading.Event()
+                self.delete_calls = 0
+                self._lock = threading.Lock()
+
+            def delete(self, storage_key: str) -> bool:
+                with self._lock:
+                    self.delete_calls += 1
+                self.started.set()
+                self.allow_finish.wait(timeout=3.0)
+                return super().delete(storage_key)
+
+        barrier_storage = _BarrierCountingStorage(root_dir=self.tmp_dir)
+        with get_db_context() as db:
+            user2 = _make_user(db, "del_race")
+            doc2_id = uuid.uuid4()
+            key2 = f"users/{user2.id}/documents/{doc2_id}/race.txt"
+            barrier_storage.put(key2, b"race_bytes", content_type="text/plain", user_id=user2.id)
+            db.add(Document(
+                id=doc2_id, user_id=user2.id, filename="race.txt", mime_type="text/plain",
+                storage_path=key2, storage_key=key2, storage_backend="local",
+            ))
+            db.commit()
+            u2_id = user2.id
+
+        res_holder = {}
+
+        def _call_one():
+            with get_db_context() as s1:
+                res_holder["one"] = delete_document(
+                    doc2_id, u2_id, s1,
+                    storage_override=barrier_storage,
+                    raise_on_storage_error=False,
+                    lease_seconds=30.0,
+                )
+
+        t1 = threading.Thread(target=_call_one)
+        t1.start()
+        self.assertTrue(barrier_storage.started.wait(timeout=2.0), "First API delete did not start")
+
+        # While call 1 holds unexpired PROCESSING lease, call 2 arrives -> MUST NOT steal claim or call delete!
+        with get_db_context() as s2:
+            res_two = delete_document(
+                doc2_id, u2_id, s2,
+                storage_override=barrier_storage,
+                raise_on_storage_error=False,
+                lease_seconds=30.0,
+            )
+        self.assertTrue(res_two.get("already_in_progress"))
+        self.assertEqual(res_two["deletion_status"], "DELETING")
+        self.assertEqual(barrier_storage.delete_calls, 1, "Concurrent API delete MUST NOT invoke duplicate physical deletion!")
+
+        barrier_storage.allow_finish.set()
+        t1.join(timeout=3.0)
+        self.assertEqual(res_holder["one"]["deletion_status"], "COMPLETED")
+        self.assertEqual(barrier_storage.delete_calls, 1)
+        self.assertFalse(barrier_storage.exists(key2))
+
+        # 3. API deletion racing with active background worker claim -> API does NOT steal worker's lease!
+        with get_db_context() as db:
+            user3 = _make_user(db, "del_wrace")
+            doc3_id = uuid.uuid4()
+            key3 = f"users/{user3.id}/documents/{doc3_id}/wrace.txt"
+            LocalFilesystemStorage(root_dir=self.tmp_dir).put(key3, b"worker_owned", content_type="text/plain", user_id=user3.id)
+            db.add(Document(
+                id=doc3_id, user_id=user3.id, filename="wrace.txt", mime_type="text/plain",
+                storage_path=key3, storage_key=key3, storage_backend="local",
+            ))
+            worker_token = uuid.uuid4()
+            outbox3_id = uuid.uuid4()
+            db.add(StorageDeletionOutbox(
+                id=outbox3_id, user_id=user3.id, document_id=doc3_id,
+                storage_backend="local", storage_key=key3,
+                status="PROCESSING", worker_id="bg_worker_active",
+                claim_token=worker_token, claimed_at=utc_now(),
+                lease_expires_at=utc_now() + timedelta(seconds=60),
+                attempt_count=0, max_attempts=5, created_at=utc_now(), updated_at=utc_now(),
+            ))
+            db.commit()
+
+            api_race_res = delete_document(
+                doc3_id, user3.id, db,
+                storage_override=LocalFilesystemStorage(root_dir=self.tmp_dir),
+                raise_on_storage_error=False,
+            )
+            self.assertTrue(api_race_res.get("already_in_progress"))
+            ob3 = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == outbox3_id).first()
+            self.assertEqual(ob3.worker_id, "bg_worker_active")
+            self.assertEqual(ob3.claim_token, worker_token)
+            self.assertIsNotNone(db.query(Document).filter(Document.id == doc3_id).first())
+
+        # 4. Storage failure -> retains Document (DELETE_FAILED); repeated API deletion succeeds once storage recovers
+        flaky = _FailingThenWorkingStorage(root_dir=self.tmp_dir, fail_count=1)
+        with get_db_context() as db:
+            user4 = _make_user(db, "del_retry")
+            doc4_id = uuid.uuid4()
+            key4 = f"users/{user4.id}/documents/{doc4_id}/retry.txt"
+            flaky.put(key4, b"retry_doc", content_type="text/plain", user_id=user4.id)
+            db.add(Document(
+                id=doc4_id, user_id=user4.id, filename="retry.txt", mime_type="text/plain",
+                storage_path=key4, storage_key=key4, storage_backend="local",
+            ))
+            db.commit()
+
+            r_fail = delete_document(doc4_id, user4.id, db, storage_override=flaky, raise_on_storage_error=False)
+            self.assertEqual(r_fail["deletion_status"], "DELETE_FAILED")
+            d4 = db.query(Document).filter(Document.id == doc4_id).first()
+            self.assertIsNotNone(d4)
+            self.assertEqual(d4.deletion_status, "DELETE_FAILED")
+            self.assertTrue(flaky.exists(key4))
+
+            # Repeated API deletion reuses same outbox row and succeeds
+            r_ok = delete_document(doc4_id, user4.id, db, storage_override=flaky, raise_on_storage_error=False)
+            self.assertEqual(r_ok["deletion_status"], "COMPLETED")
+            self.assertEqual(r_ok["outbox_id"], r_fail["outbox_id"])
+            self.assertFalse(flaky.exists(key4))
+            self.assertIsNone(db.query(Document).filter(Document.id == doc4_id).first())
+
+        # 5. Timeout + late completion -> quarantined in PROCESSING, Document retained, late finish cannot delete DB row
+        class _StuckStorage(LocalFilesystemStorage):
+            def __init__(self, root_dir: str):
+                super().__init__(root_dir=root_dir)
+                self.release = threading.Event()
+                self.finished = threading.Event()
+
+            def delete(self, storage_key: str) -> bool:
+                self.release.wait(timeout=3.0)
+                self.finished.set()
+                return super().delete(storage_key)
+
+        stuck = _StuckStorage(root_dir=self.tmp_dir)
+        with get_db_context() as db:
+            user5 = _make_user(db, "del_timeout")
+            doc5_id = uuid.uuid4()
+            key5 = f"users/{user5.id}/documents/{doc5_id}/stuck.txt"
+            stuck.put(key5, b"stuck_bytes", content_type="text/plain", user_id=user5.id)
+            db.add(Document(
+                id=doc5_id, user_id=user5.id, filename="stuck.txt", mime_type="text/plain",
+                storage_path=key5, storage_key=key5, storage_backend="local",
+            ))
+            db.commit()
+
+            r_to = delete_document(
+                doc5_id, user5.id, db,
+                storage_override=stuck,
+                raise_on_storage_error=False,
+                lease_seconds=0.22,
+                renew_interval=0.08,
+                operation_timeout_seconds=0.25,
+                timeout_grace_seconds=0.08,
+            )
+            self.assertTrue(r_to.get("timed_out"))
+            self.assertEqual(r_to["deletion_status"], "DELETE_FAILED")
+            # Document still retained and outbox quarantined in PROCESSING (not released to PENDING!)
+            self.assertIsNotNone(db.query(Document).filter(Document.id == doc5_id).first())
+            ob5 = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == uuid.UUID(r_to["outbox_id"])).first()
+            self.assertEqual(ob5.status, "PROCESSING")
+
+            # Now late operation completes -> DB row MUST still remain untouched until proper recovery/re-claim!
+            stuck.release.set()
+            self.assertTrue(stuck.finished.wait(timeout=2.0))
+            db.expire_all()
+            self.assertIsNotNone(db.query(Document).filter(Document.id == doc5_id).first())
+            # Clean up test-5 quarantined row so it does not leak into subsequent tests sharing the DB
+            db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == ob5.id).update(
+                {StorageDeletionOutbox.status: "COMPLETED", StorageDeletionOutbox.lease_expires_at: None},
+                synchronize_session=False,
+            )
+            db.commit()
+
+        # 6. DB failure after physical deletion -> outbox stays PROCESSING until lease expiry, then worker recovers & deletes DB row
+        local_store = LocalFilesystemStorage(root_dir=self.tmp_dir)
+        with get_db_context() as db:
+            user6 = _make_user(db, "del_dbfail")
+            doc6_id = uuid.uuid4()
+            key6 = f"users/{user6.id}/documents/{doc6_id}/dbfail.txt"
+            local_store.put(key6, b"gone_before_db_commit", content_type="text/plain", user_id=user6.id)
+            db.add(Document(
+                id=doc6_id, user_id=user6.id, filename="dbfail.txt", mime_type="text/plain",
+                storage_path=key6, storage_key=key6, storage_backend="local",
+            ))
+            db.commit()
+
+            with patch(
+                "services.documents.finalize_claimed_outbox_entry",
+                side_effect=RuntimeError("Simulated DB commit failure after storage delete"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    delete_document(doc6_id, user6.id, db, storage_override=local_store, lease_seconds=30.0)
+
+            # Physical object is already deleted, but DB row and PROCESSING outbox row remain consistent!
+            self.assertFalse(local_store.exists(key6))
+            self.assertIsNotNone(db.query(Document).filter(Document.id == doc6_id).first())
+            ob6 = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.document_id == doc6_id).first()
+            self.assertIsNotNone(ob6)
+            self.assertEqual(ob6.status, "PROCESSING")
+
+            # Simulate lease expiry -> background worker recovers stale claim, deletes missing object idempotently, removes Document!
+            db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == ob6.id).update(
+                {StorageDeletionOutbox.lease_expires_at: utc_now() - timedelta(seconds=5)},
+                synchronize_session=False,
+            )
+            db.commit()
+            db.expire_all()
+
+            rec_stats = process_storage_deletion_outbox(
+                db=db, limit=10, storage_override=local_store, worker_id="recovery_after_db_fail",
+            )
+            self.assertGreaterEqual(rec_stats["recovered"], 1)
+            self.assertGreaterEqual(rec_stats["completed"], 1)
+            db.expire_all()
+            self.assertIsNone(db.query(Document).filter(Document.id == doc6_id).first())
+            ob6_after = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == ob6.id).first()
+            self.assertEqual(ob6_after.status, "COMPLETED")
+
+    def test_legacy_null_fingerprint_variation_batch_compatibility_policy(self):
+        """Legacy ImageVariationBatch rows with NULL fingerprint reject mismatched params (409) & backfill on match."""
+        with get_db_context() as db:
+            user = _make_user(db, "var_legacy")
+            img_a = uuid.uuid4()
+            img_b = uuid.uuid4()
+            for iid, prompt in ((img_a, "Legacy A"), (img_b, "Legacy B")):
+                db.add(Document(id=iid, user_id=user.id, filename=f"{iid}.png", mime_type="image/png", storage_path="/tmp/l.png"))
+                db.flush()
+                db.add(GeneratedImage(
+                    id=iid, user_id=user.id, document_id=iid, prompt=prompt, enhanced_prompt=prompt,
+                    aspect_ratio="1:1", width=1024, height=1024, model="flux",
+                    storage_path="/tmp/l.png", image_url=f"/api/v1/library/files/{iid}/download",
+                ))
+            db.flush()
+            j1 = ImageGenerationJob(
+                id=uuid.uuid4(), user_id=user.id, prompt="Legacy A (variation 1)",
+                requested_pipeline="auto", status="QUEUED",
+                parameters={"parent_image_id": str(img_a), "intensity": "medium", "conversation_id": None},
+            )
+            j2 = ImageGenerationJob(
+                id=uuid.uuid4(), user_id=user.id, prompt="Legacy A (variation 2)",
+                requested_pipeline="auto", status="QUEUED",
+                parameters={"parent_image_id": str(img_a), "intensity": "medium", "conversation_id": None},
+            )
+            legacy_batch = ImageVariationBatch(
+                id=uuid.uuid4(),
+                user_id=user.id,
+                idempotency_key="legacy-null-fp-key",
+                request_fingerprint=None,
+                parent_image_id=img_a,
+                job_ids=[str(j1.id), str(j2.id)],
+                created_at=utc_now(),
+            )
+            db.add_all([j1, j2, legacy_batch])
+            db.commit()
+            token = AuthManager.create_access_token({"sub": user.username})
+            orig_ids = [str(j1.id), str(j2.id)]
+            batch_id = legacy_batch.id
+
+        headers = {"Authorization": f"Bearer {token}"}
+        # Mismatched count -> HTTP 409
+        r_bad_cnt = self.client.post(
+            "/api/v1/images/variation", headers=headers,
+            json={"parent_image_id": str(img_a), "count": 3, "idempotency_key": "legacy-null-fp-key"},
+        )
+        self.assertEqual(r_bad_cnt.status_code, 409)
+
+        # Mismatched parent_image_id -> HTTP 409
+        r_bad_parent = self.client.post(
+            "/api/v1/images/variation", headers=headers,
+            json={"parent_image_id": str(img_b), "count": 2, "idempotency_key": "legacy-null-fp-key"},
+        )
+        self.assertEqual(r_bad_parent.status_code, 409)
+
+        # Matching params -> HTTP 202 replay with original job IDs & fingerprint backfilled!
+        r_ok = self.client.post(
+            "/api/v1/images/variation", headers=headers,
+            json={"parent_image_id": str(img_a), "count": 2, "idempotency_key": "legacy-null-fp-key"},
+        )
+        self.assertEqual(r_ok.status_code, 202, r_ok.text)
+        self.assertTrue(r_ok.json()["idempotent_replay"])
+        self.assertEqual([j["id"] for j in r_ok.json()["jobs"]], orig_ids)
+
+        with get_db_context() as db:
+            refreshed = db.query(ImageVariationBatch).filter(ImageVariationBatch.id == batch_id).first()
+            self.assertIsNotNone(refreshed.request_fingerprint, "Legacy batch fingerprint should be backfilled on verified match")
+
+            # Unverifiable legacy NULL-fingerprint batch (missing stored jobs) MUST reject with HTTP 409!
+            unverifiable_batch = ImageVariationBatch(
+                id=uuid.uuid4(),
+                user_id=refreshed.user_id,
+                idempotency_key="legacy-unverifiable-key",
+                request_fingerprint=None,
+                parent_image_id=img_a,
+                job_ids=[str(uuid.uuid4()), str(uuid.uuid4())],  # jobs do not exist in DB!
+                created_at=utc_now(),
+            )
+            db.add(unverifiable_batch)
+            db.commit()
+
+        r_unverifiable = self.client.post(
+            "/api/v1/images/variation", headers=headers,
+            json={"parent_image_id": str(img_a), "count": 2, "idempotency_key": "legacy-unverifiable-key"},
+        )
+        self.assertEqual(
+            r_unverifiable.status_code,
+            409,
+            f"Unverifiable legacy NULL-fingerprint batch MUST be rejected with 409, got {r_unverifiable.status_code}: {r_unverifiable.text}",
+        )
+
+    def test_outbox_subprocess_timeout_termination_worker_cancel_lease_loss_and_async_api(self):
+        """
+        Phase 1 & 2 verification:
+        1. Killable isolated subprocess timeout definitively kills OS process before file deletion,
+           retains Document (DELETE_FAILED), requeues outbox, and retry succeeds cleanly.
+        2. Worker cancellation terminates active deletion subprocess cleanly and releases claim for retry.
+        3. Lease renewal failure mid-deletion aborts immediately ('stale') with zero DB writes.
+        4. Authoritative async API DELETE /api/v1/library/files/{id} returns HTTP 202 (DELETING),
+           never overwrites an active PROCESSING claim, and worker completes physical + DB removal.
+        """
+        import threading
+
+        # 1. Killable subprocess timeout termination (using real SAKURA_STORAGE_ROOT)
+        with patch.dict(os.environ, {"SAKURA_STORAGE_ROOT": self.tmp_dir}):
+            local_store = LocalFilesystemStorage(root_dir=self.tmp_dir)
+            with get_db_context() as db:
+                user = _make_user(db, "subproc_to")
+                doc_id = uuid.uuid4()
+                key = f"users/{user.id}/documents/{doc_id}/subproc_to.txt"
+                local_store.put(key, b"must_survive_timeout_kill", content_type="text/plain", user_id=user.id)
+                db.add(Document(
+                    id=doc_id, user_id=user.id, filename="subproc_to.txt", mime_type="text/plain",
+                    storage_path=key, storage_key=key, storage_backend="local",
+                ))
+                oid = uuid.uuid4()
+                db.add(StorageDeletionOutbox(
+                    id=oid, user_id=user.id, document_id=doc_id,
+                    storage_backend="local", storage_key=key,
+                    status="PENDING", attempt_count=0, max_attempts=5,
+                    next_retry_at=utc_now() - timedelta(seconds=1),
+                    created_at=utc_now(), updated_at=utc_now(),
+                ))
+                db.commit()
+
+                stats_to = process_storage_deletion_outbox(
+                    db=db,
+                    limit=5,
+                    storage_override=None,
+                    worker_id="subproc_to_worker",
+                    lease_seconds=2.0,
+                    renew_interval=0.15,
+                    operation_timeout_seconds=0.45,
+                    timeout_grace_seconds=0.20,
+                    use_subprocess=True,
+                    subprocess_test_delay_seconds=5.0,
+                )
+                self.assertGreaterEqual(stats_to["subprocess_terminated"], 1)
+                self.assertGreaterEqual(stats_to["retried"], 1)
+                # Subprocess was definitively killed BEFORE deleting the file!
+                self.assertTrue(local_store.exists(key), "Timed-out subprocess MUST be killed before mutating storage!")
+                doc_row = db.query(Document).filter(Document.id == doc_id).first()
+                self.assertIsNotNone(doc_row)
+                self.assertEqual(doc_row.deletion_status, "DELETE_FAILED")
+
+                # Fast-forward backoff & retry without delay -> succeeds cleanly via subprocess!
+                db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == oid).update(
+                    {StorageDeletionOutbox.next_retry_at: utc_now() - timedelta(seconds=1)},
+                    synchronize_session=False,
+                )
+                db.commit()
+                db.expire_all()
+
+                stats_ok = process_storage_deletion_outbox(
+                    db=db, limit=5, storage_override=None, worker_id="subproc_retry_worker", use_subprocess=True,
+                )
+                self.assertGreaterEqual(stats_ok["completed"], 1)
+                self.assertFalse(local_store.exists(key))
+                self.assertIsNone(db.query(Document).filter(Document.id == doc_id).first())
+
+            # 2. Worker cancellation terminates active subprocess cleanly
+            with get_db_context() as db:
+                user_c = _make_user(db, "subproc_cancel")
+                doc_c = uuid.uuid4()
+                key_c = f"users/{user_c.id}/documents/{doc_c}/cancel_me.txt"
+                local_store.put(key_c, b"cancel_bytes", content_type="text/plain", user_id=user_c.id)
+                db.add(Document(
+                    id=doc_c, user_id=user_c.id, filename="cancel_me.txt", mime_type="text/plain",
+                    storage_path=key_c, storage_key=key_c, storage_backend="local",
+                ))
+                oid_c = uuid.uuid4()
+                db.add(StorageDeletionOutbox(
+                    id=oid_c, user_id=user_c.id, document_id=doc_c,
+                    storage_backend="local", storage_key=key_c,
+                    status="PENDING", attempt_count=0, max_attempts=5,
+                    next_retry_at=utc_now() - timedelta(seconds=1),
+                    created_at=utc_now(), updated_at=utc_now(),
+                ))
+                db.commit()
+
+                cancel_ev = threading.Event()
+                timer = threading.Timer(0.25, cancel_ev.set)
+                timer.start()
+                try:
+                    stats_c = process_storage_deletion_outbox(
+                        db=db,
+                        limit=5,
+                        storage_override=None,
+                        worker_id="subproc_cancel_worker",
+                        lease_seconds=5.0,
+                        operation_timeout_seconds=10.0,
+                        timeout_grace_seconds=0.2,
+                        worker_cancel_event=cancel_ev,
+                        use_subprocess=True,
+                        subprocess_test_delay_seconds=5.0,
+                    )
+                finally:
+                    timer.cancel()
+
+                self.assertGreaterEqual(stats_c["cancelled"], 1)
+                self.assertGreaterEqual(stats_c["subprocess_terminated"], 1)
+                self.assertTrue(local_store.exists(key_c))
+                ob_c = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == oid_c).first()
+                self.assertEqual(ob_c.status, "PENDING")
+
+                # Next worker completes cleanly
+                stats_c2 = process_storage_deletion_outbox(
+                    db=db, limit=5, storage_override=None, worker_id="subproc_after_cancel", use_subprocess=True,
+                )
+                self.assertGreaterEqual(stats_c2["completed"], 1)
+                self.assertFalse(local_store.exists(key_c))
+                self.assertIsNone(db.query(Document).filter(Document.id == doc_c).first())
+
+        # 3. Lease renewal failure while storage op is running -> aborts ('stale'), zero DB writes
+        class _StealOnStartStorage(LocalFilesystemStorage):
+            def __init__(self, root_dir: str, outbox_id_to_steal: uuid.UUID):
+                super().__init__(root_dir=root_dir)
+                self.outbox_id_to_steal = outbox_id_to_steal
+                self.cancel_ev = None
+
+            def set_cancel_event(self, ev):
+                self.cancel_ev = ev
+
+            def delete(self, storage_key: str) -> bool:
+                # Simulate another worker taking over claim in DB while this worker is running
+                with get_db_context() as s_other:
+                    s_other.query(StorageDeletionOutbox).filter(
+                        StorageDeletionOutbox.id == self.outbox_id_to_steal
+                    ).update(
+                        {
+                            StorageDeletionOutbox.worker_id: "displacing_worker",
+                            StorageDeletionOutbox.claim_token: uuid.uuid4(),
+                        },
+                        synchronize_session=False,
+                    )
+                    s_other.commit()
+                # Wait until lease renewal detects loss and signals cancel_ev
+                if self.cancel_ev is not None:
+                    self.cancel_ev.wait(timeout=2.0)
+                    return False
+                time.sleep(0.5)
+                return False
+
+        with get_db_context() as db:
+            user_l = _make_user(db, "lease_loss_run")
+            doc_l = uuid.uuid4()
+            oid_l = uuid.uuid4()
+            key_l = f"users/{user_l.id}/documents/{doc_l}/lease_loss.txt"
+            steal_store = _StealOnStartStorage(root_dir=self.tmp_dir, outbox_id_to_steal=oid_l)
+            steal_store.put(key_l, b"protected", content_type="text/plain", user_id=user_l.id)
+            db.add(Document(
+                id=doc_l, user_id=user_l.id, filename="lease_loss.txt", mime_type="text/plain",
+                storage_path=key_l, storage_key=key_l, storage_backend="local",
+            ))
+            db.add(StorageDeletionOutbox(
+                id=oid_l, user_id=user_l.id, document_id=doc_l,
+                storage_backend="local", storage_key=key_l,
+                status="PENDING", attempt_count=0, max_attempts=5,
+                next_retry_at=utc_now() - timedelta(seconds=1),
+                created_at=utc_now(), updated_at=utc_now(),
+            ))
+            db.commit()
+
+            stats_l = process_storage_deletion_outbox(
+                db=db,
+                limit=5,
+                storage_override=steal_store,
+                worker_id="displaced_worker",
+                lease_seconds=0.25,
+                renew_interval=0.08,
+                operation_timeout_seconds=3.0,
+            )
+            self.assertGreaterEqual(stats_l["stale"], 1)
+            self.assertIsNotNone(db.query(Document).filter(Document.id == doc_l).first())
+            ob_l = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == oid_l).first()
+            self.assertEqual(ob_l.worker_id, "displacing_worker")
+            # Clean up so it doesn't linger in shared DB
+            db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == oid_l).update(
+                {StorageDeletionOutbox.status: "COMPLETED", StorageDeletionOutbox.lease_expires_at: None},
+                synchronize_session=False,
+            )
+            db.commit()
+
+        # 4. Authoritative async HTTP 202 API DELETE /api/v1/library/files/{id}
+        with patch.dict(os.environ, {"SAKURA_STORAGE_ROOT": self.tmp_dir}):
+            local_store = LocalFilesystemStorage(root_dir=self.tmp_dir)
+            with get_db_context() as db:
+                user_a = _make_user(db, "api_async_del")
+                doc_a = uuid.uuid4()
+                key_a = f"users/{user_a.id}/documents/{doc_a}/async_api.txt"
+                local_store.put(key_a, b"async_payload", content_type="text/plain", user_id=user_a.id)
+                db.add(Document(
+                    id=doc_a, user_id=user_a.id, filename="async_api.txt", mime_type="text/plain",
+                    storage_path=key_a, storage_key=key_a, storage_backend="local",
+                ))
+                db.commit()
+                tok_a = AuthManager.create_access_token({"sub": user_a.username})
+
+            hdrs_a = {"Authorization": f"Bearer {tok_a}"}
+            r_del = self.client.delete(f"/api/v1/library/files/{doc_a}", headers=hdrs_a)
+            self.assertEqual(r_del.status_code, 202, r_del.text)
+            body_del = r_del.json()
+            self.assertEqual(body_del["deletion_status"], "DELETING")
+            self.assertTrue(body_del.get("outbox_id"))
+            # Physical file & Document row MUST still exist until worker executes outbox!
+            self.assertTrue(local_store.exists(key_a))
+
+            # Simulate active worker claim -> repeat API delete MUST NOT overwrite PROCESSING claim!
+            with get_db_context() as db:
+                active_tok = uuid.uuid4()
+                db.query(StorageDeletionOutbox).filter(
+                    StorageDeletionOutbox.id == uuid.UUID(body_del["outbox_id"])
+                ).update(
+                    {
+                        StorageDeletionOutbox.status: "PROCESSING",
+                        StorageDeletionOutbox.worker_id: "active_bg_worker",
+                        StorageDeletionOutbox.claim_token: active_tok,
+                        StorageDeletionOutbox.lease_expires_at: utc_now() + timedelta(seconds=60),
+                    },
+                    synchronize_session=False,
+                )
+                db.commit()
+
+            r_del2 = self.client.delete(f"/api/v1/library/files/{doc_a}", headers=hdrs_a)
+            self.assertEqual(r_del2.status_code, 202)
+            self.assertTrue(r_del2.json().get("already_in_progress"))
+            with get_db_context() as db:
+                ob_chk = db.query(StorageDeletionOutbox).filter(
+                    StorageDeletionOutbox.id == uuid.UUID(body_del["outbox_id"])
+                ).first()
+                self.assertEqual(ob_chk.worker_id, "active_bg_worker")
+                self.assertEqual(ob_chk.claim_token, active_tok)
+                # Reset back to PENDING so worker can process cleanly
+                ob_chk.status = "PENDING"
+                ob_chk.worker_id = None
+                ob_chk.claim_token = None
+                ob_chk.lease_expires_at = None
+                db.commit()
+
+                done_stats = process_storage_deletion_outbox(
+                    db=db, limit=10, storage_override=local_store, worker_id="api_async_bg_worker",
+                )
+                self.assertGreaterEqual(done_stats["completed"], 1)
+                self.assertFalse(local_store.exists(key_a))
+                self.assertIsNone(db.query(Document).filter(Document.id == doc_a).first())
+
+    async def test_coding_and_image_workers_reject_terminal_writes_after_lease_expiry_before_recovery(self):
+        """
+        Proves CodingJobWorker and ImageJobWorker enforce unexpired lease fencing on every
+        write (not only at entry), preventing stale workers from overwriting DB state if their
+        lease expires before periodic stale-job recovery runs.
+        """
+        from coding.job_worker import (
+            CodingJobWorker,
+            append_coding_task_event,
+            create_and_enqueue_coding_job,
+        )
+        from media.image_worker import ImageJobWorker, create_image_generation_job
+        from database.models import CodingJob, CodingTask, RepositoryWorkspace
+
+        with get_db_context() as db:
+            user = _make_user(db, "lease_uni")
+            ws = RepositoryWorkspace(
+                id=uuid.uuid4(),
+                user_id=user.id,
+                name="lease-test-ws",
+                workspace_path=self.tmp_dir,
+                active_branch="main",
+                status="READY",
+            )
+            db.add(ws)
+            db.commit()
+            db.refresh(ws)
+
+            # 1. Atomic coding quota reservation under concurrent duplicate idempotency_key
+            uid = user.id
+            ws_id = ws.id
+            idem = f"code-idem-{uuid.uuid4().hex[:8]}"
+
+        def _submit_coding():
+            with get_db_context() as s:
+                u_obj = s.query(User).filter(User.id == uid).first()
+                w_obj = s.query(RepositoryWorkspace).filter(RepositoryWorkspace.id == ws_id).first()
+                return create_and_enqueue_coding_job(
+                    db=s,
+                    user=u_obj,
+                    workspace=w_obj,
+                    title="Atomic quota check",
+                    objective="Ensure duplicate key charges quota once",
+                    idempotency_key=idem,
+                    enforce_quota=True,
+                )
+
+        with patch.dict(os.environ, {"SAKURA_QUOTA_CODING_DAILY": "5"}):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                sub_res = [f.result() for f in [pool.submit(_submit_coding) for _ in range(4)]]
+            self.assertEqual(sum(int(c) for _, _, c in sub_res), 1)
+            job_ids = {j.id for _, j, _ in sub_res}
+            self.assertEqual(len(job_ids), 1)
+            with get_db_context() as db:
+                q = db.query(UserUsageQuota).filter(
+                    UserUsageQuota.user_id == uid, UserUsageQuota.category == "coding_task"
+                ).first()
+                self.assertEqual(q.usage_count, 1)
+
+        # 2. CodingJobWorker rejects finalization, progress update, and event append after lease expiry
+        c_worker = CodingJobWorker(worker_id="exp_code_w", lease_duration=30)
+        target_code_job_id = next(iter(job_ids))
+        code_attempt_id = uuid.uuid4()
+        code_now = utc_now()
+        with get_db_context() as db:
+            rows = db.query(CodingJob).filter(
+                CodingJob.id == target_code_job_id,
+                CodingJob.status == "QUEUED",
+            ).update(
+                {
+                    CodingJob.status: "RUNNING",
+                    CodingJob.worker_id: c_worker.worker_id,
+                    CodingJob.execution_attempt_id: code_attempt_id,
+                    CodingJob.started_at: code_now,
+                    CodingJob.heartbeat_at: code_now,
+                    CodingJob.lease_expires_at: code_now - timedelta(seconds=5),
+                },
+                synchronize_session=False,
+            )
+            self.assertEqual(rows, 1)
+            db.commit()
+            claimed_code = db.query(CodingJob).filter(CodingJob.id == target_code_job_id).first()
+            db.expunge(claimed_code)
+
+        self.assertFalse(
+            c_worker._fenced_finalize(
+                job_id=claimed_code.id,
+                task_id=str(claimed_code.task_id),
+                attempt_id=claimed_code.execution_attempt_id,
+                new_status="COMPLETED_VERIFIED",
+            ),
+            "Expired coding worker MUST NOT finalize before recovery!",
+        )
+        self.assertFalse(
+            c_worker._fenced_update_task_progress(
+                job_id=claimed_code.id,
+                task_id=str(claimed_code.task_id),
+                attempt_id=claimed_code.execution_attempt_id,
+                task_status="TESTING",
+            ),
+            "Expired coding worker MUST NOT update task progress!",
+        )
+        self.assertIsNone(
+            append_coding_task_event(
+                task_id=str(claimed_code.task_id),
+                job_id=claimed_code.id,
+                phase="STEP",
+                event_type="status",
+                message="stale event must be dropped",
+                expected_worker_id=c_worker.worker_id,
+                expected_attempt_id=claimed_code.execution_attempt_id,
+            ),
+            "Expired coding worker MUST NOT append fenced events!",
+        )
+        # Clean up coding job so it doesn't linger for later tests
+        with get_db_context() as db:
+            db.query(CodingJob).filter(CodingJob.id == claimed_code.id).update(
+                {CodingJob.status: "CANCELLED", CodingJob.lease_expires_at: None},
+                synchronize_session=False,
+            )
+            db.commit()
+
+        # 3. ImageJobWorker rejects completion when lease expires mid-generation before recovery
+        with get_db_context() as db:
+            img_job, created_img = create_image_generation_job(
+                db=db, user_id=uid, prompt="Lease expiry test", enforce_quota=False
+            )
+            self.assertTrue(created_img)
+            img_job_id = img_job.id
+
+        img_worker = ImageJobWorker(worker_id="exp_img_w", lease_duration=30, heartbeat_interval=60)
+        with get_db_context() as db:
+            img_now = utc_now()
+            claimed_img = img_worker._atomic_claim_job_id(
+                db,
+                img_job_id,
+                img_now,
+                img_now + timedelta(seconds=30),
+                uuid.uuid4(),
+            )
+        self.assertIsNotNone(claimed_img)
+        self.assertEqual(claimed_img.id, img_job_id)
+
+        async def _expire_mid_gen(user_id, prompt, params):
+            with get_db_context() as s:
+                s.query(ImageGenerationJob).filter(ImageGenerationJob.id == claimed_img.id).update(
+                    {ImageGenerationJob.lease_expires_at: utc_now() - timedelta(seconds=5)},
+                    synchronize_session=False,
+                )
+                s.commit()
+            return {"id": str(uuid.uuid4()), "provider": "test", "model": "test"}
+
+        ok_img = await img_worker.execute_job(claimed_img, generator_fn=_expire_mid_gen)
+        self.assertFalse(ok_img, "Expired image worker MUST NOT mark job COMPLETED before recovery!")
+        with get_db_context() as db:
+            reloaded = db.query(ImageGenerationJob).filter(ImageGenerationJob.id == img_job_id).first()
+            self.assertEqual(reloaded.status, "RUNNING")
+            reloaded.status = "CANCELLED"
+            reloaded.lease_expires_at = None
+            db.commit()
+
+    async def test_durable_task_worker_heartbeat_refuses_expired_lease_resurrection_and_cas_recovery(self):
+        """
+        Regression test for DurableTaskWorker:
+        1. Heartbeat loop MUST NOT resurrect an already-expired BackgroundTask lease; it must
+           detect lease loss, cancel the handler, and perform zero terminal writes.
+        2. Concurrent recover_stale_tasks() calls must atomically CAS-recover an expired task
+           at most once (retry_count incremented once, never overwriting a fresh claim).
+        """
+        import asyncio
+        from tasks.worker import DurableTaskWorker
+        from database.models import BackgroundTask
+
+        with get_db_context() as db:
+            user = _make_user(db, "bg_lease_fence")
+            task_id = uuid.uuid4()
+            attempt_id = uuid.uuid4()
+            now = utc_now()
+            db.add(
+                BackgroundTask(
+                    id=task_id,
+                    user_id=user.id,
+                    type="doc_summary",
+                    title="Lease resurrection regression",
+                    payload={},
+                    status="Running",
+                    progress=5,
+                    retry_count=0,
+                    worker_id="bg_worker_exp",
+                    execution_attempt_id=attempt_id,
+                    started_at=now,
+                    heartbeat_at=now,
+                    lease_expires_at=now + timedelta(seconds=30),
+                    created_at=now,
+                )
+            )
+            db.commit()
+
+        worker = DurableTaskWorker(
+            worker_id="bg_worker_exp",
+            lease_duration=30.0,
+            heartbeat_interval=0.06,
+        )
+
+        handler_cancelled = False
+
+        async def _slow_handler(tid, uid, payload, router, ctx=None):
+            nonlocal handler_cancelled
+            # Expire lease in DB BEFORE the next heartbeat fires (without running recovery)
+            with get_db_context() as s:
+                s.query(BackgroundTask).filter(BackgroundTask.id == task_id).update(
+                    {BackgroundTask.lease_expires_at: utc_now() - timedelta(seconds=5)},
+                    synchronize_session=False,
+                )
+                s.commit()
+            try:
+                await asyncio.sleep(5.0)
+            except asyncio.CancelledError:
+                handler_cancelled = True
+                raise
+
+        with get_db_context() as db:
+            task_obj = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
+            db.expunge(task_obj)
+
+        with patch("tasks.worker.execute_doc_summary", side_effect=_slow_handler):
+            await worker.execute_task(task_obj)
+
+        self.assertTrue(handler_cancelled, "Expired-lease heartbeat must cancel running handler instead of resurrecting lease!")
+        with get_db_context() as db:
+            after = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
+            self.assertEqual(after.status, "Running")
+            self.assertLess(
+                after.lease_expires_at.replace(tzinfo=None),
+                utc_now().replace(tzinfo=None),
+                "Expired lease_expires_at MUST NOT be extended by stale heartbeat!",
+            )
+
+        # Concurrent CAS recovery: two workers running recover_stale_tasks() recover task at most once
+        w1 = DurableTaskWorker(worker_id="bg_rec_1")
+        w2 = DurableTaskWorker(worker_id="bg_rec_2")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f1 = pool.submit(w1.recover_stale_tasks)
+            f2 = pool.submit(w2.recover_stale_tasks)
+            r1, r2 = f1.result(), f2.result()
+
+        self.assertEqual(r1 + r2, 1, f"Expected exactly 1 CAS recovery across concurrent workers, got {r1}+{r2}")
+        with get_db_context() as db:
+            rec = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
+            self.assertEqual(rec.status, "Queued")
+            self.assertEqual(rec.retry_count, 1)
+            # Clean up
+            rec.status = "Cancelled"
+            db.commit()
+
+    def test_account_deletion_cleans_variation_batches_and_reconciles_failed_outbox_rows(self):
+        """
+        Regression test for delete_user_account():
+        - Explicitly deletes user's ImageVariationBatch rows.
+        - Reconciles prior FAILED StorageDeletionOutbox rows whose physical object is deleted
+          to COMPLETED (zero orphaned FAILED alert rows), while leaving active PROCESSING rows untouched.
+        """
+        from services.account import delete_user_account
+
+        local_store = LocalFilesystemStorage(root_dir=self.tmp_dir)
+        with get_db_context() as db:
+            user = _make_user(db, "acct_del_hygiene")
+            uid = user.id
+            doc_id = uuid.uuid4()
+            key_failed = f"users/{uid}/documents/{doc_id}/previously_failed.txt"
+            local_store.put(key_failed, b"cleanup_me", content_type="text/plain", user_id=uid)
+
+            db.add(
+                Document(
+                    id=doc_id,
+                    user_id=uid,
+                    filename="previously_failed.txt",
+                    mime_type="text/plain",
+                    storage_path=key_failed,
+                    storage_key=key_failed,
+                    storage_backend="local",
+                    deletion_status="DELETE_FAILED",
+                )
+            )
+            failed_ob_id = uuid.uuid4()
+            db.add(
+                StorageDeletionOutbox(
+                    id=failed_ob_id,
+                    user_id=uid,
+                    document_id=doc_id,
+                    storage_backend="local",
+                    storage_key=key_failed,
+                    status="FAILED",
+                    attempt_count=5,
+                    max_attempts=5,
+                    last_error="Prior transient error",
+                    created_at=utc_now(),
+                    updated_at=utc_now(),
+                )
+            )
+            batch_id = uuid.uuid4()
+            db.add(
+                ImageVariationBatch(
+                    id=batch_id,
+                    user_id=uid,
+                    idempotency_key=f"acct-del-var-{uid.hex[:8]}",
+                    request_fingerprint="fp_acct_del",
+                    parent_image_id=None,
+                    job_ids=[],
+                    created_at=utc_now(),
+                )
+            )
+            db.commit()
+
+            res = delete_user_account(db, user, storage_override=local_store)
+            self.assertEqual(res["cleanup_status"], "COMPLETE")
+            self.assertFalse(local_store.exists(key_failed))
+
+            # ImageVariationBatch row must be explicitly removed
+            self.assertIsNone(
+                db.query(ImageVariationBatch).filter(ImageVariationBatch.id == batch_id).first(),
+                "delete_user_account() must explicitly delete ImageVariationBatch rows!",
+            )
+            # Prior FAILED outbox row must be reconciled to COMPLETED (not left FAILED forever)
+            ob_after = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == failed_ob_id).first()
+            self.assertIsNotNone(ob_after)
+            self.assertEqual(ob_after.status, "COMPLETED")
+            self.assertIsNone(ob_after.user_id)
+
 
 @unittest.skipUnless(
     os.getenv("SAKURA_POSTGRES_TEST", "0") == "1",
@@ -431,29 +1389,45 @@ class TestPostgresPgvectorAndConcurrency(unittest.IsolatedAsyncioTestCase):
 
     def test_pg_existing_json_schema_upgrade_to_vector_1536_preserves_data_and_rejects_malformed(self):
         """
-        Tests upgrading a real PostgreSQL schema from i8e6f152a45b (JSON embedding) to
-        j9f7a263b56c (native vector(1536)) inside an isolated PostgreSQL schema:
-        - Valid 1536-dim JSON embedding is preserved as vector(1536) with exact values
+        Tests upgrading a genuinely isolated temporary PostgreSQL database from i8e6f152a45b
+        (JSON embedding) to j9f7a263b56c (native vector(1536)):
+        - Valid 1536-dim JSON embedding is preserved as vector(1536) with exact float values
         - NULL embedding is preserved as NULL
-        - Malformed JSON embedding aborts upgrade with actionable error without data loss
+        - Malformed JSON embedding (wrong dim, boolean, non-array) aborts upgrade with actionable error
+        - Wrong vector typmod (vector(768)) aborts upgrade with actionable error
+        - Downgrade converts vector(1536) back to JSON preserving values and NULLs
         """
-        schema_name = f"pgvec_upg_{uuid.uuid4().hex[:10]}"
-        with self.pg_engine.connect() as conn:
-            conn.execute(sa.text(f'CREATE SCHEMA "{schema_name}"'))
-            conn.commit()
+        from sqlalchemy.engine.url import make_url
+        import json
 
-        schema_engine = sa.create_engine(
-            self.pg_url,
-            connect_args={"options": f"-csearch_path={schema_name},public"},
-        )
+        temp_db_name = f"sakura_pgvec_upg_{uuid.uuid4().hex[:10]}"
+        parsed_url = make_url(self.pg_url)
+        admin_url = parsed_url.set(database="postgres")
+        temp_url = parsed_url.set(database=temp_db_name)
+
+        admin_engine = sa.create_engine(admin_url, isolation_level="AUTOCOMMIT")
+        with admin_engine.connect() as conn:
+            conn.execute(sa.text(f'CREATE DATABASE "{temp_db_name}"'))
+
+        temp_engine = sa.create_engine(temp_url)
         try:
-            # 1. Upgrade isolated schema to pre-pgvector revision i8e6f152a45b
+            # 1. Upgrade fresh temporary database to pre-pgvector revision i8e6f152a45b
             cfg = Config("alembic.ini")
-            with schema_engine.begin() as conn:
+            cfg.set_main_option("sqlalchemy.url", str(temp_url))
+            with temp_engine.begin() as conn:
                 cfg.attributes["connection"] = conn
                 command.upgrade(cfg, "i8e6f152a45b")
 
-            # Seed valid 1536-dim JSON embedding, NULL embedding, and verify JSON type pre-upgrade
+            # Confirm pre-upgrade column is JSON
+            with temp_engine.connect() as conn:
+                pre_type = conn.execute(
+                    sa.text(
+                        "SELECT udt_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() AND table_name = 'document_chunks' AND column_name = 'embedding'"
+                    )
+                ).scalar()
+                self.assertIn(pre_type, ("json", "jsonb"))
+
             uid = uuid.uuid4()
             doc_id = uuid.uuid4()
             valid_cid = uuid.uuid4()
@@ -461,8 +1435,7 @@ class TestPostgresPgvectorAndConcurrency(unittest.IsolatedAsyncioTestCase):
             bad_cid = uuid.uuid4()
             vec = _make_unit_vec(5, secondary_index=42, secondary_weight=0.25)
 
-            import json
-            with schema_engine.begin() as conn:
+            with temp_engine.begin() as conn:
                 conn.execute(
                     sa.text("INSERT INTO users (id, username, hashed_password) VALUES (:id, :u, :p)"),
                     {"id": uid, "u": f"upg_{uid.hex[:6]}", "p": "hash"},
@@ -488,7 +1461,7 @@ class TestPostgresPgvectorAndConcurrency(unittest.IsolatedAsyncioTestCase):
                     ),
                     {"id": null_cid, "did": doc_id},
                 )
-                # Insert malformed row first to prove upgrade fails cleanly with actionable error
+                # Insert malformed row first to prove upgrade fails cleanly with actionable diagnostics
                 conn.execute(
                     sa.text(
                         "INSERT INTO document_chunks (id, document_id, chunk_index, content, embedding) "
@@ -498,35 +1471,55 @@ class TestPostgresPgvectorAndConcurrency(unittest.IsolatedAsyncioTestCase):
                 )
 
             with self.assertRaises(RuntimeError) as err_ctx:
-                with schema_engine.begin() as conn:
+                with temp_engine.begin() as conn:
                     cfg.attributes["connection"] = conn
                     command.upgrade(cfg, "head")
             self.assertIn(str(bad_cid), str(err_ctx.exception))
             self.assertIn("1536", str(err_ctx.exception))
 
-            # Remove malformed row -> upgrade to head MUST succeed and preserve valid & NULL rows
-            with schema_engine.begin() as conn:
+            # Verify failed migration rolled back cleanly to pre-upgrade revision & column type
+            with temp_engine.connect() as conn:
+                rev_after_fail = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
+                self.assertEqual(rev_after_fail, "i8e6f152a45b")
+
+            # Seed a legacy generated_images row with a dangling parent_image_id (pre-FK state)
+            dangling_img_id = uuid.uuid4()
+            with temp_engine.begin() as conn:
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO generated_images (id, user_id, prompt, storage_path, image_url, parent_image_id) "
+                        "VALUES (:id, :uid, 'orphan child', '/tmp/o.png', '/api/v1/library/files/x/download', :pid)"
+                    ),
+                    {"id": dangling_img_id, "uid": uid, "pid": uuid.uuid4()},
+                )
+
+            # Remove malformed row -> upgrade to head MUST succeed, preserve vectors/NULLs, and nullify dangling parent_image_id
+            with temp_engine.begin() as conn:
                 conn.execute(sa.text("DELETE FROM document_chunks WHERE id = :id"), {"id": bad_cid})
 
-            with schema_engine.begin() as conn:
+            with temp_engine.begin() as conn:
                 cfg.attributes["connection"] = conn
                 command.upgrade(cfg, "head")
 
-            with schema_engine.connect() as conn:
+            with temp_engine.connect() as conn:
+                repaired_parent = conn.execute(
+                    sa.text("SELECT parent_image_id FROM generated_images WHERE id = :id"),
+                    {"id": dangling_img_id},
+                ).scalar()
+                self.assertIsNone(repaired_parent, "Dangling parent_image_id must be nullified before adding FK")
+
+            with temp_engine.connect() as conn:
                 emb_type = conn.execute(
                     sa.text(
                         """
                         SELECT format_type(a.atttypid, a.atttypmod)
                         FROM pg_attribute a
                         JOIN pg_class c ON a.attrelid = c.oid
-                        JOIN pg_namespace n ON n.oid = c.relnamespace
-                        WHERE n.nspname = :sname
-                          AND c.relname = 'document_chunks'
+                        WHERE c.relname = 'document_chunks'
                           AND a.attname = 'embedding'
                           AND NOT a.attisdropped
                         """
-                    ),
-                    {"sname": schema_name},
+                    )
                 ).scalar()
                 self.assertEqual(emb_type, "vector(1536)")
 
@@ -536,16 +1529,117 @@ class TestPostgresPgvectorAndConcurrency(unittest.IsolatedAsyncioTestCase):
                 ).scalar()
                 self.assertEqual(dims, 1536)
 
+                # Verify actual preserved float values (not merely dimensions!)
+                raw_vec_text = conn.execute(
+                    sa.text("SELECT embedding::text FROM document_chunks WHERE id = :id"),
+                    {"id": valid_cid},
+                ).scalar()
+                parsed_vals = json.loads(raw_vec_text)
+                self.assertEqual(len(parsed_vals), 1536)
+                self.assertAlmostEqual(float(parsed_vals[5]), 1.0, places=5)
+                self.assertAlmostEqual(float(parsed_vals[42]), 0.25, places=5)
+                self.assertAlmostEqual(float(parsed_vals[0]), 0.0, places=5)
+
                 null_check = conn.execute(
                     sa.text("SELECT embedding IS NULL FROM document_chunks WHERE id = :id"),
                     {"id": null_cid},
                 ).scalar()
                 self.assertTrue(null_check)
+
+            # Verify downgrade back to i8e6f152a45b converts vector(1536) back to JSON preserving values & NULL
+            with temp_engine.begin() as conn:
+                cfg.attributes["connection"] = conn
+                command.downgrade(cfg, "i8e6f152a45b")
+
+            with temp_engine.connect() as conn:
+                down_vals = conn.execute(
+                    sa.text("SELECT embedding FROM document_chunks WHERE id = :id"),
+                    {"id": valid_cid},
+                ).scalar()
+                self.assertEqual(len(down_vals), 1536)
+                self.assertAlmostEqual(float(down_vals[5]), 1.0, places=5)
+                self.assertAlmostEqual(float(down_vals[42]), 0.25, places=5)
+
+            # Verify wrong vector typmod (e.g. vector(768)) is explicitly caught & rejected with chunk ID
+            with temp_engine.begin() as conn:
+                conn.execute(sa.text("CREATE EXTENSION IF NOT EXISTS vector"))
+                conn.execute(
+                    sa.text("UPDATE document_chunks SET embedding = NULL WHERE id = :id"),
+                    {"id": valid_cid},
+                )
+                conn.execute(sa.text("ALTER TABLE document_chunks ALTER COLUMN embedding TYPE vector(768) USING NULL"))
+                vec_768 = [0.0] * 768
+                vec_768[0] = 1.0
+                conn.execute(
+                    sa.text("UPDATE document_chunks SET embedding = CAST(:v AS vector(768)) WHERE id = :id"),
+                    {"id": valid_cid, "v": json.dumps(vec_768)},
+                )
+
+            with self.assertRaises(RuntimeError) as typmod_err:
+                with temp_engine.begin() as conn:
+                    cfg.attributes["connection"] = conn
+                    command.upgrade(cfg, "head")
+            self.assertIn(str(valid_cid), str(typmod_err.exception))
+            self.assertIn("1536", str(typmod_err.exception))
+
+            # Verify unconstrained `vector` column with valid 1536-dim data safely converts to vector(1536) preserving values & NULLs
+            with temp_engine.begin() as conn:
+                conn.execute(sa.text("UPDATE document_chunks SET embedding = NULL WHERE id = :id"), {"id": valid_cid})
+                conn.execute(sa.text("ALTER TABLE document_chunks ALTER COLUMN embedding TYPE vector USING NULL"))
+                conn.execute(
+                    sa.text("UPDATE document_chunks SET embedding = CAST(:v AS vector) WHERE id = :id"),
+                    {"id": valid_cid, "v": json.dumps(vec)},
+                )
+            with temp_engine.begin() as conn:
+                cfg.attributes["connection"] = conn
+                command.upgrade(cfg, "head")
+            with temp_engine.connect() as conn:
+                unconstrained_upgraded_type = conn.execute(
+                    sa.text(
+                        "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
+                        "JOIN pg_class c ON a.attrelid = c.oid "
+                        "WHERE c.relname = 'document_chunks' AND a.attname = 'embedding' AND NOT a.attisdropped"
+                    )
+                ).scalar()
+                self.assertEqual(unconstrained_upgraded_type, "vector(1536)")
+                preserved_vec = json.loads(
+                    conn.execute(
+                        sa.text("SELECT embedding::text FROM document_chunks WHERE id = :id"),
+                        {"id": valid_cid},
+                    ).scalar()
+                )
+                self.assertAlmostEqual(float(preserved_vec[5]), 1.0, places=5)
+                self.assertAlmostEqual(float(preserved_vec[42]), 0.25, places=5)
+                self.assertTrue(
+                    conn.execute(
+                        sa.text("SELECT embedding IS NULL FROM document_chunks WHERE id = :id"),
+                        {"id": null_cid},
+                    ).scalar()
+                )
+
+            # Verify unexpected historical column type (e.g. text) aborts cleanly with actionable diagnostics
+            with temp_engine.begin() as conn:
+                cfg.attributes["connection"] = conn
+                command.downgrade(cfg, "i8e6f152a45b")
+            with temp_engine.begin() as conn:
+                conn.execute(sa.text("ALTER TABLE document_chunks ALTER COLUMN embedding TYPE text USING NULL"))
+            with self.assertRaises(RuntimeError) as bad_type_err:
+                with temp_engine.begin() as conn:
+                    cfg.attributes["connection"] = conn
+                    command.upgrade(cfg, "head")
+            self.assertIn("Unsupported existing column type", str(bad_type_err.exception))
         finally:
-            schema_engine.dispose()
-            with self.pg_engine.connect() as conn:
-                conn.execute(sa.text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
-                conn.commit()
+            temp_engine.dispose()
+            with admin_engine.connect() as conn:
+                conn.execute(
+                    sa.text(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                        "WHERE datname = :dname AND pid <> pg_backend_pid()"
+                    ),
+                    {"dname": temp_db_name},
+                )
+                conn.execute(sa.text(f'DROP DATABASE IF EXISTS "{temp_db_name}"'))
+            admin_engine.dispose()
 
     async def test_pg_native_cosine_distance_ordering_and_null_handling(self):
         with self.PGSession() as db:
@@ -766,6 +1860,267 @@ class TestPostgresPgvectorAndConcurrency(unittest.IsolatedAsyncioTestCase):
                     UserUsageQuota.category == "image_generation",
                 ).first()
                 self.assertEqual(quota.usage_count, 2, "Quota MUST only be charged once for the winning batch!")
+
+    def test_pg_concurrent_api_delete_and_worker_race(self):
+        """
+        Real PostgreSQL multi-session test proving API delete_document() and background
+        process_storage_deletion_outbox() share one lease-fenced state machine:
+        - Concurrent API delete & background worker cannot steal an active PG lease
+        - Physical storage delete is executed strictly ONCE
+        - Document row is removed only after physical deletion finishes
+        """
+        import threading
+        from services.documents import delete_document
+
+        class _PGBarrierStorage(LocalFilesystemStorage):
+            def __init__(self, root_dir: str):
+                super().__init__(root_dir=root_dir)
+                self.started = threading.Event()
+                self.allow_finish = threading.Event()
+                self.delete_calls = 0
+                self._lock = threading.Lock()
+
+            def delete(self, storage_key: str) -> bool:
+                with self._lock:
+                    self.delete_calls += 1
+                self.started.set()
+                self.allow_finish.wait(timeout=5.0)
+                return super().delete(storage_key)
+
+        storage = _PGBarrierStorage(root_dir=self.tmp_dir)
+        with self.PGSession() as db:
+            user = _make_user(db, "pg_del_race")
+            uid = user.id
+            doc_id = uuid.uuid4()
+            key = f"users/{uid}/documents/{doc_id}/pg_race.txt"
+            storage.put(key, b"pg_race_payload", content_type="text/plain", user_id=uid)
+            db.add(Document(
+                id=doc_id, user_id=uid, filename="pg_race.txt", mime_type="text/plain",
+                storage_path=key, storage_key=key, storage_backend="local",
+            ))
+            db.commit()
+
+        holder = {}
+
+        def _api_delete_primary():
+            with self.PGSession() as s1:
+                holder["primary"] = delete_document(
+                    doc_id, uid, s1,
+                    storage_override=storage,
+                    raise_on_storage_error=False,
+                    lease_seconds=30.0,
+                )
+
+        t = threading.Thread(target=_api_delete_primary)
+        t.start()
+        self.assertTrue(storage.started.wait(timeout=3.0), "Primary PG delete did not start")
+
+        # While primary holds unexpired PG PROCESSING lease:
+        # 1. Second independent PG API delete sees in-progress, zero duplicate delete
+        with self.PGSession() as s2:
+            res_second = delete_document(
+                doc_id, uid, s2,
+                storage_override=storage,
+                raise_on_storage_error=False,
+                lease_seconds=30.0,
+            )
+        self.assertTrue(res_second.get("already_in_progress"))
+        self.assertEqual(res_second["deletion_status"], "DELETING")
+
+        # 2. Independent PG background worker skips locked/active PROCESSING lease for doc_id
+        with self.PGSession() as s3:
+            process_storage_deletion_outbox(
+                db=s3, limit=20, storage_override=storage, worker_id="pg_racer_worker",
+            )
+            s3.expire_all()
+            ob_live = s3.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.document_id == doc_id).first()
+            self.assertIsNotNone(ob_live)
+            self.assertEqual(ob_live.status, "PROCESSING")
+            self.assertTrue(str(ob_live.worker_id or "").startswith("api_sync_"))
+            self.assertIsNotNone(s3.query(Document).filter(Document.id == doc_id).first())
+
+        self.assertEqual(storage.delete_calls, 1, "Physical deletion MUST only execute once under PG concurrency!")
+
+        storage.allow_finish.set()
+        t.join(timeout=5.0)
+        self.assertEqual(holder["primary"]["deletion_status"], "COMPLETED")
+        self.assertEqual(storage.delete_calls, 1)
+        self.assertFalse(storage.exists(key))
+
+        with self.PGSession() as s_chk:
+            self.assertIsNone(s_chk.query(Document).filter(Document.id == doc_id).first())
+
+    def test_pg_concurrent_request_document_deletion_creates_single_outbox_row(self):
+        """
+        Real PostgreSQL concurrency test:
+        Two concurrent request_document_deletion() calls for the same document MUST serialize
+        via SELECT ... FOR UPDATE on Document and produce EXACTLY ONE active StorageDeletionOutbox row.
+        """
+        from services.documents import request_document_deletion
+
+        with self.PGSession() as db:
+            user = _make_user(db, "pg_req_dup")
+            uid = user.id
+            doc_id = uuid.uuid4()
+            key = f"users/{uid}/documents/{doc_id}/dedup.txt"
+            db.add(
+                Document(
+                    id=doc_id,
+                    user_id=uid,
+                    filename="dedup.txt",
+                    mime_type="text/plain",
+                    storage_path=key,
+                    storage_key=key,
+                    storage_backend="local",
+                )
+            )
+            db.commit()
+
+        def _req():
+            with self.PGSession() as s:
+                return request_document_deletion(doc_id, uid, s)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = [f.result() for f in [pool.submit(_req) for _ in range(4)]]
+
+        outbox_ids = {r["outbox_id"] for r in results}
+        self.assertEqual(len(outbox_ids), 1, f"Concurrent requests created duplicate outbox rows: {outbox_ids}")
+
+        with self.PGSession() as db:
+            rows = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.document_id == doc_id).all()
+            self.assertEqual(len(rows), 1)
+            # Clean up
+            rows[0].status = "COMPLETED"
+            db.query(Document).filter(Document.id == doc_id).delete(synchronize_session=False)
+            db.commit()
+
+    def test_pg_single_item_claim_contention_recovery_max_attempts_rollback_and_dup_events(self):
+        """
+        Real PostgreSQL integration test covering:
+        1. 4 concurrent workers contesting the EXACT SAME outbox item via claim_specific_outbox_entry -> exactly 1 wins.
+        2. Stale recovery increments attempt_count on each crash/expiry until max_attempts transitions row to FAILED
+           AND updates Document.deletion_status to DELETE_FAILED (never infinite-loops).
+        3. Transaction rollback in finalize_claimed_outbox_entry leaves outbox + Document consistent & session usable.
+        4. Concurrent duplicate CodingTaskEvent appends resolve to strictly monotonic unique sequence numbers.
+        """
+        from services.documents import claim_specific_outbox_entry
+        from coding.job_worker import append_coding_task_event
+        from database.models import CodingTaskEvent
+
+        with self.PGSession() as db:
+            user = _make_user(db, "pg_adv_conc")
+            uid = user.id
+            doc_id = uuid.uuid4()
+            oid = uuid.uuid4()
+            key = f"users/{uid}/documents/{doc_id}/poison.txt"
+            db.add(
+                Document(
+                    id=doc_id,
+                    user_id=uid,
+                    filename="poison.txt",
+                    mime_type="text/plain",
+                    storage_path=key,
+                    storage_key=key,
+                    storage_backend="local",
+                    deletion_status="DELETING",
+                )
+            )
+            db.add(
+                StorageDeletionOutbox(
+                    id=oid,
+                    user_id=uid,
+                    document_id=doc_id,
+                    storage_backend="local",
+                    storage_key=key,
+                    status="PENDING",
+                    attempt_count=0,
+                    max_attempts=2,
+                    next_retry_at=utc_now() - timedelta(seconds=1),
+                    created_at=utc_now(),
+                    updated_at=utc_now(),
+                )
+            )
+            db.commit()
+
+        # 1. 4 concurrent PG workers race to claim the exact same outbox row
+        def _contest(wname: str):
+            with self.PGSession() as s:
+                return claim_specific_outbox_entry(s, oid, worker_id=wname, lease_seconds=30.0)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            claims = [f.result() for f in [pool.submit(_contest, f"pg_contender_{i}") for i in range(4)]]
+
+        winners = [c for c in claims if c is not None]
+        self.assertEqual(len(winners), 1, f"Exactly 1 worker must claim the same item, got {len(winners)}")
+
+        # 2. Simulate repeated worker crashes (lease expiry) -> attempt_count increments & hits FAILED + DELETE_FAILED
+        with self.PGSession() as db:
+            db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == oid).update(
+                {StorageDeletionOutbox.lease_expires_at: utc_now() - timedelta(seconds=5)},
+                synchronize_session=False,
+            )
+            db.commit()
+            rec1 = recover_stale_outbox_claims(db)
+            self.assertGreaterEqual(rec1, 1)
+            row1 = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == oid).first()
+            self.assertEqual(row1.status, "PENDING")
+            self.assertEqual(row1.attempt_count, 1)
+
+            # Second claim + crash -> hits max_attempts=2 -> FAILED + Document.deletion_status == DELETE_FAILED
+            c2 = claim_specific_outbox_entry(db, oid, worker_id="pg_crash_2", lease_seconds=30.0)
+            self.assertIsNotNone(c2)
+            db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == oid).update(
+                {StorageDeletionOutbox.lease_expires_at: utc_now() - timedelta(seconds=5)},
+                synchronize_session=False,
+            )
+            db.commit()
+            recover_stale_outbox_claims(db)
+            db.expire_all()
+            row2 = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == oid).first()
+            self.assertEqual(row2.status, "FAILED")
+            self.assertEqual(row2.attempt_count, 2)
+            doc2 = db.query(Document).filter(Document.id == doc_id).first()
+            self.assertIsNotNone(doc2)
+            self.assertEqual(doc2.deletion_status, "DELETE_FAILED")
+
+            # 3. Transaction rollback in finalize_claimed_outbox_entry preserves state & leaves PG session usable
+            row2.status = "PENDING"
+            row2.attempt_count = 0
+            row2.next_retry_at = utc_now() - timedelta(seconds=1)
+            db.commit()
+            c3 = claim_specific_outbox_entry(db, oid, worker_id="pg_rb_w", lease_seconds=30.0)
+            with patch.object(db, "commit", side_effect=RuntimeError("simulated PG commit failure")):
+                with self.assertRaises(RuntimeError):
+                    finalize_claimed_outbox_entry(db, c3, "pg_rb_w", True, None)
+            # Session must be cleanly rolled back and usable immediately
+            self.assertEqual(db.execute(sa.text("SELECT 1")).scalar(), 1)
+            row_after_rb = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == oid).first()
+            self.assertEqual(row_after_rb.status, "PROCESSING")
+            self.assertIsNotNone(db.query(Document).filter(Document.id == doc_id).first())
+            # Clean up
+            finalize_claimed_outbox_entry(db, c3, "pg_rb_w", True, None)
+
+        # 4. Concurrent duplicate sequence attempts on CodingTaskEvent resolve to unique monotonic sequences
+        task_id = str(uuid.uuid4())
+
+        def _append_dup(idx: int):
+            return append_coding_task_event(
+                task_id=task_id,
+                job_id=None,
+                phase="TESTING",
+                event_type="status",
+                seq=1,  # intentionally colliding sequence number
+                message=f"PG dup event {idx}",
+            )
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            evts = [f.result() for f in [pool.submit(_append_dup, i) for i in range(4)]]
+
+        seqs = sorted(e.sequence_number for e in evts)
+        self.assertEqual(seqs, [1, 2, 3, 4], f"Expected strictly monotonic unique sequences, got {seqs}")
+        with self.PGSession() as db:
+            db.query(CodingTaskEvent).filter(CodingTaskEvent.task_id == task_id).delete(synchronize_session=False)
+            db.commit()
 
 
 if __name__ == "__main__":

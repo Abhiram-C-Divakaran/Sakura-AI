@@ -4,6 +4,9 @@ const apiProxyTarget = (process.env.SAKURA_API_PROXY_TARGET || '').replace(/\/+$
 const nextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
+  images: {
+    unoptimized: true,
+  },
   async rewrites() {
     if (!apiProxyTarget) return [];
     return [

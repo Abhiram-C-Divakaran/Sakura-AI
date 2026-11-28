@@ -841,7 +841,11 @@ async def update_conversation(conversation_id: str, update_data: ConversationUpd
 
 @router.get("/conversations/{conversation_id}/messages", response_model=List[Dict[str, Any]])
 def list_messages(conversation_id: str, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
-    conv = db.query(Conversation).filter(Conversation.id == uuid.UUID(conversation_id), Conversation.user_id == current_user.id).first()
+    try:
+        conv_uuid = uuid.UUID(conversation_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid conversation ID")
+    conv = db.query(Conversation).filter(Conversation.id == conv_uuid, Conversation.user_id == current_user.id).first()
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
     messages = db.query(Message).filter(Message.conversation_id == conv.id).order_by(Message.created_at.asc()).all()
@@ -913,7 +917,11 @@ def list_memory(current_user: User = Depends(AuthManager.get_current_user), db: 
 
 @router.delete("/memory/{memory_id}")
 def delete_memory(memory_id: str, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
-    memory = db.query(UserMemory).filter(UserMemory.id == uuid.UUID(memory_id), UserMemory.user_id == current_user.id).first()
+    try:
+        mem_uuid = uuid.UUID(memory_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid memory ID")
+    memory = db.query(UserMemory).filter(UserMemory.id == mem_uuid, UserMemory.user_id == current_user.id).first()
     if not memory:
         raise HTTPException(status_code=404, detail="Memory not found")
     db.delete(memory)
@@ -947,21 +955,32 @@ def list_documents(current_user: User = Depends(AuthManager.get_current_user), d
     docs = db.query(Document).filter(Document.user_id == current_user.id).all()
     return [docs_svc.serialize_document(d) for d in docs]
 
-@router.delete("/documents/{document_id}")
-def delete_document(document_id: str, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
+@router.delete("/documents/{document_id}", status_code=202)
+async def delete_document(document_id: str, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
     import services.documents as docs_svc
     try:
         doc_uuid = uuid.UUID(document_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid document ID format")
-    return docs_svc.delete_document(doc_uuid, current_user.id, db)
+    del_res = docs_svc.request_document_deletion(doc_uuid, current_user.id, db)
+    if del_res.get("file"):
+        await ws_manager.send_to_user(str(current_user.id), {
+            "type": "library_update",
+            "action": "updated",
+            "data": del_res["file"],
+        })
+    return del_res
 
 class RenameRequest(BaseModel):
     filename: str
 
 @router.post("/documents/{document_id}/rename")
 def rename_document(document_id: str, req: RenameRequest, current_user: User = Depends(AuthManager.get_current_user), db: Session = Depends(get_db)):
-    doc = db.query(Document).filter(Document.id == uuid.UUID(document_id), Document.user_id == current_user.id).first()
+    try:
+        doc_uuid = uuid.UUID(document_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid document ID format")
+    doc = db.query(Document).filter(Document.id == doc_uuid, Document.user_id == current_user.id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     
@@ -1169,21 +1188,6 @@ async def chat_stream(
                 is_terminal_coding_status,
             )
             from database.models import CodingJob, CodingTaskEvent
-            from services.quotas import enforce_user_quota
-
-            is_replay = False
-            if req.idempotency_key and req.idempotency_key.strip():
-                is_replay = (
-                    db.query(CodingJob)
-                    .filter(
-                        CodingJob.user_id == current_user.id,
-                        CodingJob.idempotency_key == req.idempotency_key.strip()[:128],
-                    )
-                    .first()
-                    is not None
-                )
-            if not is_replay:
-                enforce_user_quota(db, current_user.id, "coding_task")
 
             coding_task, coding_job, _created = create_and_enqueue_coding_job(
                 db=db,
@@ -1194,6 +1198,7 @@ async def chat_stream(
                 intensity=req.intensity or "high",
                 idempotency_key=req.idempotency_key,
                 metadata={"source": "chat_stream", "conversation_id": str(conv.id)},
+                enforce_quota=True,
             )
             queued_task_id = str(coding_task.id)
             queued_job_id = str(coding_job.id)
@@ -1504,9 +1509,23 @@ class TaskCreateRequest(BaseModel):
     title: str
     payload: Dict[str, Any]
 
+ALLOWED_USER_TASK_TYPES = frozenset({
+    "doc_summary",
+    "code_analysis",
+    "dataset_analysis",
+    "web_research",
+})
+
+
 @router.post("/tasks")
 async def create_task(req: TaskCreateRequest, current_user: User = Depends(AuthManager.get_current_user)):
     user_id = str(current_user.id)
+
+    if req.type not in ALLOWED_USER_TASK_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported or internal-only task type: {req.type}",
+        )
 
     if req.type == "doc_summary" and "document_id" not in req.payload:
         raise HTTPException(status_code=400, detail="document_id is required for document summary")

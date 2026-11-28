@@ -83,8 +83,13 @@ class MemoryManager:
         )
 
         try:
-            # We use structured generation to ensure valid JSON schema adherence
-            result: MemoryExtractionResult = await self.router.providers["openai" if "openai" in self.router.providers else "groq"].generate_structured(
+            # Select any available configured provider (supports OpenAI, Groq, Anthropic, Ollama)
+            provider = (
+                self.router.providers.get("openai")
+                or self.router.providers.get("groq")
+                or self.router.get_provider("general_inquiry")[1]
+            )
+            result: MemoryExtractionResult = await provider.generate_structured(
                 prompt=prompt,
                 response_model=MemoryExtractionResult,
                 system_prompt=system_prompt

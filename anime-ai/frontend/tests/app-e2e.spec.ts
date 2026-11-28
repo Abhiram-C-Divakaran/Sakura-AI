@@ -28,6 +28,9 @@ interface MockState {
   };
   passwordResetEnabled: boolean;
   lastResetIdentifier: string | null;
+  libraryGenerateKeys: string[];
+  libraryGenerateMode: 'fail_once_then_ok' | 'conflict_409' | 'ok';
+  libraryDeletePollTicksBeforeRemoved: number;
 }
 
 function makeFakeJwt(username: string): string {
@@ -73,6 +76,9 @@ function createInitialState(): MockState {
     },
     passwordResetEnabled: true,
     lastResetIdentifier: null,
+    libraryGenerateKeys: [],
+    libraryGenerateMode: 'ok',
+    libraryDeletePollTicksBeforeRemoved: 1,
   };
 }
 
@@ -330,7 +336,7 @@ async function mountDeterministicApi(page: Page, state: MockState) {
     }
 
     // 5. Image Generation Jobs (Create, Poll, Variation, Cancel)
-    if ((path === '/api/v1/images/jobs' || path === '/api/v1/images/generate' || path === '/api/v1/library/generate-image') && method === 'POST') {
+    if ((path === '/api/v1/images/jobs' || path === '/api/v1/images/generate') && method === 'POST') {
       const body = req.postDataJSON();
       const id = `img-job-${state.imageJobs.size + 1}`;
       const job = { id, job_id: id, status: 'QUEUED', prompt: body.prompt, requested_pipeline: body.requested_pipeline || 'auto', polls: 0 };
@@ -364,9 +370,51 @@ async function mountDeterministicApi(page: Page, state: MockState) {
       return json(j);
     }
 
-    // 6. Library Upload, Preview, Indexing & Removal
+    // 6. Library Upload, Preview, Indexing, Async Deletion (HTTP 202) & Generate Image Idempotency
     if (path === '/api/v1/library/files' && method === 'GET') {
+      // Simulate background outbox worker completing DELETING files after N polls
+      for (let i = state.files.length - 1; i >= 0; i--) {
+        const f = state.files[i];
+        if (f.deletion_status === 'DELETING') {
+          f._deletePolls = (f._deletePolls || 0) + 1;
+          if (f._deletePolls >= state.libraryDeletePollTicksBeforeRemoved) {
+            state.files.splice(i, 1);
+          }
+        }
+      }
       return json(state.files);
+    }
+    if (path === '/api/v1/library/generate-image' && method === 'POST') {
+      const body = req.postDataJSON();
+      if (body.idempotency_key) {
+        state.libraryGenerateKeys.push(body.idempotency_key);
+      }
+      if (state.libraryGenerateMode === 'fail_once_then_ok' && state.libraryGenerateKeys.length === 1) {
+        return json({ detail: 'Temporary upstream 503 error' }, 503);
+      }
+      if (state.libraryGenerateMode === 'conflict_409') {
+        return json({ detail: 'Idempotency key was already used with different parameters.' }, 409);
+      }
+      const jid = `lib-img-${state.libraryGenerateKeys.length}`;
+      const job = { id: jid, status: 'COMPLETED', output_image_id: 'img-out-1', polls: 1 };
+      state.imageJobs.set(jid, job);
+      return json({ status: 'queued', job_id: jid, job }, 202);
+    }
+    const delFileMatch = path.match(/^\/api\/v1\/library\/files\/([^/]+)$/);
+    if (delFileMatch && method === 'DELETE') {
+      const f = state.files.find((x) => x.id === delFileMatch[1]);
+      if (!f) return json({ detail: 'Document not found' }, 404);
+      f.deletion_status = 'DELETING';
+      f.deletion_error = null;
+      f.is_knowledge_base = false;
+      f._deletePolls = 0;
+      return json({
+        status: 'deleting',
+        deletion_status: 'DELETING',
+        id: f.id,
+        outbox_id: 'outbox-1',
+        file: f,
+      }, 202);
     }
     if (path === '/api/v1/library/upload' && method === 'POST') {
       const newFile = {
@@ -623,5 +671,83 @@ test.describe('Sakura AI Authenticated Application Browser E2E Suite', () => {
     expect(results.schedRunStatus).toBe('queued');
     expect(results.exportDownloadStatus).toBe(200);
     expect(results.deleteStatus).toBe('COMPLETE');
+  });
+
+  test('18-19. Async Library Deletion UI (HTTP 202 Deleting -> Confirmed Removed, DELETE_FAILED Retry) & GenerateImageModal Idempotent Retries (409)', async ({ page, isMobile }) => {
+    const state = createInitialState();
+    state.libraryGenerateMode = 'fail_once_then_ok';
+    state.libraryDeletePollTicksBeforeRemoved = 2;
+    state.files.push({
+      id: 'file-failed-1',
+      name: 'retry_failed.md',
+      filename: 'retry_failed.md',
+      mime_type: 'text/markdown',
+      size_bytes: 64,
+      category: 'documents',
+      modified_at: new Date().toISOString(),
+      status: 'READY',
+      is_knowledge_base: false,
+      indexing_status: 'NOT_INDEXED',
+      deletion_status: 'DELETE_FAILED',
+      deletion_error: 'Transient S3 503 error',
+    });
+    await mountDeterministicApi(page, state);
+
+    await page.addInitScript(() => {
+      const origSetInterval = window.setInterval.bind(window);
+      (window as any).setInterval = (fn: any, ms?: number, ...args: any[]) => {
+        const capped = typeof ms === 'number' && ms >= 500 ? 150 : ms;
+        return origSetInterval(fn, capped, ...args);
+      };
+    });
+
+    await page.goto('/login', { waitUntil: 'domcontentloaded' });
+    await page.evaluate((tok) => localStorage.setItem('access_token', tok), makeFakeJwt('alice@example.com'));
+    await page.goto('/chat', { waitUntil: 'domcontentloaded' });
+
+    // Open Library view from sidebar
+    const openSidebarBtn = page.locator('button[title="Open Sidebar"]');
+    if (await openSidebarBtn.isVisible()) {
+      await openSidebarBtn.click();
+    }
+    await page.getByRole('button', { name: /Library/i }).first().click();
+    await expect(page.getByText('architecture.md')).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText('retry_failed.md')).toBeVisible();
+
+    // Verify DELETE_FAILED file shows Delete failed + Retry Delete in desktop table (or switches to grid on mobile)
+    if (isMobile) {
+      await page.locator('button[title="Grid view"]').click();
+    }
+    await expect(page.getByText('Delete failed')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Retry Delete' })).toBeVisible();
+
+    // Click Retry Delete -> HTTP 202 keeps file visible in Deleting… state until confirmed removed on poll!
+    await page.getByRole('button', { name: 'Retry Delete' }).click();
+    await expect(page.getByText(/Deleting "retry_failed.md" in background/i)).toBeVisible();
+    await expect(page.getByText('Deleting…')).toBeVisible();
+    await expect(page.getByText('retry_failed.md', { exact: true })).toHaveCount(0, { timeout: 10_000 });
+
+    // Open Generate Image modal -> first attempt returns 503, retry sends EXACT SAME idempotency_key!
+    await page.getByRole('button', { name: /^New$/i }).click();
+    await page.getByRole('button', { name: /Generate image/i }).click();
+    await page.locator('textarea').last().fill('Moonlit torii gate in Kyoto');
+    await page.getByRole('button', { name: /Generate & Save/i }).click();
+    await expect(page.getByText(/Temporary upstream 503 error/i)).toBeVisible({ timeout: 5_000 });
+
+    // Retry same action -> must send IDENTICAL idempotency_key and succeed!
+    await page.getByRole('button', { name: /Generate & Save/i }).click();
+    await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 10_000 });
+    expect(state.libraryGenerateKeys.length).toBe(2);
+    expect(state.libraryGenerateKeys[0]).toBe(state.libraryGenerateKeys[1]);
+
+    // New action with different prompt -> fresh idempotency_key + HTTP 409 clearly presented!
+    state.libraryGenerateMode = 'conflict_409';
+    await page.getByRole('button', { name: /^New$/i }).click();
+    await page.getByRole('button', { name: /Generate image/i }).click();
+    await page.locator('textarea').last().fill('Cyberpunk Tokyo skyline');
+    await page.getByRole('button', { name: /Generate & Save/i }).click();
+    await expect(page.getByText(/Idempotency key was already used with different parameters/i)).toBeVisible({ timeout: 5_000 });
+    expect(state.libraryGenerateKeys.length).toBe(3);
+    expect(state.libraryGenerateKeys[2]).not.toBe(state.libraryGenerateKeys[0]);
   });
 });

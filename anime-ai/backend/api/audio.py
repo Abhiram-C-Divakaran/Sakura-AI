@@ -13,6 +13,12 @@ from auth.manager import AuthManager
 
 router = APIRouter(prefix="/audio", tags=["audio"])
 
+MAX_AUDIO_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB (Whisper upstream hard cap)
+ALLOWED_AUDIO_EXTENSIONS = frozenset({
+    ".webm", ".wav", ".mp3", ".m4a", ".ogg", ".mp4", ".flac", ".mpeg", ".mpga"
+})
+
+
 @router.post("/transcribe")
 async def transcribe_audio(
     file: UploadFile = File(...),
@@ -22,26 +28,42 @@ async def transcribe_audio(
 ):
     """
     Transcribes audio file to text using Groq Whisper (ultra low-latency) or OpenAI Whisper.
-    Supports .webm, .wav, .mp3, .m4a, .ogg, .mp4 formats.
+    Supports .webm, .wav, .mp3, .m4a, .ogg, .mp4, .flac, .mpeg, .mpga formats (max 25 MB).
     """
     if not file:
         raise HTTPException(status_code=400, detail="No audio file provided")
 
-    # Read uploaded bytes
-    content = await file.read()
-    if len(content) == 0:
-        raise HTTPException(status_code=400, detail="Empty audio recording received")
+    # Sanitize filename strictly against path separators / traversal and allowlist extension
+    raw_filename = (file.filename or "recording.webm").replace("\\", "/")
+    safe_basename = os.path.basename(raw_filename.strip()) or "recording.webm"
+    ext = (os.path.splitext(safe_basename)[1] or ".webm").lower()
+    if ext not in ALLOWED_AUDIO_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported audio file extension '{ext}'.",
+        )
 
-    # Determine filename & extension
-    original_filename = file.filename or "recording.webm"
-    ext = os.path.splitext(original_filename)[1] or ".webm"
-
-    # Temporary file storage for SDK ingestion
-    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
-
+    # Stream upload directly to a bounded temporary file (prevents unbounded RAM DoS)
+    total_bytes = 0
+    tmp_path = None
     try:
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp_path = tmp.name
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > MAX_AUDIO_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Audio file exceeds maximum allowed size of 25MB.",
+                    )
+                tmp.write(chunk)
+
+        if total_bytes == 0:
+            raise HTTPException(status_code=400, detail="Empty audio recording received")
+
         # Priority 1: Groq Whisper (super-fast)
         groq_key = os.getenv("GROQ_API_KEY")
         openai_key = os.getenv("OPENAI_API_KEY")
@@ -65,7 +87,7 @@ async def transcribe_audio(
                         "status": "success",
                         "text": text.strip(),
                         "provider": "groq-whisper-large-v3",
-                        "duration_bytes": len(content)
+                        "duration_bytes": total_bytes
                     }
             except Exception as e:
                 print(f"Groq Whisper transcription error: {e}")
@@ -87,7 +109,7 @@ async def transcribe_audio(
                         "status": "success",
                         "text": text.strip(),
                         "provider": "openai-whisper-1",
-                        "duration_bytes": len(content)
+                        "duration_bytes": total_bytes
                     }
             except Exception as e:
                 print(f"OpenAI Whisper transcription error: {e}")
@@ -99,7 +121,7 @@ async def transcribe_audio(
         )
 
     finally:
-        if os.path.exists(tmp_path):
+        if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
             except Exception:

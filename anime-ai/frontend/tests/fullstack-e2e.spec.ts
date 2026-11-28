@@ -347,9 +347,7 @@ test.describe('Sakura AI Real Full-Stack Integration Suite (Zero API Mocks)', ()
       35_000,
       500
     );
-    expect(['COMPLETED_VERIFIED', 'COMPLETED_UNVERIFIED']).toContain(
-      String(codingTaskFinal.status || '').toUpperCase()
-    );
+    expect(String(codingTaskFinal.status || '').toUpperCase()).toBe('COMPLETED_VERIFIED');
 
     const codingEvents = await page.evaluate(async (tid) => {
       const tok = localStorage.getItem('access_token') || '';
@@ -359,7 +357,12 @@ test.describe('Sakura AI Real Full-Stack Integration Suite (Zero API Mocks)', ()
       return r.json();
     }, codingTaskId);
     expect(Array.isArray(codingEvents)).toBe(true);
-    expect(codingEvents.length).toBeGreaterThanOrEqual(2);
+    expect(codingEvents.length).toBeGreaterThanOrEqual(8);
+    const seqs = codingEvents.map((e: any) => e.sequenceNumber);
+    expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+    expect(new Set(seqs).size).toBe(seqs.length);
+    const combinedOutput = codingEvents.map((e: any) => `${e.stdoutPreview || ''} ${e.message || ''}`).join('\n');
+    expect(combinedOutput).toContain('SAKURA_REMOTE_DOCKER_TESTS_PASSED');
 
     // Also test real /code message persistence & UI panel render in /chat
     await composer.fill('/code create deterministic check module');
@@ -369,6 +372,44 @@ test.describe('Sakura AI Real Full-Stack Integration Suite (Zero API Mocks)', ()
     });
     await page.reload({ waitUntil: 'domcontentloaded' });
     await expect(page.getByText('/code create deterministic check module')).toBeVisible({ timeout: 15_000 });
+
+    // Wait for the /code chat-triggered durable coding task to reach a terminal state
+    // so no sandbox child container is still mid-execution when account deletion runs.
+    const chatCodingTaskId = await page.evaluate(async () => {
+      const tok = localStorage.getItem('access_token') || '';
+      const h = { Authorization: `Bearer ${tok}` };
+      const convs = await (await fetch('/api/v1/conversations', { headers: h })).json();
+      for (const c of Array.isArray(convs) ? convs : []) {
+        const msgs = await (await fetch(`/api/v1/conversations/${c.id}/messages`, { headers: h })).json();
+        for (const m of (Array.isArray(msgs) ? msgs : []).slice().reverse()) {
+          const tid = m?.metadata?.coding_task_id;
+          if (tid) return String(tid);
+        }
+      }
+      return null;
+    });
+    expect(chatCodingTaskId).toBeTruthy();
+    if (chatCodingTaskId) {
+      const chatCodingFinal = await pollUntil(
+        async () =>
+          page.evaluate(async (tid) => {
+            const tok = localStorage.getItem('access_token') || '';
+            const r = await fetch(`/api/v1/coding/tasks/${tid}`, {
+              headers: { Authorization: `Bearer ${tok}` },
+            });
+            return r.json();
+          }, chatCodingTaskId),
+        (t) =>
+          ['COMPLETED_VERIFIED', 'COMPLETED_UNVERIFIED', 'FAILED', 'CANCELLED'].includes(
+            String(t.status || '').toUpperCase()
+          ),
+        35_000,
+        500
+      );
+      expect(['COMPLETED_VERIFIED', 'COMPLETED_UNVERIFIED']).toContain(
+        String(chatCodingFinal.status || '').toUpperCase()
+      );
+    }
 
     // 11. Real async Account Export -> real DurableTaskWorker builds ZIP -> valid ZIP download
     const exportStart = await page.evaluate(async () => {
@@ -443,9 +484,9 @@ test.describe('Sakura AI Real Full-Stack Integration Suite (Zero API Mocks)', ()
         const xImgJob = await fetch(`/api/v1/images/jobs/${targetImgJobId}`, { headers: h2 });
         const xCoding = await fetch(`/api/v1/coding/tasks/${targetCodingTaskId}`, { headers: h2 });
 
-        // User 1 deletes their own uploaded library file and verifies removal (404 afterwards)
+        // User 1 requests async deletion of their uploaded library file (HTTP 202 DELETING)
         const delFile = await fetch(`/api/v1/library/files/${targetFileId}`, { method: 'DELETE', headers: h1 });
-        const afterDel = await fetch(`/api/v1/library/files/${targetFileId}`, { headers: h1 });
+        const delFileBody = await delFile.json();
 
         return {
           wsTicketStatus: wsTicketRes.status,
@@ -454,7 +495,7 @@ test.describe('Sakura AI Real Full-Stack Integration Suite (Zero API Mocks)', ()
           xImgJobStatus: xImgJob.status,
           xCodingStatus: xCoding.status,
           delFileStatus: delFile.status,
-          afterDelStatus: afterDel.status,
+          delFileDeletionStatus: delFileBody.deletion_status,
         };
       },
       {
@@ -470,8 +511,24 @@ test.describe('Sakura AI Real Full-Stack Integration Suite (Zero API Mocks)', ()
     expect(securityChecks.xFileStatus).toBe(404);
     expect(securityChecks.xImgJobStatus).toBe(404);
     expect(securityChecks.xCodingStatus).toBe(404);
-    expect(securityChecks.delFileStatus).toBe(200);
-    expect(securityChecks.afterDelStatus).toBe(404);
+    expect(securityChecks.delFileStatus).toBe(202);
+    expect(securityChecks.delFileDeletionStatus).toBe('DELETING');
+
+    // Verify real DurableTaskWorker processes StorageDeletionOutbox and removes the file (404 afterwards)
+    const afterDelStatus = await pollUntil(
+      async () =>
+        page.evaluate(async (fid) => {
+          const tok = localStorage.getItem('access_token') || '';
+          const r = await fetch(`/api/v1/library/files/${fid}`, {
+            headers: { Authorization: `Bearer ${tok}` },
+          });
+          return r.status;
+        }, fileId),
+      (status) => status === 404,
+      20_000,
+      300
+    );
+    expect(afterDelStatus).toBe(404);
 
     // 12. Real Account Deletion -> cleanup status verified & credentials permanently invalidated
     const deleteRes = await page.evaluate(

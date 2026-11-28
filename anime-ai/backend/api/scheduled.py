@@ -246,6 +246,9 @@ async def trigger_scheduled_task(
     if not task:
         raise HTTPException(status_code=404, detail="Scheduled task not found")
 
+    from services.quotas import enforce_user_quota
+    enforce_user_quota(db, current_user.id, "scheduled_job")
+
     now = utc_now()
     run_id = uuid.uuid4()
     run = ScheduledTaskRun(

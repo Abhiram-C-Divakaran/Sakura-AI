@@ -169,7 +169,8 @@ class TaskManager:
     @staticmethod
     def recover_stale_tasks(db: Optional[Session] = None, max_retries: int = 3) -> int:
         """
-        Recovers tasks in 'Running' or 'Starting' status where lease has expired OR lease_expires_at is NULL.
+        Atomically recovers tasks in 'Running' or 'Starting' status where lease has expired OR lease_expires_at is NULL.
+        Fenced per row by (id, status, worker_id, execution_attempt_id, expired lease).
         """
         from sqlalchemy import or_
         now = utc_now()
@@ -182,24 +183,62 @@ class TaskManager:
                     BackgroundTask.lease_expires_at < now
                 )
             ).all()
+            snaps = [
+                (
+                    task.id,
+                    task.status,
+                    task.worker_id,
+                    task.execution_attempt_id,
+                    int(task.retry_count or 0),
+                )
+                for task in stale_tasks
+            ]
 
             count = 0
-            for task in stale_tasks:
-                current_retries = task.retry_count or 0
+            for task_id, old_status, old_worker_id, old_attempt_id, current_retries in snaps:
+                base_filter = [
+                    BackgroundTask.id == task_id,
+                    BackgroundTask.status == old_status,
+                    BackgroundTask.worker_id == old_worker_id,
+                    BackgroundTask.execution_attempt_id == old_attempt_id,
+                    or_(
+                        BackgroundTask.lease_expires_at.is_(None),
+                        BackgroundTask.lease_expires_at < now
+                    ),
+                ]
                 if current_retries >= max_retries:
-                    task.status = "Failed"
-                    task.error = f"Task exceeded maximum retries ({max_retries}). Lease expired without heartbeat."
-                    task.completed_at = now
+                    rows = session.query(BackgroundTask).filter(*base_filter).update(
+                        {
+                            BackgroundTask.status: "Failed",
+                            BackgroundTask.error: f"Task exceeded maximum retries ({max_retries}). Lease expired without heartbeat.",
+                            BackgroundTask.completed_at: now,
+                            BackgroundTask.lease_expires_at: None,
+                        },
+                        synchronize_session=False,
+                    )
+                    if rows == 1:
+                        session.commit()
+                    else:
+                        session.rollback()
                 else:
-                    task.status = "Queued"
-                    task.retry_count = current_retries + 1
-                    task.worker_id = None
-                    task.execution_attempt_id = None
-                    task.started_at = None
-                    task.heartbeat_at = None
-                    task.lease_expires_at = None
-                    count += 1
-            session.commit()
+                    rows = session.query(BackgroundTask).filter(*base_filter).update(
+                        {
+                            BackgroundTask.status: "Queued",
+                            BackgroundTask.retry_count: current_retries + 1,
+                            BackgroundTask.worker_id: None,
+                            BackgroundTask.execution_attempt_id: None,
+                            BackgroundTask.started_at: None,
+                            BackgroundTask.heartbeat_at: None,
+                            BackgroundTask.lease_expires_at: None,
+                        },
+                        synchronize_session=False,
+                    )
+                    if rows == 1:
+                        session.commit()
+                        count += 1
+                    else:
+                        session.rollback()
+            session.expire_all()
             return count
 
         if db is not None:
@@ -384,6 +423,8 @@ async def update_task_state(
             query = query.filter(BackgroundTask.execution_attempt_id == execution_attempt_id)
         if worker_id is not None:
             query = query.filter(BackgroundTask.worker_id == worker_id)
+        if (worker_id is not None or execution_attempt_id is not None) and db.bind and db.bind.dialect.name == "postgresql":
+            query = query.with_for_update()
 
         task = query.first()
         if not task:
@@ -728,10 +769,24 @@ async def execute_scheduled_task_job(
         return
 
     with get_db_context() as db:
-        st = db.query(ScheduledTask).filter(ScheduledTask.id == st_uuid).first()
-        run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+        st = (
+            db.query(ScheduledTask)
+            .filter(ScheduledTask.id == st_uuid, ScheduledTask.user_id == user_id)
+            .first()
+        )
+        run = (
+            db.query(ScheduledTaskRun)
+            .filter(ScheduledTaskRun.id == run_uuid, ScheduledTaskRun.task_id == st_uuid)
+            .first()
+        )
         if not st or not run:
-            await update_task_state(task_id, "Failed", 100, error="Scheduled task or run record not found.", ctx=ctx)
+            await update_task_state(
+                task_id,
+                "Failed",
+                100,
+                error="Scheduled task or run record not found or access denied.",
+                ctx=ctx,
+            )
             return
 
         run.status = "RUNNING"
@@ -749,7 +804,11 @@ async def execute_scheduled_task_job(
         curr = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
         if curr and (curr.cancel_requested or curr.status == "Cancelled"):
             with get_db_context() as db2:
-                r = db2.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+                r = (
+                    db2.query(ScheduledTaskRun)
+                    .filter(ScheduledTaskRun.id == run_uuid, ScheduledTaskRun.task_id == st_uuid)
+                    .first()
+                )
                 if r:
                     r.status = "CANCELLED"
                     r.error = "Execution cancelled by user."
@@ -779,7 +838,11 @@ async def execute_scheduled_task_job(
 
             curr = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
             if curr and (curr.cancel_requested or curr.status == "Cancelled"):
-                r = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+                r = (
+                    db.query(ScheduledTaskRun)
+                    .filter(ScheduledTaskRun.id == run_uuid, ScheduledTaskRun.task_id == st_uuid)
+                    .first()
+                )
                 if r:
                     r.status = "CANCELLED"
                     r.error = "Execution cancelled by user."
@@ -788,7 +851,11 @@ async def execute_scheduled_task_job(
                 await update_task_state(task_id, "Cancelled", 100, ctx=ctx)
                 return
 
-            run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+            run = (
+                db.query(ScheduledTaskRun)
+                .filter(ScheduledTaskRun.id == run_uuid, ScheduledTaskRun.task_id == st_uuid)
+                .first()
+            )
             if run:
                 run.status = "COMPLETED"
                 run.output = response_text
@@ -808,7 +875,11 @@ async def execute_scheduled_task_job(
                     ctx.assert_owned_in_session(db, lock=False)
                 except TaskLeaseLostError:
                     return
-            run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+            run = (
+                db.query(ScheduledTaskRun)
+                .filter(ScheduledTaskRun.id == run_uuid, ScheduledTaskRun.task_id == st_uuid)
+                .first()
+            )
             if run:
                 run.status = "FAILED"
                 run.error = str(e)

@@ -333,11 +333,36 @@ class CodingAgent:
             user_id=user.id
         )
         self.modified_files: List[str] = []
+        self._mutation_epoch: int = 0
         self.tests_run: List[Dict[str, Any]] = []
         self.linters_run: List[Dict[str, Any]] = []
         self.typechecks_run: List[Dict[str, Any]] = []
         self.builds_run: List[Dict[str, Any]] = []
         self.diff_reviewed: bool = False
+
+    def _evaluate_latest_verification_runs(self, runs: List[Dict[str, Any]]) -> tuple[int, bool, bool]:
+        """
+        Evaluates verification command runs executed at the current mutation epoch
+        (i.e. after the latest file modification). Keeps the latest outcome per
+        distinct command so reproducing a failing test, patching code, and re-running
+        the passing test resolves truthfully to passed.
+        Returns: (effective_run_count, all_passed, any_failed)
+        """
+        current_epoch_runs = [
+            r for r in runs if r.get("mutation_epoch", self._mutation_epoch) == self._mutation_epoch
+        ]
+        if not current_epoch_runs:
+            return 0, False, False
+
+        latest_by_cmd: Dict[str, Dict[str, Any]] = {}
+        for idx, run in enumerate(current_epoch_runs):
+            cmd_key = str(run.get("command") or f"__run_{idx}").strip()
+            latest_by_cmd[cmd_key] = run
+
+        final_runs = list(latest_by_cmd.values())
+        all_passed = all(r.get("exit_code") == 0 for r in final_runs)
+        any_failed = any(r.get("exit_code") != 0 for r in final_runs)
+        return len(final_runs), all_passed, any_failed
 
     def _persist_task_state(
         self,
@@ -416,28 +441,37 @@ class CodingAgent:
         elif tool_name == "write_file":
             path = args.get("path", "")
             res = await self.toolchain.write_file(path, args.get("content", ""))
-            if res.get("success") and path not in self.modified_files:
-                self.modified_files.append(path)
+            if res.get("success"):
+                self._mutation_epoch += 1
+                if path not in self.modified_files:
+                    self.modified_files.append(path)
         elif tool_name == "create_file":
             path = args.get("path", "")
             res = await self.toolchain.create_file(path, args.get("content", ""))
-            if res.get("success") and path not in self.modified_files:
-                self.modified_files.append(path)
+            if res.get("success"):
+                self._mutation_epoch += 1
+                if path not in self.modified_files:
+                    self.modified_files.append(path)
         elif tool_name == "apply_patch":
             path = args.get("path", "")
             res = await self.toolchain.apply_patch(path, args.get("target_content", ""), args.get("replacement_content", ""))
-            if res.get("success") and path not in self.modified_files:
-                self.modified_files.append(path)
+            if res.get("success"):
+                self._mutation_epoch += 1
+                if path not in self.modified_files:
+                    self.modified_files.append(path)
         elif tool_name == "delete_file":
             path = args.get("path", "")
             res = await self.toolchain.delete_file(path)
-            if res.get("success") and path not in self.modified_files:
-                self.modified_files.append(path)
+            if res.get("success"):
+                self._mutation_epoch += 1
+                if path not in self.modified_files:
+                    self.modified_files.append(path)
         elif tool_name == "rename_file":
             old_path = args.get("old_path", "")
             new_path = args.get("new_path", "")
             res = await self.toolchain.rename_file(old_path, new_path)
             if res.get("success"):
+                self._mutation_epoch += 1
                 if old_path not in self.modified_files:
                     self.modified_files.append(old_path)
                 if new_path not in self.modified_files:
@@ -451,19 +485,23 @@ class CodingAgent:
                 network_capability=args.get("network_capability")
             )
         elif tool_name == "run_tests":
-            res = await self.toolchain.run_tests(args.get("command", "npm test"))
-            self.tests_run.append(res)
+            cmd = args.get("command", "npm test")
+            res = await self.toolchain.run_tests(cmd)
+            self.tests_run.append({**res, "command": cmd, "mutation_epoch": self._mutation_epoch})
         elif tool_name == "run_linter":
-            res = await self.toolchain.run_linter(args.get("command", "npm run lint"))
-            self.linters_run.append(res)
+            cmd = args.get("command", "npm run lint")
+            res = await self.toolchain.run_linter(cmd)
+            self.linters_run.append({**res, "command": cmd, "mutation_epoch": self._mutation_epoch})
         elif tool_name == "run_formatter":
             res = await self.toolchain.run_formatter(args.get("command", "npm run format"))
         elif tool_name == "run_typecheck":
-            res = await self.toolchain.run_typecheck(args.get("command", "npm run typecheck"))
-            self.typechecks_run.append(res)
+            cmd = args.get("command", "npm run typecheck")
+            res = await self.toolchain.run_typecheck(cmd)
+            self.typechecks_run.append({**res, "command": cmd, "mutation_epoch": self._mutation_epoch})
         elif tool_name == "run_build":
-            res = await self.toolchain.run_build(args.get("command", "npm run build"))
-            self.builds_run.append(res)
+            cmd = args.get("command", "npm run build")
+            res = await self.toolchain.run_build(cmd)
+            self.builds_run.append({**res, "command": cmd, "mutation_epoch": self._mutation_epoch})
         elif tool_name == "git_diff":
             res = await self.toolchain.git_diff(args.get("file_path"))
             self.diff_reviewed = True
@@ -652,18 +690,16 @@ Please execute this task: inspect the codebase, implement the changes, run tests
                 if self.modified_files:
                     task_kind = "MUTATING"
 
-                tests_run_count = len(self.tests_run)
-                tests_passed = tests_run_count > 0 and all(t.get("exit_code") == 0 for t in self.tests_run)
-                tests_failed = tests_run_count > 0 and any(t.get("exit_code") != 0 for t in self.tests_run)
+                tests_run_count, tests_passed, tests_failed = self._evaluate_latest_verification_runs(self.tests_run)
 
-                lint_passed = all(l.get("exit_code") == 0 for l in self.linters_run) if self.linters_run else None
-                lint_failed = any(l.get("exit_code") != 0 for l in self.linters_run) if self.linters_run else False
+                lint_count, lint_all_passed, lint_failed = self._evaluate_latest_verification_runs(self.linters_run)
+                lint_passed = lint_all_passed if lint_count > 0 else None
 
-                typecheck_passed = all(tc.get("exit_code") == 0 for tc in self.typechecks_run) if self.typechecks_run else None
-                typecheck_failed = any(tc.get("exit_code") != 0 for tc in self.typechecks_run) if self.typechecks_run else False
+                tc_count, tc_all_passed, typecheck_failed = self._evaluate_latest_verification_runs(self.typechecks_run)
+                typecheck_passed = tc_all_passed if tc_count > 0 else None
 
-                build_passed = all(b.get("exit_code") == 0 for b in self.builds_run) if self.builds_run else None
-                build_failed = any(b.get("exit_code") != 0 for b in self.builds_run) if self.builds_run else False
+                build_count, build_all_passed, build_failed = self._evaluate_latest_verification_runs(self.builds_run)
+                build_passed = build_all_passed if build_count > 0 else None
 
                 unverified_reasons = []
 

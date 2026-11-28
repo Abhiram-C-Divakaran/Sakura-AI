@@ -1,10 +1,16 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { FilePreviewModal, LibraryFile } from './FilePreviewModal';
+import { AuthenticatedImage, downloadAuthenticatedFile } from './AuthenticatedImage';
 import { CreateDocumentModal } from './CreateDocumentModal';
 import { GenerateImageModal } from './GenerateImageModal';
 import { getAccessToken, authFetch } from '../lib/auth';
 import { API_BASE } from '../lib/api';
 import { useRealtime } from '../hooks/useRealtime';
+
+interface LibraryFileItem extends LibraryFile {
+  deletion_status?: 'ACTIVE' | 'DELETING' | 'DELETE_FAILED' | string;
+  deletion_error?: string | null;
+}
 
 interface LibraryViewProps {
   onAttachToChat: (file: LibraryFile) => void;
@@ -22,7 +28,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onNavigateToChat,
   apiBase = API_BASE
 }) => {
-  const [files, setFiles] = useState<LibraryFile[]>([]);
+  const [files, setFiles] = useState<LibraryFileItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
@@ -33,7 +39,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
   const [activeMenuFileId, setActiveMenuFileId] = useState<string | null>(null);
-  const [previewFile, setPreviewFile] = useState<LibraryFile | null>(null);
+  const [previewFile, setPreviewFile] = useState<LibraryFileItem | null>(null);
+  const [deleteBanner, setDeleteBanner] = useState<{ type: 'info' | 'error'; message: string } | null>(null);
 
   const [isNewMenuOpen, setIsNewMenuOpen] = useState(false);
   const [isCreateDocOpen, setIsCreateDocOpen] = useState(false);
@@ -99,6 +106,19 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     fetchFiles();
   }, [fetchFiles]);
 
+  // Fallback reconciliation polling while any file is in asynchronous DELETING state
+  const hasPendingDeletions = files.some((f) => f.deletion_status === 'DELETING');
+  useEffect(() => {
+    if (!hasPendingDeletions) {
+      setDeleteBanner((curr) => (curr?.type === 'info' ? null : curr));
+      return;
+    }
+    const interval = setInterval(() => {
+      fetchFiles();
+    }, 1500);
+    return () => clearInterval(interval);
+  }, [hasPendingDeletions, fetchFiles]);
+
   // Connect ticket-authenticated WebSocket for real-time multi-device sync
   useRealtime({
     onMessage: (msg: any) => {
@@ -109,6 +129,12 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         } else if (action === 'updated') {
           setFiles((prev) => prev.map((f) => (f.id === data.id ? { ...f, ...data } : f)));
           setPreviewFile((curr) => (curr && curr.id === data.id ? { ...curr, ...data } : curr));
+          if (data?.deletion_status === 'DELETE_FAILED') {
+            setDeleteBanner({
+              type: 'error',
+              message: `Failed to delete "${data.name || 'file'}": ${data.deletion_error || 'Storage error. You can retry deletion.'}`,
+            });
+          }
         } else if (action === 'deleted') {
           setFiles((prev) => prev.filter((f) => f.id !== data.id));
           setPreviewFile((curr) => (curr && curr.id === data.id ? null : curr));
@@ -217,6 +243,11 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
+      if (res.status === 409) {
+        throw new Error(
+          err.detail || 'Idempotency conflict (HTTP 409): this request key was already used with different parameters. Please adjust parameters or retry.'
+        );
+      }
       throw new Error(err.detail || 'Failed to generate image');
     }
     const payload = await res.json();
@@ -256,18 +287,56 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     }
   };
 
-  // Delete handler
-  const handleDelete = async (file: LibraryFile) => {
-    if (!confirm(`Are you sure you want to permanently delete "${file.name}"?`)) return;
+  // Delete handler (asynchronous HTTP 202 durable outbox lifecycle — removes file ONLY when confirmed deleted)
+  const handleDelete = async (file: LibraryFileItem, skipConfirm = false) => {
+    if (file.deletion_status === 'DELETING') return;
+    if (!skipConfirm && !confirm(`Are you sure you want to permanently delete "${file.name}"?`)) return;
+    setDeleteBanner(null);
     try {
       const res = await authFetch(`${apiBase}/api/v1/library/files/${file.id}`, {
         method: 'DELETE'
       });
-      if (res.ok) {
+      const body = await res.json().catch(() => ({}));
+      if (res.status === 202 || body?.deletion_status === 'DELETING') {
+        // Deletion accepted asynchronously: keep item visible in DELETING state until worker confirms removal
+        setFiles((prev) =>
+          prev.map((f) =>
+            f.id === file.id
+              ? {
+                ...f,
+                ...(body?.file || {}),
+                deletion_status: 'DELETING',
+                deletion_error: null,
+                is_knowledge_base: false,
+              }
+              : f
+          )
+        );
+        if (previewFile?.id === file.id) setPreviewFile(null);
+        setDeleteBanner({
+          type: 'info',
+          message: `Deleting "${file.name}" in background… File will disappear once physical storage removal completes.`,
+        });
+      } else if (res.ok && body?.deletion_status === 'COMPLETED') {
         setFiles((prev) => prev.filter((f) => f.id !== file.id));
         if (previewFile?.id === file.id) setPreviewFile(null);
+      } else {
+        const errMsg = body?.detail || body?.error || `Failed to delete "${file.name}" (HTTP ${res.status})`;
+        setFiles((prev) =>
+          prev.map((f) =>
+            f.id === file.id ? { ...f, deletion_status: 'DELETE_FAILED', deletion_error: errMsg } : f
+          )
+        );
+        setDeleteBanner({ type: 'error', message: errMsg });
       }
-    } catch (e) {
+    } catch (e: any) {
+      const errMsg = e?.message || `Failed to delete "${file.name}"`;
+      setFiles((prev) =>
+        prev.map((f) =>
+          f.id === file.id ? { ...f, deletion_status: 'DELETE_FAILED', deletion_error: errMsg } : f
+        )
+      );
+      setDeleteBanner({ type: 'error', message: errMsg });
       console.error('Delete failed:', e);
     }
   };
@@ -449,7 +518,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                setIsNewMenuOpen(!isNewMenuOpen)}
+                setIsNewMenuOpen(!isNewMenuOpen)
+              }
               }
               className="flex items-center gap-1.5 px-3.5 py-1.5 bg-white text-black font-medium text-[13px] rounded-xl hover:bg-[#EAEAEA] transition-all cursor-pointer shadow-md"
             >
@@ -522,9 +592,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           <div className="flex items-center bg-[#141414] border border-[#262626] rounded-xl p-0.5">
             <button
               onClick={() => handleToggleViewMode('list')}
-              className={`p-1.5 rounded-lg transition-colors ${
-                viewMode === 'list' ? 'bg-[#282828] text-white' : 'text-[#666666] hover:text-white'
-              }`}
+              className={`p-1.5 rounded-lg transition-colors ${viewMode === 'list' ? 'bg-[#282828] text-white' : 'text-[#666666] hover:text-white'
+                }`}
               title="List view"
             >
               <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -538,9 +607,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             </button>
             <button
               onClick={() => handleToggleViewMode('grid')}
-              className={`p-1.5 rounded-lg transition-colors ${
-                viewMode === 'grid' ? 'bg-[#282828] text-white' : 'text-[#666666] hover:text-white'
-              }`}
+              className={`p-1.5 rounded-lg transition-colors ${viewMode === 'grid' ? 'bg-[#282828] text-white' : 'text-[#666666] hover:text-white'
+                }`}
               title="Grid view"
             >
               <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -564,11 +632,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             <button
               key={tab}
               onClick={() => setCategory(tab)}
-              className={`px-3 py-1.5 text-[13px] font-medium rounded-xl transition-all cursor-pointer capitalize flex items-center gap-1.5 ${
-                isActive
-                  ? 'bg-[#1F1F1F] text-white shadow-sm'
-                  : 'text-[#888888] hover:text-white hover:bg-[#141414]'
-              }`}
+              className={`px-3 py-1.5 text-[13px] font-medium rounded-xl transition-all cursor-pointer capitalize flex items-center gap-1.5 ${isActive
+                ? 'bg-[#1F1F1F] text-white shadow-sm'
+                : 'text-[#888888] hover:text-white hover:bg-[#141414]'
+                }`}
             >
               <span>{tab}</span>
               {count > 0 && (
@@ -592,6 +659,26 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             <span>{uploadProgress.name}</span>
           </div>
           <span className="font-mono text-[11px] font-semibold">{uploadProgress.progress}</span>
+        </div>
+      )}
+
+      {/* Async Deletion Status Banner */}
+      {deleteBanner && (
+        <div
+          role="status"
+          className={`mx-8 mt-3 p-3 rounded-xl flex items-center justify-between text-[12.5px] border ${deleteBanner.type === 'error'
+            ? 'bg-[#2A1515] border-[#5C2323] text-[#FF8585]'
+            : 'bg-[#262014] border-[#EAB308]/35 text-[#FACC15]'
+            }`}
+        >
+          <span>{deleteBanner.message}</span>
+          <button
+            type="button"
+            onClick={() => setDeleteBanner(null)}
+            className="ml-3 text-xs opacity-75 hover:opacity-100 cursor-pointer"
+          >
+            ✕
+          </button>
         </div>
       )}
 
@@ -688,20 +775,18 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                       key={file.id}
                       onClick={() => setSelectedFileId(file.id)}
                       onDoubleClick={() => setPreviewFile(file)}
-                      className={`group hover:bg-[#121212] transition-colors cursor-pointer ${
-                        isSelected ? 'bg-[#161616]' : ''
-                      }`}
+                      className={`group hover:bg-[#121212] transition-colors cursor-pointer ${isSelected ? 'bg-[#161616]' : ''
+                        }`}
                     >
                       {/* Name + Icon / Thumbnail */}
                       <td className="py-3 pl-2 pr-4">
                         <div className="flex items-center gap-3 min-w-0">
                           <div className="w-8 h-8 rounded-lg bg-[#181818] border border-[#282828] flex items-center justify-center flex-shrink-0 group-hover:border-[#383838] transition-colors overflow-hidden">
                             {file.category === 'images' ? (
-                              <img
+                              <AuthenticatedImage
                                 src={`${apiBase}/api/v1/library/files/${file.id}/download`}
-                                alt=""
+                                alt={file.name}
                                 className="w-full h-full object-cover"
-                                loading="lazy"
                               />
                             ) : (
                               getFileIcon(file, 'w-4 h-4')
@@ -728,17 +813,42 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                         {formatBytes(file.size_bytes)}
                       </td>
 
-                      {/* AI Knowledge Status */}
+                      {/* AI Knowledge / Deletion Status */}
                       <td className="py-3 hidden lg:table-cell">
-                        <span
-                          className={`text-[11px] font-mono px-2 py-0.5 rounded-full border ${
-                            file.is_knowledge_base
+                        {file.deletion_status === 'DELETING' ? (
+                          <span className="inline-flex items-center gap-1.5 text-[11px] font-mono px-2 py-0.5 rounded-full border bg-[#262014] text-[#FACC15] border-[#EAB308]/35">
+                            <span className="w-1.5 h-1.5 rounded-full bg-[#FACC15] animate-pulse" />
+                            Deleting…
+                          </span>
+                        ) : file.deletion_status === 'DELETE_FAILED' ? (
+                          <div className="flex items-center gap-2">
+                            <span
+                              title={file.deletion_error || 'Storage deletion failed'}
+                              className="text-[11px] font-mono px-2 py-0.5 rounded-full border bg-[#2A1515] text-[#FF8585] border-[#5C2323]"
+                            >
+                              Delete failed
+                            </span>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleDelete(file, true);
+                              }}
+                              className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-[#3B1E1E] text-[#FFB4B4] hover:bg-[#522828] cursor-pointer"
+                            >
+                              Retry Delete
+                            </button>
+                          </div>
+                        ) : (
+                          <span
+                            className={`text-[11px] font-mono px-2 py-0.5 rounded-full border ${file.is_knowledge_base
                               ? 'bg-[#14231E] text-[#35D0BA] border-[#35D0BA]/30'
                               : 'bg-[#181818] text-[#777777] border-[#2A2A2A]'
-                          }`}
-                        >
-                          {file.is_knowledge_base ? 'Ready for AI' : 'Not indexed'}
-                        </span>
+                              }`}
+                          >
+                            {file.is_knowledge_base ? 'Ready for AI' : 'Not indexed'}
+                          </span>
+                        )}
                       </td>
 
                       {/* Context Menu Button */}
@@ -806,11 +916,19 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                               <span>{file.is_knowledge_base ? 'Remove from AI' : 'Add to AI Index'}</span>
                             </button>
 
-                            <a
-                              href={`${apiBase}/api/v1/library/files/${file.id}/download`}
-                              download={file.name}
-                              onClick={() => setActiveMenuFileId(null)}
-                              className="w-full px-3 py-1.5 text-[12.5px] text-white hover:bg-[#2C2C2C] rounded-lg transition-colors flex items-center gap-2"
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setActiveMenuFileId(null);
+                                void downloadAuthenticatedFile(
+                                  `${apiBase}/api/v1/library/files/${file.id}/download`,
+                                  file.name
+                                ).catch((err) => {
+                                  console.error('File download failed:', err);
+                                  setDeleteBanner({ type: 'error', message: `Failed to download ${file.name}.` });
+                                });
+                              }}
+                              className="w-full px-3 py-1.5 text-[12.5px] text-white hover:bg-[#2C2C2C] rounded-lg transition-colors flex items-center gap-2 cursor-pointer"
                             >
                               <svg className="w-3.5 h-3.5 text-[#888888]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
@@ -818,23 +936,30 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                                 <line x1="12" x2="12" y1="15" y2="3" />
                               </svg>
                               <span>Download</span>
-                            </a>
+                            </button>
 
                             <div className="h-px bg-[#303030] my-1" />
 
                             <button
+                              disabled={file.deletion_status === 'DELETING'}
                               onClick={() => {
-                                handleDelete(file);
+                                handleDelete(file, file.deletion_status === 'DELETE_FAILED');
                                 setActiveMenuFileId(null);
                               }}
-                              className="w-full px-3 py-1.5 text-[12.5px] text-[#FF5555] hover:bg-[#2E1818] rounded-lg transition-colors flex items-center gap-2"
+                              className="w-full px-3 py-1.5 text-[12.5px] text-[#FF5555] hover:bg-[#2E1818] rounded-lg transition-colors flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
                             >
                               <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                 <path d="M3 6h18" />
                                 <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
                                 <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
                               </svg>
-                              <span>Delete</span>
+                              <span>
+                                {file.deletion_status === 'DELETING'
+                                  ? 'Deleting…'
+                                  : file.deletion_status === 'DELETE_FAILED'
+                                    ? 'Retry Delete'
+                                    : 'Delete'}
+                              </span>
                             </button>
                           </div>
                         )}
@@ -858,11 +983,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                 {/* Thumbnail / Large Icon */}
                 <div className="w-full h-32 rounded-xl bg-[#0A0A0A] border border-[#1E1E1E] flex items-center justify-center overflow-hidden mb-3">
                   {file.category === 'images' ? (
-                    <img
+                    <AuthenticatedImage
                       src={`${apiBase}/api/v1/library/files/${file.id}/download`}
-                      alt=""
+                      alt={file.name}
                       className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                      loading="lazy"
                     />
                   ) : (
                     getFileIcon(file, 'w-10 h-10')
@@ -894,6 +1018,34 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                     <span>{formatBytes(file.size_bytes)}</span>
                     <span>{formatRelativeDate(file.modified_at)}</span>
                   </div>
+                  {file.deletion_status === 'DELETING' && (
+                    <div className="mt-2">
+                      <span className="inline-flex items-center gap-1.5 text-[10.5px] font-mono px-2 py-0.5 rounded-full border bg-[#262014] text-[#FACC15] border-[#EAB308]/35">
+                        <span className="w-1.5 h-1.5 rounded-full bg-[#FACC15] animate-pulse" />
+                        Deleting…
+                      </span>
+                    </div>
+                  )}
+                  {file.deletion_status === 'DELETE_FAILED' && (
+                    <div className="mt-2 flex items-center justify-between gap-2">
+                      <span
+                        title={file.deletion_error || 'Storage deletion failed'}
+                        className="text-[10.5px] font-mono px-2 py-0.5 rounded-full border bg-[#2A1515] text-[#FF8585] border-[#5C2323]"
+                      >
+                        Delete failed
+                      </span>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDelete(file, true);
+                        }}
+                        className="text-[10.5px] font-medium px-2 py-0.5 rounded-md bg-[#3B1E1E] text-[#FFB4B4] hover:bg-[#522828] cursor-pointer"
+                      >
+                        Retry Delete
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
             ))}

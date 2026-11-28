@@ -87,5 +87,32 @@ class TestCodingVerificationSemantics(unittest.TestCase):
         self.assertEqual(status, TaskOutcome.COMPLETED_VERIFIED)
         self.assertEqual(len(unverified_reasons), 0)
 
+    def test_post_edit_verification_allows_fail_then_patch_then_pass(self):
+        """Reproducing a failing test, patching the bug, and re-running to pass must evaluate as passed."""
+        agent = CodingAgent.__new__(CodingAgent)
+        agent._mutation_epoch = 2
+        runs = [
+            {"command": "python3 test_calc.py", "exit_code": 1, "mutation_epoch": 1},
+            {"command": "python3 test_calc.py", "exit_code": 0, "mutation_epoch": 2},
+        ]
+        count, passed, failed = agent._evaluate_latest_verification_runs(runs)
+        self.assertEqual(count, 1)
+        self.assertTrue(passed)
+        self.assertFalse(failed)
+
+        # If a new file mutation occurs after the passing run without re-running tests -> unverified (0 effective runs)
+        agent._mutation_epoch = 3
+        count2, passed2, failed2 = agent._evaluate_latest_verification_runs(runs)
+        self.assertEqual(count2, 0)
+        self.assertFalse(passed2)
+        self.assertFalse(failed2)
+
+        # If the latest run at the current epoch fails -> failed
+        runs.append({"command": "python3 test_calc.py", "exit_code": 1, "mutation_epoch": 3})
+        count3, passed3, failed3 = agent._evaluate_latest_verification_runs(runs)
+        self.assertEqual(count3, 1)
+        self.assertFalse(passed3)
+        self.assertTrue(failed3)
+
 if __name__ == "__main__":
     unittest.main()

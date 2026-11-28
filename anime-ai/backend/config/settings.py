@@ -144,11 +144,27 @@ class Settings(BaseSettings):
                 )
             if self.jwt_secret == self.integration_encryption_key:
                 raise RuntimeError("Production security error: INTEGRATION_ENCRYPTION_KEY must be independent of JWT_SECRET.")
-            if self.sakura_sandbox_capability_signing_key:
-                if self.sakura_sandbox_capability_signing_key in [self.jwt_secret, self.integration_encryption_key, self.sakura_sandbox_service_token]:
-                    raise RuntimeError("Production security error: SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY must be independent of other secrets.")
-                if len(self.sakura_sandbox_capability_signing_key) < 32:
-                    raise RuntimeError("Production security error: SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY must be at least 32 characters long.")
+            cap_key = (self.sakura_sandbox_capability_signing_key or "").strip()
+            if not cap_key or cap_key in KNOWN_DEV_SECRETS:
+                raise RuntimeError(
+                    "Production startup failed: FATAL PRODUCTION SECURITY ERROR: "
+                    "SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY must be explicitly configured in production "
+                    "and cannot match any known development key."
+                )
+            if len(cap_key) < 32:
+                raise RuntimeError(
+                    "Production security error: SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY must be at least 32 characters long."
+                )
+            if cap_key in {self.jwt_secret, self.integration_encryption_key, self.sakura_sandbox_service_token}:
+                raise RuntimeError(
+                    "Production security error: SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY must be independent of other secrets."
+                )
+            svc_token = (self.sakura_sandbox_service_token or "").strip()
+            if not svc_token or svc_token in KNOWN_DEV_SECRETS:
+                raise RuntimeError(
+                    "Production startup failed: FATAL PRODUCTION SECURITY ERROR: "
+                    "SAKURA_SANDBOX_SERVICE_TOKEN must be explicitly configured in production."
+                )
             if self.trusted_proxy_cidrs:
                 from services.rate_limit import validate_trusted_proxy_cidrs
                 _, cidr_errors = validate_trusted_proxy_cidrs(self.trusted_proxy_cidrs)
