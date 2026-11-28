@@ -533,7 +533,8 @@ def build_deck():
     # ── Slide 8: System Architecture ──────────────────────────────────────────
     s8 = prs.slides.add_slide(blank)
     add_chrome(s8, "System Architecture", "10-service production topology separating API, durable workers, data, and Docker sandbox", 8)
-    s8.shapes.add_picture(str(arch_png), Inches(0.55), Inches(1.32), width=Inches(12.23))
+    pic8 = s8.shapes.add_picture(str(arch_png), Inches(0), Inches(1.32), height=Inches(5.6))
+    pic8.left = int((prs.slide_width - pic8.width) / 2)
     add_notes(s8, "Walk left to right: Browser -> Nginx -> Next.js/FastAPI -> PostgreSQL/Redis/Storage -> 4 independent workers -> isolated sandbox-executor mounting docker.sock exclusively.")
 
     # ── Slide 9: Database Architecture ────────────────────────────────────────
@@ -580,13 +581,15 @@ def build_deck():
     # ── Slide 11: AI & Hybrid RAG Workflow ────────────────────────────────────
     s11 = prs.slides.add_slide(blank)
     add_chrome(s11, "AI Routing & Hybrid RAG Workflow", "Per-user semantic + lexical retrieval with honest BM25 fallback and fail-closed privacy", 11)
-    s11.shapes.add_picture(str(rag_png), Inches(0.55), Inches(1.38), width=Inches(12.23))
+    pic11 = s11.shapes.add_picture(str(rag_png), Inches(0), Inches(1.36), height=Inches(5.55))
+    pic11.left = int((prs.slide_width - pic11.width) / 2)
     add_notes(s11, "Explain why combining pgvector cosine distance and Okapi BM25 via RRF outperforms vector-only search, and explain how private_data mode fails closed if Ollama is unconfigured.")
 
     # ── Slide 12: Sakura Coding Engine & Sandbox ──────────────────────────────
     s12 = prs.slides.add_slide(blank)
     add_chrome(s12, "Sakura Coding Engine & Docker Sandbox", "Autonomous repository editing isolated behind an authenticated non-root Docker boundary", 12)
-    s12.shapes.add_picture(str(sandbox_png), Inches(0.55), Inches(1.38), width=Inches(12.23))
+    pic12 = s12.shapes.add_picture(str(sandbox_png), Inches(0), Inches(1.36), height=Inches(5.55))
+    pic12.left = int((prs.slide_width - pic12.width) / 2)
     add_notes(s12, "Stress the security boundary: neither FastAPI nor coding-worker touches docker.sock. Only sandbox-executor launches ephemeral UID 1001 containers with --network none and single-use HMAC capabilities.")
 
     # ── Slide 13: Security Architecture ───────────────────────────────────────
@@ -636,7 +639,7 @@ def build_deck():
     stats = [
         ("253 Passed", "Local Backend Tests\n(18 PG/Docker gated, 0 fail)", BLUE, BLUE_SOFT),
         ("37 / 37 Passed", "Live Local Full-Stack\nAPI & UI User Journeys", TEAL, TEAL_SOFT),
-        ("4 / 4 CI Jobs", "GitHub Actions Run #39\n(46157049085 on d8de865)", GREEN, GREEN_SOFT),
+        ("4 / 4 CI Jobs", "GitHub Actions Run\n(46167864598 on 03e213d)", GREEN, GREEN_SOFT),
         ("0 Orphans", "Verified Sandbox Child\nContainers Post-Run", SAKURA, SAKURA_SOFT),
     ]
     for i, (num, lbl, col, bgc) in enumerate(stats):

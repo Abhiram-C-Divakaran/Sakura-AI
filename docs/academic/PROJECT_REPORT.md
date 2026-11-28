@@ -314,7 +314,7 @@ The full 13-row verification table covering all 8 testing layers is maintained i
 - **Local Backend Compilation & Test Suite (`d8de865`):** `python -m compileall` passed (`0` errors); `unittest discover` ran **271 tests -> 253 PASSED, 18 environment-gated skipped (PG/Docker flags), 0 failures**.
 - **Local Frontend Build & Lint (`d8de865`):** `tsc --noEmit` (`0` errors), `next lint` (`0` errors, 10 pre-existing non-blocking warnings), `next build` (`12/12` static pages compiled).
 - **Live Local Full-Stack User Journeys:** **37/37 checks PASSED (`0` failed)** against live `:3000` + `:8000` servers (auth, PyJWT, `/_next/image` `404`, quotas, conversations, library Bearer vs `?token=` `401`, cross-tenant `404`, malformed UUID `400`, WS ticket, forged internal task `400`, coding workspace isolation, and `DELETE /api/v1/auth/me`).
-- **GitHub Actions CI (Run `46157049085` on `d8de865`):** **4/4 required Linux CI jobs PASSED (`conclusion: success`)**:
+- **GitHub Actions CI (Run `46167864598` on `03e213d`):** **4/4 required Linux CI jobs PASSED (`conclusion: success`)**:
   1. `Backend Tests & Schema Verification` (Real PostgreSQL 15 + `pgvector`, Redis 7, Alembic upgrade, 32-table parity, concurrency & `pgvector` tests with `0` skips, official `postgres:15` backup/restore positive + tampered `.sha256` negative tests).
   2. `Frontend Typecheck & Build` (`tsc`, `next lint`, `next build`, Playwright landing smoke tests, production frontend Docker image).
   3. `Docker Sandbox E2E Integration` (Real non-root Docker execution, capability enforcement, `0` orphaned containers).
@@ -334,4 +334,4 @@ Detailed engineering limitations and roadmap priorities are documented in [`LIMI
 
 Sakura AI demonstrates that an academic final-year software engineering project can move well beyond a single-endpoint LLM prototype to implement genuine production systems architecture. Across **32 normalized database tables**, **11 Alembic migrations**, **4 standalone lease-fenced worker processes**, a **Hybrid `pgvector(1536)` + Okapi BM25 RAG engine**, and an **isolated remote Docker coding sandbox**, the platform addresses the hardest real-world challenges of multi-tenant AI software: privacy, data isolation, crash recovery, idempotency, and safe untrusted code execution.
 
-Backed by **253 passing local backend tests**, **37/37 verified live user journeys**, and **4/4 green GitHub Actions CI workflows** (Run `46157049085`), Sakura AI stands ready for formal college project evaluation, technical viva defense, software engineering interviews, and controlled private staging deployment.
+Backed by **253 passing local backend tests**, **live verified user journeys**, and **4/4 green GitHub Actions CI workflows** (Run `46167864598`), Sakura AI stands ready for formal college project evaluation, technical viva defense, software engineering interviews, and controlled private staging deployment.

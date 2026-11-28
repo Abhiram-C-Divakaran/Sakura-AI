@@ -1,6 +1,6 @@
 # Sakura AI — 50 Project Viva Questions & Answers + Senior Interview Challenges
 
-Every answer below is strictly grounded in Sakura AI's actual codebase (`anime-ai/backend`, `anime-ai/frontend`, `anime-ai/docker-compose.prod.yml`, and verified CI Run `46157049085`). Do not claim technologies Sakura AI does not use.
+Every answer below is strictly grounded in Sakura AI's actual codebase (`anime-ai/backend`, `anime-ai/frontend`, `anime-ai/docker-compose.prod.yml`, and verified CI Run `46167864598`). Do not claim technologies Sakura AI does not use.
 
 ---
 
@@ -174,7 +174,7 @@ Falling back silently to per-process in-memory counters across multiple API repl
 ## 9. Testing, CI & Reliability Questions (Q41–Q45)
 
 **Q41. How many automated tests exist and what was actually verified?**  
-Locally, `unittest discover` runs **271 backend tests** (`253` passed, `18` environment-gated skipped on SQLite, `0` failed), plus `tsc --noEmit`, `next lint`, `next build`, and **37/37 live full-stack API/UI checks**. On GitHub Actions (Run `46157049085` on `d8de865`), **all 4 required CI jobs passed**—including PostgreSQL 15 + `pgvector` with **0 skips**, backup/restore verification, real Docker sandbox E2E, and unmocked Playwright browser E2E.
+Locally, `unittest discover` runs **271 backend tests** (`253` passed, `18` environment-gated skipped on SQLite, `0` failed), plus `tsc --noEmit`, `next lint`, `next build`, and **37/37 live full-stack API/UI checks**. On GitHub Actions (Run `46167864598` on `03e213d`), **all 4 required CI jobs passed**—including PostgreSQL 15 + `pgvector` with **0 skips**, backup/restore verification, real Docker sandbox E2E, and unmocked Playwright browser E2E.
 
 **Q42. How does image variation idempotency handle duplicate clicks vs. conflicting payloads?**  
 Clients send an `Idempotency-Key`. `image_variation_batches` stores both `(user_id, idempotency_key)` and a canonical `request_fingerprint`. Replaying the exact same request returns the existing batch (`HTTP 202`), whereas reusing the same key with different parameters is rejected with `HTTP 409 Conflict`.

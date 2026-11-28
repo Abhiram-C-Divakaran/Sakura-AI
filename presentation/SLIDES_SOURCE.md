@@ -77,7 +77,7 @@
 - Actual verified metrics (zero fabricated numbers):
   - **253 / 253 active local backend tests PASSED** (`18` PG/Docker-gated skipped on SQLite, `0` failures).
   - **37 / 37 live full-stack API & UI journeys PASSED** (`0` failures).
-  - **4 / 4 GitHub Actions CI jobs PASSED** (Run `46157049085` on `d8de865`): Real PostgreSQL 15 + `pgvector` (0 skips), backup/restore tamper test, real Docker sandbox E2E, unmocked Playwright E2E, **0 orphaned containers**.
+  - **4 / 4 GitHub Actions CI jobs PASSED** (Run `46167864598` on `03e213d`): Real PostgreSQL 15 + `pgvector` (0 skips), backup/restore tamper test, real Docker sandbox E2E, unmocked Playwright E2E, **0 orphaned containers**.
 
 ## Slide 16 — Known Limitations
 - External staging host (TLS, managed PG15/Redis/S3/SMTP) not yet provisioned.
