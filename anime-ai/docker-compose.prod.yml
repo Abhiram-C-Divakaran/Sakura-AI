@@ -20,7 +20,7 @@ services:
     image: redis:7-alpine
     container_name: sakura_redis
     restart: always
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
     # No public host port in production; accessible only via internal network
     volumes:
       - redis_data:/data

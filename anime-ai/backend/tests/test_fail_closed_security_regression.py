@@ -599,6 +599,56 @@ class TestFailClosedSecurityRegression(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(captured_messages, "Expected system prompt sent to provider")
             self.assertIn("S3_CONFIDENTIAL_PROJECT_NOTES_12345", captured_messages[0]["content"])
 
+    # 13. Preflight validate_env.py rejects reused secrets, wildcard CORS, and test providers in prod
+    def test_validate_env_preflight_rejects_secret_reuse_wildcard_cors_and_test_providers(self):
+        import importlib.util
+
+        script_path = os.path.join(os.path.dirname(BACKEND_DIR), "ops", "scripts", "validate_env.py")
+        spec = importlib.util.spec_from_file_location("sakura_validate_env", script_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        valid_env = {
+            "ENVIRONMENT": "production",
+            "POSTGRES_PASSWORD": "pg_strong_password_987654",
+            "DATABASE_URL": "postgresql+psycopg2://postgres:pg_strong_password_987654@postgres:5432/anime_ai",
+            "REDIS_URL": "redis://redis:6379/0",
+            "JWT_SECRET": "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0",
+            "INTEGRATION_ENCRYPTION_KEY": "z9y8x7w6v5u4t3s2r1q0p9o8n7m6l5k4j3i2h1g0",
+            "SAKURA_SANDBOX_SERVICE_TOKEN": "svc_tok_prod_val_987654321012",
+            "SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY": "cap_key_prod_val_1234567890abcdef123456",
+            "SAKURA_STORAGE_BACKEND": "s3",
+            "SAKURA_STORAGE_BUCKET": "sakura-staging",
+            "SAKURA_STORAGE_ACCESS_KEY": "AKIAVALIDKEY12345678",
+            "SAKURA_STORAGE_SECRET_KEY": "valid_s3_secret_value_9876543210",
+            "SAKURA_EMBEDDED_WORKER": "false",
+            "SAKURA_EMBEDDED_SCHEDULER": "false",
+            "SAKURA_EMBEDDED_CODING_WORKER": "false",
+            "TRUSTED_PROXY_CIDRS": "127.0.0.1/32",
+            "CORS_ALLOWED_ORIGINS": "https://staging.sakura.internal",
+            "OPENAI_API_KEY": "sk-live-placeholder-not-real",
+        }
+        errs, _ = mod.validate_environment(valid_env)
+        self.assertEqual(errs, [], f"Baseline valid staging env must pass: {errs}")
+
+        # Reused secret MUST fail
+        reused = dict(valid_env)
+        reused["SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY"] = valid_env["JWT_SECRET"]
+        errs_reuse, _ = mod.validate_environment(reused)
+        self.assertTrue(any("independent" in e.lower() for e in errs_reuse))
+
+        # Wildcard CORS MUST fail
+        wild_cors = dict(valid_env)
+        wild_cors["CORS_ALLOWED_ORIGINS"] = "*"
+        errs_cors, _ = mod.validate_environment(wild_cors)
+        self.assertTrue(any("wildcard" in e.lower() for e in errs_cors))
+
+        # Deterministic test providers in production MUST fail
+        det_prod = dict(valid_env)
+        det_prod["SAKURA_DETERMINISTIC_TEST_PROVIDERS"] = "true"
+        errs_det, _ = mod.validate_environment(det_prod)
+        self.assertTrue(any("deterministic_test_providers" in e.lower() for e in errs_det))
+
 
 if __name__ == "__main__":
     unittest.main()

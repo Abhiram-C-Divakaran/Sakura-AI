@@ -38,7 +38,7 @@ def validate_environment(env: dict) -> Tuple[List[str], List[str]]:
     environment = (env.get("ENVIRONMENT") or "production").strip().lower()
     is_prod = environment in ("production", "prod", "staging")
 
-    # 1. Required secrets & minimum entropy length
+    # 1. Required secrets & minimum entropy length + pairwise independence
     secret_specs = [
         ("POSTGRES_PASSWORD", 12),
         ("JWT_SECRET", 32),
@@ -46,6 +46,7 @@ def validate_environment(env: dict) -> Tuple[List[str], List[str]]:
         ("SAKURA_SANDBOX_SERVICE_TOKEN", 24),
         ("SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY", 32),
     ]
+    resolved_secrets = {}
     for name, min_len in secret_specs:
         val = (env.get(name) or "").strip()
         if not val:
@@ -54,6 +55,27 @@ def validate_environment(env: dict) -> Tuple[List[str], List[str]]:
             errors.append(f"{name} must be at least {min_len} characters (got {len(val)}).")
         elif is_prod and _looks_placeholder(val):
             errors.append(f"{name} appears to contain a placeholder value.")
+        else:
+            resolved_secrets[name] = val
+
+    # Ensure core cryptographic/service secrets are strictly independent (never reused)
+    independent_keys = [
+        "JWT_SECRET",
+        "INTEGRATION_ENCRYPTION_KEY",
+        "SAKURA_SANDBOX_SERVICE_TOKEN",
+        "SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY",
+    ]
+    seen_values = {}
+    for key_name in independent_keys:
+        val = resolved_secrets.get(key_name)
+        if not val:
+            continue
+        if val in seen_values:
+            errors.append(
+                f"{key_name} must be independent of {seen_values[val]} (secret reuse is forbidden)."
+            )
+        else:
+            seen_values[val] = key_name
 
     # 2. Database URL driver consistency
     db_url = (env.get("DATABASE_URL") or "").strip()
@@ -132,7 +154,19 @@ def validate_environment(env: dict) -> Tuple[List[str], List[str]]:
     else:
         warnings.append("SMTP_HOST / SMTP_FROM_EMAIL not set; password reset will remain disabled truthfully.")
 
-    # 8. At least one LLM provider configured
+    # 8. Forbid wildcard CORS and deterministic test providers in staging/production
+    cors_origins = (env.get("CORS_ALLOWED_ORIGINS") or "").strip()
+    if is_prod:
+        if not cors_origins:
+            warnings.append("CORS_ALLOWED_ORIGINS is unset; backend will default to localhost origins.")
+        else:
+            parsed_origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
+            if any(o == "*" or "*" in o for o in parsed_origins):
+                errors.append("CORS_ALLOWED_ORIGINS must not contain wildcard '*' in staging/production.")
+        if (env.get("SAKURA_DETERMINISTIC_TEST_PROVIDERS") or "").strip().lower() in ("1", "true", "yes"):
+            errors.append("SAKURA_DETERMINISTIC_TEST_PROVIDERS must not be enabled in staging/production.")
+
+    # 9. At least one LLM provider configured
     llm_keys = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY", "OLLAMA_BASE_URL", "OLLAMA_HOST")
     if not any((env.get(k) or "").strip() for k in llm_keys):
         warnings.append("No LLM provider key configured (OPENAI_API_KEY, ANTHROPIC_API_KEY, GROQ_API_KEY, or OLLAMA_BASE_URL).")
