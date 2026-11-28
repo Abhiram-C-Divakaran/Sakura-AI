@@ -15,7 +15,8 @@ Sakura AI is a production-oriented full-stack AI platform built with **FastAPI (
 | [`docs/architecture/`](docs/architecture/) | Architects & Faculty | All 9 verified Mermaid diagrams: [`SYSTEM_ARCHITECTURE.md`](docs/architecture/SYSTEM_ARCHITECTURE.md), [`API_WORKFLOW.md`](docs/architecture/API_WORKFLOW.md), [`AI_RAG_WORKFLOW.md`](docs/architecture/AI_RAG_WORKFLOW.md), [`DATABASE_ER_DIAGRAM.md`](docs/architecture/DATABASE_ER_DIAGRAM.md), [`CODING_SANDBOX_WORKFLOW.md`](docs/architecture/CODING_SANDBOX_WORKFLOW.md) |
 | [`presentation/`](presentation/) | College Viva & Presentation | Editable 19-slide source ([`SLIDES_SOURCE.md`](presentation/SLIDES_SOURCE.md), [`build_presentation.py`](presentation/build_presentation.py)) and final PowerPoint deck ([`Sakura_AI_Academic_Presentation.pptx`](presentation/Sakura_AI_Academic_Presentation.pptx)) |
 | [`docs/interview/`](docs/interview/) | Viva & Engineering Interviews | [`VIVA_QUESTIONS_AND_ANSWERS.md`](docs/interview/VIVA_QUESTIONS_AND_ANSWERS.md) (50 viva Q&As + 8 senior deep-dives), [`ARCHITECTURE_EXPLANATIONS.md`](docs/interview/ARCHITECTURE_EXPLANATIONS.md), [`TECHNICAL_INTERVIEW_PREP.md`](docs/interview/TECHNICAL_INTERVIEW_PREP.md) |
-| [`docs/DEMO_PLAYBOOK.md`](docs/DEMO_PLAYBOOK.md) | Live Demonstrations | Repeatable 15-minute live demo script with pre-flight checklist and offline/degraded fallback matrix |
+| [`docs/DEMO_PLAYBOOK.md`](docs/DEMO_PLAYBOOK.md) | Live Demonstrations | Repeatable 5-minute & 15-minute demo playbooks, pre-flight script ([`preflight_check.py`](docs/demo_assets/preflight_check.py)), sample RAG/code assets, and fallback matrix |
+| [`docs/testing/`](docs/testing/) | QA, Evaluators & Auditors | Phase 3 UAT evidence: [`UAT_TEST_PLAN.md`](docs/testing/UAT_TEST_PLAN.md), [`UAT_TEST_RESULTS.md`](docs/testing/UAT_TEST_RESULTS.md), [`FEATURE_VERIFICATION_MATRIX.md`](docs/testing/FEATURE_VERIFICATION_MATRIX.md), [`SECURITY_VERIFICATION.md`](docs/testing/SECURITY_VERIFICATION.md), [`DEMONSTRATION_TEST_REPORT.md`](docs/testing/DEMONSTRATION_TEST_REPORT.md) |
 | [`anime-ai/PRODUCTION_READINESS.md`](anime-ai/PRODUCTION_READINESS.md) | DevOps & Release Reviewers | Staging runbook, branch protection, backup/restore verification, and operational readiness checklist |
 | [`anime-ai/SAKURA_CODING_ENGINE.md`](anime-ai/SAKURA_CODING_ENGINE.md) | Engineering Reference | Coding agent design charter, 21-tool surface, and verification principles |
 
@@ -222,7 +223,7 @@ npm run lint
 npm run build
 ```
 
-### GitHub Actions CI (4 Required Workflows — Run `46157049085` on `d8de865`: 4/4 PASSED)
+### GitHub Actions CI (4 Required Workflows — Run `46167864598` on `03e213d`: 4/4 PASSED)
 Every pull request executes four required Ubuntu Linux CI workflows in [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
 1. **Backend Tests & Schema Verification:** Real PostgreSQL 15 (`pgvector/pgvector:pg15`) + Redis 7, Alembic upgrade, 32-table schema parity, PG concurrency & `pgvector(1536)` tests (`0` skips), official `postgres:15` `backup_postgres.sh` + `verify_restore.sh` (positive restore + tampered `.sha256` rejection), Compose validation, and backend Docker build.
 2. **Frontend Typecheck & Build:** `tsc --noEmit`, `next lint`, `next build`, Playwright landing smoke tests, and production frontend Docker build.
