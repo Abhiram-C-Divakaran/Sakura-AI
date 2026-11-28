@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect } from 'react';
 import { authFetch } from '../lib/auth';
 import { API_BASE } from '../lib/api';
@@ -296,11 +297,10 @@ export const FilePreviewModal: React.FC<FilePreviewModalProps> = ({
           <div className="flex items-center gap-2">
             <button
               onClick={() => onToggleKnowledgeBase(file)}
-              className={`px-3 py-1.5 text-[12px] font-medium rounded-lg transition-colors cursor-pointer border ${
-                file.is_knowledge_base
+              className={`px-3 py-1.5 text-[12px] font-medium rounded-lg transition-colors cursor-pointer border ${file.is_knowledge_base
                   ? 'bg-[#1C2C26] text-[#35D0BA] border-[#35D0BA]/30 hover:bg-[#243B33]'
                   : 'bg-[#222222] text-[#CCCCCC] border-[#333333] hover:bg-[#2C2C2C]'
-              }`}
+                }`}
             >
               {file.is_knowledge_base ? '✓ Indexed in AI Memory' : '+ Add to AI Memory'}
             </button>

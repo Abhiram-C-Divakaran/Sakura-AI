@@ -302,12 +302,12 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           prev.map((f) =>
             f.id === file.id
               ? {
-                  ...f,
-                  ...(body?.file || {}),
-                  deletion_status: 'DELETING',
-                  deletion_error: null,
-                  is_knowledge_base: false,
-                }
+                ...f,
+                ...(body?.file || {}),
+                deletion_status: 'DELETING',
+                deletion_error: null,
+                is_knowledge_base: false,
+              }
               : f
           )
         );
@@ -517,7 +517,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                setIsNewMenuOpen(!isNewMenuOpen)}
+                setIsNewMenuOpen(!isNewMenuOpen)
+              }
               }
               className="flex items-center gap-1.5 px-3.5 py-1.5 bg-white text-black font-medium text-[13px] rounded-xl hover:bg-[#EAEAEA] transition-all cursor-pointer shadow-md"
             >
@@ -590,9 +591,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           <div className="flex items-center bg-[#141414] border border-[#262626] rounded-xl p-0.5">
             <button
               onClick={() => handleToggleViewMode('list')}
-              className={`p-1.5 rounded-lg transition-colors ${
-                viewMode === 'list' ? 'bg-[#282828] text-white' : 'text-[#666666] hover:text-white'
-              }`}
+              className={`p-1.5 rounded-lg transition-colors ${viewMode === 'list' ? 'bg-[#282828] text-white' : 'text-[#666666] hover:text-white'
+                }`}
               title="List view"
             >
               <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -606,9 +606,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             </button>
             <button
               onClick={() => handleToggleViewMode('grid')}
-              className={`p-1.5 rounded-lg transition-colors ${
-                viewMode === 'grid' ? 'bg-[#282828] text-white' : 'text-[#666666] hover:text-white'
-              }`}
+              className={`p-1.5 rounded-lg transition-colors ${viewMode === 'grid' ? 'bg-[#282828] text-white' : 'text-[#666666] hover:text-white'
+                }`}
               title="Grid view"
             >
               <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -632,11 +631,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             <button
               key={tab}
               onClick={() => setCategory(tab)}
-              className={`px-3 py-1.5 text-[13px] font-medium rounded-xl transition-all cursor-pointer capitalize flex items-center gap-1.5 ${
-                isActive
-                  ? 'bg-[#1F1F1F] text-white shadow-sm'
-                  : 'text-[#888888] hover:text-white hover:bg-[#141414]'
-              }`}
+              className={`px-3 py-1.5 text-[13px] font-medium rounded-xl transition-all cursor-pointer capitalize flex items-center gap-1.5 ${isActive
+                ? 'bg-[#1F1F1F] text-white shadow-sm'
+                : 'text-[#888888] hover:text-white hover:bg-[#141414]'
+                }`}
             >
               <span>{tab}</span>
               {count > 0 && (
@@ -667,11 +665,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       {deleteBanner && (
         <div
           role="status"
-          className={`mx-8 mt-3 p-3 rounded-xl flex items-center justify-between text-[12.5px] border ${
-            deleteBanner.type === 'error'
-              ? 'bg-[#2A1515] border-[#5C2323] text-[#FF8585]'
-              : 'bg-[#262014] border-[#EAB308]/35 text-[#FACC15]'
-          }`}
+          className={`mx-8 mt-3 p-3 rounded-xl flex items-center justify-between text-[12.5px] border ${deleteBanner.type === 'error'
+            ? 'bg-[#2A1515] border-[#5C2323] text-[#FF8585]'
+            : 'bg-[#262014] border-[#EAB308]/35 text-[#FACC15]'
+            }`}
         >
           <span>{deleteBanner.message}</span>
           <button
@@ -777,9 +774,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                       key={file.id}
                       onClick={() => setSelectedFileId(file.id)}
                       onDoubleClick={() => setPreviewFile(file)}
-                      className={`group hover:bg-[#121212] transition-colors cursor-pointer ${
-                        isSelected ? 'bg-[#161616]' : ''
-                      }`}
+                      className={`group hover:bg-[#121212] transition-colors cursor-pointer ${isSelected ? 'bg-[#161616]' : ''
+                        }`}
                     >
                       {/* Name + Icon / Thumbnail */}
                       <td className="py-3 pl-2 pr-4">
@@ -845,11 +841,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                           </div>
                         ) : (
                           <span
-                            className={`text-[11px] font-mono px-2 py-0.5 rounded-full border ${
-                              file.is_knowledge_base
-                                ? 'bg-[#14231E] text-[#35D0BA] border-[#35D0BA]/30'
-                                : 'bg-[#181818] text-[#777777] border-[#2A2A2A]'
-                            }`}
+                            className={`text-[11px] font-mono px-2 py-0.5 rounded-full border ${file.is_knowledge_base
+                              ? 'bg-[#14231E] text-[#35D0BA] border-[#35D0BA]/30'
+                              : 'bg-[#181818] text-[#777777] border-[#2A2A2A]'
+                              }`}
                           >
                             {file.is_knowledge_base ? 'Ready for AI' : 'Not indexed'}
                           </span>
