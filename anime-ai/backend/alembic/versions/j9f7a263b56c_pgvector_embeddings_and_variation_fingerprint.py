@@ -40,35 +40,41 @@ def _validate_existing_json_embeddings(bind) -> None:
     to PostgreSQL `vector(1536)`. Raises an actionable RuntimeError listing offending row IDs
     and exact validation errors if any row is malformed or has the wrong dimension.
     """
-    rows = bind.execute(
+    result = bind.execute(
         sa.text("SELECT id, embedding FROM document_chunks WHERE embedding IS NOT NULL")
-    ).fetchall()
+    )
 
     invalid_rows = []
-    for row_id, raw_val in rows:
-        if not isinstance(raw_val, list):
-            invalid_rows.append(
-                f"id={row_id}: expected JSON array of {EXPECTED_EMBEDDING_DIM} numbers, got {type(raw_val).__name__}"
-            )
-            continue
-        if len(raw_val) != EXPECTED_EMBEDDING_DIM:
-            invalid_rows.append(
-                f"id={row_id}: expected dimension {EXPECTED_EMBEDDING_DIM}, got {len(raw_val)}"
-            )
-            continue
-        bad_elem = None
-        for idx, item in enumerate(raw_val):
-            # Reject booleans (isinstance(True, int) is True in Python), strings, nulls, NaN/Inf
-            if isinstance(item, bool) or not isinstance(item, (int, float)):
-                bad_elem = f"index {idx} has non-numeric type {type(item).__name__}"
-                break
-            if not math.isfinite(float(item)):
-                bad_elem = f"index {idx} has non-finite float value {item!r}"
-                break
-        if bad_elem is not None:
-            invalid_rows.append(f"id={row_id}: {bad_elem}")
+    use_chunks = hasattr(result, "fetchmany")
+    while True:
+        rows = result.fetchmany(500) if use_chunks else result.fetchall()
+        if not rows:
+            break
+        for row_id, raw_val in rows:
+            if not isinstance(raw_val, list):
+                invalid_rows.append(
+                    f"id={row_id}: expected JSON array of {EXPECTED_EMBEDDING_DIM} numbers, got {type(raw_val).__name__}"
+                )
+            elif len(raw_val) != EXPECTED_EMBEDDING_DIM:
+                invalid_rows.append(
+                    f"id={row_id}: expected dimension {EXPECTED_EMBEDDING_DIM}, got {len(raw_val)}"
+                )
+            else:
+                bad_elem = None
+                for idx, item in enumerate(raw_val):
+                    # Reject booleans (isinstance(True, int) is True in Python), strings, nulls, NaN/Inf
+                    if isinstance(item, bool) or not isinstance(item, (int, float)):
+                        bad_elem = f"index {idx} has non-numeric type {type(item).__name__}"
+                        break
+                    if not math.isfinite(float(item)):
+                        bad_elem = f"index {idx} has non-finite float value {item!r}"
+                        break
+                if bad_elem is not None:
+                    invalid_rows.append(f"id={row_id}: {bad_elem}")
 
-        if len(invalid_rows) >= 10:
+            if len(invalid_rows) >= 10:
+                break
+        if len(invalid_rows) >= 10 or not use_chunks:
             break
 
     if invalid_rows:
@@ -179,6 +185,14 @@ def upgrade() -> None:
             for fk in insp.get_foreign_keys('generated_images')
         }
         if (('parent_image_id',), 'generated_images', ('id',)) not in existing_fks:
+            # Nullify any dangling parent_image_id left before FK existed so ON DELETE SET NULL FK applies cleanly
+            bind.execute(
+                sa.text(
+                    "UPDATE generated_images SET parent_image_id = NULL "
+                    "WHERE parent_image_id IS NOT NULL "
+                    "AND parent_image_id NOT IN (SELECT id FROM generated_images)"
+                )
+            )
             with op.batch_alter_table('generated_images') as batch_op:
                 batch_op.create_foreign_key(
                     'fk_generated_images_parent_image_id',

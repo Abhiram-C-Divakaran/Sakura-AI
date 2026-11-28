@@ -244,6 +244,11 @@ class RemoteHttpSandboxRuntime(BaseSandboxRuntime):
         network_capability: Optional[str] = None
     ) -> Dict[str, Any]:
         timeout = timeout_seconds or self.default_timeout_seconds
+        env_now = os.getenv("ENVIRONMENT", "development").lower()
+        if env_now in ("production", "prod") and not (self.service_token or "").strip():
+            raise SandboxUnavailableError(
+                "Production sandbox execution blocked: SAKURA_SANDBOX_SERVICE_TOKEN is not configured."
+            )
         execution_id = uuid.uuid4().hex
         payload = {
             "command": command,
@@ -313,6 +318,11 @@ class RemoteHttpSandboxRuntime(BaseSandboxRuntime):
         timeout_seconds: int = 120
     ) -> Dict[str, Any]:
         """Invokes the dedicated /workspaces/{workspace_id}/clone endpoint with a repository_clone capability."""
+        env_now = os.getenv("ENVIRONMENT", "development").lower()
+        if env_now in ("production", "prod") and not (self.service_token or "").strip():
+            raise SandboxUnavailableError(
+                "Production sandbox clone blocked: SAKURA_SANDBOX_SERVICE_TOKEN is not configured."
+            )
         headers = {}
         if self.service_token:
             headers["X-Sandbox-Token"] = self.service_token
@@ -336,10 +346,17 @@ class RemoteHttpSandboxRuntime(BaseSandboxRuntime):
                     raise SandboxUnavailableError("Sandbox executor authentication failed: invalid service token.")
                 if resp.status_code != 200:
                     raise SandboxUnavailableError(f"Sandbox clone returned HTTP {resp.status_code}: {resp.text}")
-                return resp.json()
+                data = resp.json()
+                if data.get("isolation_unavailable"):
+                    raise SandboxUnavailableError(
+                        f"Sandbox executor container isolation unavailable during clone: {data.get('stderr')}"
+                    )
+                return data
         except SandboxUnavailableError:
             raise
         except Exception as e:
+            if env_now in ("production", "prod"):
+                raise SandboxUnavailableError(f"Production sandbox clone failed: {str(e)}") from e
             return {
                 "success": False,
                 "exit_code": -1,
@@ -466,23 +483,24 @@ class LocalRestrictedSandboxRuntime(BaseSandboxRuntime):
                     "timed_out": False
                 }
             except asyncio.CancelledError:
+                # Sweep child process tree BEFORE killing parent alone so Windows taskkill /T finds descendants
+                self._kill_process_tree(proc.pid)
                 try:
                     proc.kill()
                 except Exception:
                     pass
-                self._kill_process_tree(proc.pid)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=2)
                 except Exception:
                     pass
                 raise
             except asyncio.TimeoutError:
-                # Terminate process directly first, then sweep child tree with bounded timeout
+                # Sweep child process tree BEFORE killing parent alone so Windows taskkill /T finds descendants
+                self._kill_process_tree(proc.pid)
                 try:
                     proc.kill()
                 except Exception:
                     pass
-                self._kill_process_tree(proc.pid)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=2)
                 except Exception:
@@ -517,19 +535,60 @@ class LocalRestrictedSandboxRuntime(BaseSandboxRuntime):
         """Kills the target process and all child processes."""
         try:
             if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=2,
-                    check=False
-                )
+                import ctypes
+                from ctypes import wintypes
+
+                class _PROCESSENTRY32W(ctypes.Structure):
+                    _fields_ = [
+                        ("dwSize", wintypes.DWORD),
+                        ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_size_t),
+                        ("th32ModuleID", wintypes.DWORD),
+                        ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD),
+                        ("pcPriClassBase", wintypes.LONG),
+                        ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", wintypes.WCHAR * 260),
+                    ]
+
+                kernel32 = ctypes.windll.kernel32
+                snap = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+                if snap not in (0, -1, wintypes.HANDLE(-1).value):
+                    children_by_parent: Dict[int, List[int]] = {}
+                    try:
+                        entry = _PROCESSENTRY32W()
+                        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+                        ok_walk = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+                        while ok_walk:
+                            children_by_parent.setdefault(int(entry.th32ParentProcessID), []).append(int(entry.th32ProcessID))
+                            ok_walk = kernel32.Process32NextW(snap, ctypes.byref(entry))
+                    finally:
+                        kernel32.CloseHandle(snap)
+
+                    ordered: List[int] = []
+                    queue = [int(pid)]
+                    seen = {int(pid)}
+                    while queue:
+                        cur = queue.pop(0)
+                        ordered.append(cur)
+                        for child in children_by_parent.get(cur, ()):
+                            if child not in seen:
+                                seen.add(child)
+                                queue.append(child)
+
+                    for target_pid in reversed(ordered):
+                        handle = kernel32.OpenProcess(0x0001, False, target_pid)
+                        if handle:
+                            try:
+                                kernel32.TerminateProcess(handle, 1)
+                            finally:
+                                kernel32.CloseHandle(handle)
             else:
                 import signal
                 try:
-                    pgid = os.getpgid(pid)
-                    if pgid != os.getpgrp():
-                        os.killpg(pgid, signal.SIGKILL)
+                    if pid != os.getpgrp():
+                        os.killpg(pid, signal.SIGKILL)
                     else:
                         os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -608,7 +667,13 @@ class SandboxManager:
         """
         env = os.getenv("ENVIRONMENT", "development").lower()
         is_prod = env in ("production", "prod")
-        pref = (force_runtime or os.getenv("SAKURA_SANDBOX_RUNTIME", "auto")).lower()
+        pref = (force_runtime or os.getenv("SAKURA_SANDBOX_RUNTIME", "auto")).strip().lower()
+        valid_runtimes = {"auto", "remote", "remote_http", "docker", "local_restricted"}
+        if pref not in valid_runtimes:
+            raise SandboxUnavailableError(
+                f"Invalid sandbox runtime configuration '{pref}'. "
+                f"Expected one of: {', '.join(sorted(valid_runtimes))}."
+            )
 
         if is_prod:
             if pref in ("local_restricted", "docker"):

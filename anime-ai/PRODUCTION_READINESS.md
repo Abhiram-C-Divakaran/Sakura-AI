@@ -174,5 +174,57 @@ The repository is deployment-neutral and has no confirmed hosting provider or pu
 
 ### Frontend Image Variation Entry-Point Note
 - `GenerateImageModal.tsx` (`LibraryView.tsx`) generates and preserves a retry-stable `idempotency_key` via `createIdempotencyKey('img_gen')` for `POST /api/v1/library/generate-image`.
-- `POST /api/v1/images/variation` enforces required `idempotency_key` (`HTTP 400`), normalized request fingerprint replay (`HTTP 202`, zero extra quota), payload conflict rejection (`HTTP 409`), and legacy `NULL`-fingerprint compatibility validation on the backend. No mounted frontend UI button currently calls `/api/v1/images/variation` (`ImageLightboxModal.tsx` is unmounted), so no dead frontend client helper is shipped.
+- `POST /api/v1/images/variation` enforces required `idempotency_key` (`HTTP 400`, max 128 chars, collision-safe child job keys), normalized request fingerprint replay (`HTTP 202`, zero extra quota, idempotent re-enqueue of still-`QUEUED` jobs), payload conflict rejection (`HTTP 409`), and legacy `NULL`-fingerprint compatibility validation on the backend. No mounted frontend UI button currently calls `/api/v1/images/variation` (`ImageLightboxModal.tsx` is unmounted), so no dead frontend client helper is shipped.
+
+---
+
+## 14. Evidence-Based Release Readiness Assessment *(PR #1 Hardening Status)*
+
+> **Truthfulness Policy:** Nothing below claims live production deployment, external cloud provisioning, or live third-party integration success without direct test/CI evidence. Items requiring external infrastructure or manual sign-off remain explicitly open.
+
+### 14.1 Completed and Locally Verified
+- **Python static compilation (`python -m compileall -q .`):** Verified exit 0 across `anime-ai/backend`.
+- **Backend unit & cross-dialect contract test suite (`python -m unittest discover -s tests -p "test_*.py" -v`):** 240 passed, 0 failed, 18 skipped (PostgreSQL-only and Docker-daemon E2E tests gated by `SAKURA_POSTGRES_TEST=1` / `SAKURA_SANDBOX_E2E=1` because Docker Desktop and PostgreSQL 15 are not running on the local Windows workstation).
+- **Subprocess hardening regression suite (`tests/test_subprocess_hardening_regression.py`):** Verified locally — bounded concurrent stdout/stderr pipe draining (>128 KiB without deadlock), process-tree termination (child + grandchild verified dead on timeout and cancellation), non-zero exit rejection even when stdout prints `{"ok": true}`, malformed/empty stdin and stdout rejection, production `test_delay_seconds` guard, and expired-lease cancellation fencing (`stale`).
+- **Fail-closed security regression suite (`tests/test_fail_closed_security_regression.py`):** Verified locally — production `Settings.validate_production_guards()` rejection of default/empty/reused `SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY` and missing `SAKURA_SANDBOX_SERVICE_TOKEN`, `get_capability_signing_key()` production fail-closed checks, `/readiness` 503 on missing production sandbox secrets, production Redis-unavailable fail-closed rate limiting (503) and nonce store denial, capability replay/scope/workspace/command mismatch denial, cross-user resource denial, invalid `SAKURA_SANDBOX_RUNTIME` denial, unresolved Docker volume denial on `/clone` and `/execute`, and production remote runtime connection/credential fail-closed errors.
+- **Image variation idempotency regression suite (`tests/test_image_variation_idempotency_regression.py`):** Verified locally — repeated identical requests, concurrent duplicate requests, long (>112-char) prefix-sharing key non-collision, >128-char key rejection (HTTP 400), cross-user key isolation, conflicting payload rejection (`count`, `parent_image_id`, `intensity`, `conversation_id`, missing incoming fingerprint -> HTTP 409, zero extra quota), and recovery after partial quota (429) and transient Redis enqueue failures.
+- **Frontend static checks & production build (`npm run typecheck`, `npm run lint`, `npm run build`):** Verified locally with exit 0 (0 TypeScript errors, 0 ESLint errors, all 12 Next.js routes compiled).
+
+### 14.2 Completed and CI Verified *(GitHub Actions — Sakura AI CI)*
+All four required GitHub Actions CI workflows execute on every PR #1 head commit with real containerized infrastructure (zero silent skips on PG and Docker E2E suites):
+1. **`Backend Tests & Schema Verification`:** Real PostgreSQL 15 + `pgvector` (`pgvector/pgvector:pg15`) and Redis 7 (`redis:7-alpine`): `alembic upgrade head`, `test_schema_parity.py`, `test_scheduler_resilience.py`, `test_postgres_pgvector_and_concurrency.py` (all 7 PG tests with 0 skips: concurrent `FOR UPDATE SKIP LOCKED` claims, single-item claim contention, concurrent `request_document_deletion` single-outbox serialization, lease expiry/recovery max-attempts exhaustion + `Document.deletion_status='DELETE_FAILED'`, rollback safety, duplicate `CodingTaskEvent` monotonic sequence resolution, JSON -> `vector(1536)` migration + malformed-row rollback + dangling FK cleanup + downgrade roundtrip, native cosine-distance search, and PG variation concurrency), plus official `postgres:15` `backup_postgres.sh` / `verify_restore.sh` positive & negative (tampered/corrupt dump) checks, `docker-compose.prod.yml config`, backend Docker image build, and full backend test suite.
+2. **`Frontend Typecheck & Build`:** `npm ci`, `npm run typecheck`, `npm run lint`, `npm run build`, Playwright Chromium browser E2E (`npm run test:e2e`), and production frontend Docker image build.
+3. **`Docker Sandbox E2E Integration`:** Builds `sakura-sandbox`, `sakura-sandbox-executor`, and `sakura-backend` images; runs real PG 15 + Redis + remote Docker `sandbox-executor` + separate `coding.job_worker` container; executes `test_sandbox_e2e_docker.py`, `test_workspace_topology_e2e.py`, and `test_production_remote_coding_e2e.py` (0 skips) and asserts 0 orphaned `sakura-exec-*` / `sakura-smoke-*` containers.
+4. **`Full-Stack Integration Tests`:** Runs PG 15 + Redis + remote Docker `sandbox-executor` + FastAPI API + 3 separate worker containers (`tasks.worker`, `media.image_worker`, `coding.job_worker`) + Next.js frontend and executes Playwright `npm run test:e2e:fullstack` plus 0 orphaned container check.
+
+### 14.3 Implemented but Not Integration Verified Against Live External Services
+- **S3-compatible object storage (`services/storage.py` `S3CompatibleStorage`):** Implemented with streaming uploads/downloads, bounded delete timeouts, and credential redaction in `/readiness`, and covered by unit/adapter tests, but NOT integration-verified against a live external AWS S3 / Cloudflare R2 / MinIO bucket in CI (CI exercises local durable volume storage).
+- **Live external LLM & embedding providers (`OpenAI`, `Anthropic`, `Groq`, `Ollama`):** Implemented and verified via deterministic test providers and mock/unit tests; live external API quota/latency/model availability is not exercised in CI.
+- **Transactional SMTP password reset delivery (`services/email.py`):** Implemented with fail-closed production HTTPS `PUBLIC_APP_URL` checks; live external SMTP server delivery and SPF/DKIM/DMARC deliverability are not exercised in CI.
+- **Nginx TLS reverse proxy (`ops/nginx.conf.example`):** Template provided for TLS 1.2/1.3, WebSocket upgrade, and unbuffered SSE; not live-tested against a provisioned domain and ACME certificate.
+- **Local workstation Docker / PG / Playwright suites:** Not executed locally on this Windows host due to Docker Desktop daemon not running and Playwright `chromium_headless_shell-1255` not installed locally; executed on GitHub Actions Linux CI instead.
+
+### 14.4 Requires External Infrastructure
+- **PostgreSQL 15 + `pgvector`:** Managed or dedicated self-hosted PG 15 server with `pgvector` extension package installed and private VPC networking.
+- **Redis 7:** Private-network Redis 7 instance with AOF persistence (`--appendonly yes --appendfsync everysec`) and memory eviction policy appropriate for rate-limit and capability nonce keys (`noeviction` recommended for nonce safety).
+- **S3-Compatible Object Storage:** Provisioned bucket with SSE, versioning, lifecycle rules, and least-privilege IAM credentials (`SAKURA_STORAGE_BACKEND=s3`).
+- **LLM & Embedding Credentials:** Production API keys (`OPENAI_API_KEY` for 1536-dim embeddings / GPT, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, or private `OLLAMA_BASE_URL`).
+- **SMTP:** Transactional email provider credentials (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`) and canonical HTTPS `PUBLIC_APP_URL`.
+- **Domain & TLS:** Public DNS records, TLS 1.2/1.3 certificates, reverse proxy deployment, explicit `TRUSTED_PROXY_CIDRS`, `CORS_ALLOWED_ORIGINS`, and `NEXT_PUBLIC_SITE_URL`.
+- **Monitoring & Alerting:** External metrics/logs/alerting stack scraping `/health`, `/readiness`, PostgreSQL/Redis queue depth, `storage_deletion_outbox` `FAILED` rows, HTTP 401/403/429/503 spikes, and workspace/Docker disk utilization.
+- **Backup Scheduling & Restore Drills:** Scheduled off-host execution of `ops/scripts/backup_postgres.sh` and recurring staging restore drills via `ops/scripts/verify_restore.sh` (using a major-version-matched `postgres:15` client with `REQUIRE_CHECKSUM=true`, `REQUIRE_PGVECTOR=true`, `REQUIRE_RESTORED_VECTOR=true`).
+
+### 14.5 Requires Manual Security, Governance & Operational Review
+- **GitHub Branch Protection:** `main` currently reports `protected=false`; repository owner must manually enable branch protection requiring PR reviews and all 4 CI status checks.
+- **Security & Privacy Review:** Independent security/penetration review of authentication, multi-tenant isolation, sandbox host egress firewall (including blocking `169.254.169.254`), and secret management/rotation procedures.
+- **Support & Legal Readiness:** Configure `NEXT_PUBLIC_SUPPORT_EMAIL` for `/contact` and obtain formal legal counsel review and sign-off on draft `/privacy` and `/terms` pages prior to public/commercial launch.
+- **Staging Load & UAT Sign-Off:** Multi-replica staging load testing and manual end-to-end UAT across desktop and mobile flows.
+
+### 14.6 Outstanding Release Blockers *(Before Public Production Launch)*
+1. **Branch protection not enabled on `main`** (manual GitHub repository setting).
+2. **External staging/production infrastructure not yet provisioned** (PostgreSQL 15 + `pgvector`, Redis 7 AOF, S3 bucket, SMTP, domain/TLS, monitoring/alerting, scheduled backups).
+3. **S3-compatible object storage, SMTP delivery, and live LLM/embedding credentials not yet integration-verified** in a live staging environment.
+4. **Formal security/privacy review and legal sign-off on `/privacy` and `/terms`** not yet completed.
+5. **Staging backup + restore drill and multi-replica load test** not yet performed against target hosting infrastructure.
+
 

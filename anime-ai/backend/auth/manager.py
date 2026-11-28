@@ -76,7 +76,9 @@ class AuthManager:
         secret: Optional[str] = None,
         environment: Optional[str] = None,
         env: Optional[str] = None,
-        integration_key: Optional[str] = None
+        integration_key: Optional[str] = None,
+        capability_signing_key: Optional[str] = None,
+        sandbox_service_token: Optional[str] = None,
     ) -> bool:
         """
         Validates secrets against production security requirements by delegating
@@ -88,10 +90,22 @@ class AuthManager:
             "INTEGRATION_ENCRYPTION_KEY",
             "valid_integration_key_for_test_min_32_chars_123" if target_env in ["production", "prod"] else None
         )
+        target_cap_key = capability_signing_key if capability_signing_key is not None else os.getenv(
+            "SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY",
+            "valid_capability_signing_key_for_test_min_32_chars_789" if target_env in ["production", "prod"] else None
+        )
+        target_svc_token = sandbox_service_token if sandbox_service_token is not None else os.getenv(
+            "SAKURA_SANDBOX_SERVICE_TOKEN",
+            "valid_sandbox_service_token_for_test_456" if target_env in ["production", "prod"] else None
+        )
         from config.settings import Settings
         kwargs = {"ENVIRONMENT": target_env, "JWT_SECRET": target_secret}
         if target_integration_key is not None:
             kwargs["INTEGRATION_ENCRYPTION_KEY"] = target_integration_key
+        if target_cap_key is not None:
+            kwargs["SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY"] = target_cap_key
+        if target_svc_token is not None:
+            kwargs["SAKURA_SANDBOX_SERVICE_TOKEN"] = target_svc_token
         s = Settings(**kwargs)
         s.validate_production_guards()
         return True

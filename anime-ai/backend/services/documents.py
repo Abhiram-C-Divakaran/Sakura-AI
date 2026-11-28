@@ -356,7 +356,13 @@ def request_document_deletion(
     Physical deletion, DB row removal, and `library_update: deleted` broadcasts happen strictly
     in the lease-fenced outbox worker after physical storage deletion succeeds.
     """
-    doc = db.query(Document).filter(Document.id == doc_id, Document.user_id == user_id).first()
+    is_postgres = bool(db.bind and db.bind.dialect.name == "postgresql")
+    doc_query = db.query(Document).filter(Document.id == doc_id, Document.user_id == user_id)
+    if is_postgres:
+        # Serialize concurrent deletion requests for the same document on PostgreSQL so
+        # two simultaneous requests can NEVER insert duplicate active outbox rows.
+        doc_query = doc_query.with_for_update()
+    doc = doc_query.first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
@@ -385,10 +391,15 @@ def request_document_deletion(
             t.completed_at = now
             cancelled_tasks += 1
 
-    outbox = db.query(StorageDeletionOutbox).filter(
-        StorageDeletionOutbox.document_id == doc.id,
-        StorageDeletionOutbox.status != "COMPLETED",
-    ).first()
+    outbox = (
+        db.query(StorageDeletionOutbox)
+        .filter(
+            StorageDeletionOutbox.document_id == doc.id,
+            StorageDeletionOutbox.status != "COMPLETED",
+        )
+        .order_by(StorageDeletionOutbox.created_at.asc())
+        .first()
+    )
 
     already_in_progress = False
     if not outbox:
@@ -595,6 +606,8 @@ def recover_stale_outbox_claims(db: Optional[Session] = None) -> int:
         snaps = [
             (
                 row.id,
+                row.user_id,
+                row.document_id,
                 row.worker_id,
                 row.claim_token,
                 int(row.attempt_count or 0),
@@ -604,7 +617,7 @@ def recover_stale_outbox_claims(db: Optional[Session] = None) -> int:
             for row in stale
         ]
         recovered = 0
-        for oid, old_worker, old_token, attempts, max_att, prev_err in snaps:
+        for oid, uid, doc_id, old_worker, old_token, attempts, max_att, prev_err in snaps:
             filters = [
                 StorageDeletionOutbox.id == oid,
                 StorageDeletionOutbox.status == "PROCESSING",
@@ -615,29 +628,49 @@ def recover_stale_outbox_claims(db: Optional[Session] = None) -> int:
                     StorageDeletionOutbox.lease_expires_at < now,
                 ),
             ]
-            if attempts >= max_att:
+            next_attempts = attempts + 1
+            if next_attempts >= max_att:
+                fail_err = prev_err or "Outbox lease expired after max attempts."
                 rows = session.query(StorageDeletionOutbox).filter(*filters).update(
                     {
                         StorageDeletionOutbox.status: "FAILED",
+                        StorageDeletionOutbox.attempt_count: next_attempts,
                         StorageDeletionOutbox.worker_id: None,
                         StorageDeletionOutbox.claim_token: None,
                         StorageDeletionOutbox.claimed_at: None,
                         StorageDeletionOutbox.lease_expires_at: None,
                         StorageDeletionOutbox.next_retry_at: None,
-                        StorageDeletionOutbox.last_error: prev_err or "Outbox lease expired after max attempts.",
+                        StorageDeletionOutbox.last_error: fail_err,
                         StorageDeletionOutbox.updated_at: now,
                     },
                     synchronize_session=False,
                 )
                 if rows == 1:
+                    failed_doc_payload = None
+                    if doc_id:
+                        doc_rec = session.query(Document).filter(Document.id == doc_id).first()
+                        if doc_rec:
+                            doc_rec.deletion_status = "DELETE_FAILED"
+                            doc_rec.metadata_json = {**(doc_rec.metadata_json or {}), "deletion_error": fail_err}
+                            failed_doc_payload = serialize_document(doc_rec)
                     session.commit()
                     session.expire_all()
+                    if failed_doc_payload and uid:
+                        try:
+                            from realtime.manager import publish_user_realtime_event_sync
+                            publish_user_realtime_event_sync(
+                                str(uid),
+                                {"type": "library_update", "action": "updated", "data": failed_doc_payload},
+                            )
+                        except Exception:
+                            pass
                 else:
                     session.rollback()
             else:
                 rows = session.query(StorageDeletionOutbox).filter(*filters).update(
                     {
                         StorageDeletionOutbox.status: "PENDING",
+                        StorageDeletionOutbox.attempt_count: next_attempts,
                         StorageDeletionOutbox.worker_id: None,
                         StorageDeletionOutbox.claim_token: None,
                         StorageDeletionOutbox.claimed_at: None,
@@ -1005,33 +1038,37 @@ def finalize_claimed_outbox_entry(
     ]
 
     if ok:
-        rows = session.query(StorageDeletionOutbox).filter(*fence).update(
-            {
-                StorageDeletionOutbox.status: "COMPLETED",
-                StorageDeletionOutbox.attempt_count: next_attempts,
-                StorageDeletionOutbox.last_error: None,
-                StorageDeletionOutbox.completed_at: step_now,
-                StorageDeletionOutbox.next_retry_at: None,
-                StorageDeletionOutbox.worker_id: None,
-                StorageDeletionOutbox.claim_token: None,
-                StorageDeletionOutbox.lease_expires_at: None,
-                StorageDeletionOutbox.updated_at: step_now,
-            },
-            synchronize_session=False,
-        )
-        if rows != 1:
-            session.rollback()
-            return "stale"
+        try:
+            rows = session.query(StorageDeletionOutbox).filter(*fence).update(
+                {
+                    StorageDeletionOutbox.status: "COMPLETED",
+                    StorageDeletionOutbox.attempt_count: next_attempts,
+                    StorageDeletionOutbox.last_error: None,
+                    StorageDeletionOutbox.completed_at: step_now,
+                    StorageDeletionOutbox.next_retry_at: None,
+                    StorageDeletionOutbox.worker_id: None,
+                    StorageDeletionOutbox.claim_token: None,
+                    StorageDeletionOutbox.lease_expires_at: None,
+                    StorageDeletionOutbox.updated_at: step_now,
+                },
+                synchronize_session=False,
+            )
+            if rows != 1:
+                session.rollback()
+                return "stale"
 
-        if entry.get("document_id"):
-            session.query(GeneratedImage).filter(
-                GeneratedImage.document_id == entry["document_id"]
-            ).delete(synchronize_session=False)
-            doc_rec = session.query(Document).filter(Document.id == entry["document_id"]).first()
-            if doc_rec:
-                session.delete(doc_rec)
-        session.commit()
-        session.expire_all()
+            if entry.get("document_id"):
+                session.query(GeneratedImage).filter(
+                    GeneratedImage.document_id == entry["document_id"]
+                ).delete(synchronize_session=False)
+                doc_rec = session.query(Document).filter(Document.id == entry["document_id"]).first()
+                if doc_rec:
+                    session.delete(doc_rec)
+            session.commit()
+            session.expire_all()
+        except Exception:
+            session.rollback()
+            raise
 
         # Broadcast completed deletion ONLY AFTER physical deletion AND DB commit succeeded!
         if entry.get("document_id") and entry.get("user_id"):
@@ -1062,33 +1099,37 @@ def finalize_claimed_outbox_entry(
         next_retry = step_now + timedelta(seconds=backoff)
         outcome = "retried"
 
-    rows = session.query(StorageDeletionOutbox).filter(*fence).update(
-        {
-            StorageDeletionOutbox.status: target_status,
-            StorageDeletionOutbox.attempt_count: next_attempts,
-            StorageDeletionOutbox.last_error: err_msg,
-            StorageDeletionOutbox.next_retry_at: next_retry,
-            StorageDeletionOutbox.worker_id: None,
-            StorageDeletionOutbox.claim_token: None,
-            StorageDeletionOutbox.claimed_at: None,
-            StorageDeletionOutbox.lease_expires_at: None,
-            StorageDeletionOutbox.updated_at: step_now,
-        },
-        synchronize_session=False,
-    )
-    if rows != 1:
-        session.rollback()
-        return "stale"
+    try:
+        rows = session.query(StorageDeletionOutbox).filter(*fence).update(
+            {
+                StorageDeletionOutbox.status: target_status,
+                StorageDeletionOutbox.attempt_count: next_attempts,
+                StorageDeletionOutbox.last_error: err_msg,
+                StorageDeletionOutbox.next_retry_at: next_retry,
+                StorageDeletionOutbox.worker_id: None,
+                StorageDeletionOutbox.claim_token: None,
+                StorageDeletionOutbox.claimed_at: None,
+                StorageDeletionOutbox.lease_expires_at: None,
+                StorageDeletionOutbox.updated_at: step_now,
+            },
+            synchronize_session=False,
+        )
+        if rows != 1:
+            session.rollback()
+            return "stale"
 
-    failed_doc_payload = None
-    if entry.get("document_id"):
-        doc_rec = session.query(Document).filter(Document.id == entry["document_id"]).first()
-        if doc_rec:
-            doc_rec.deletion_status = "DELETE_FAILED"
-            doc_rec.metadata_json = {**(doc_rec.metadata_json or {}), "deletion_error": err_msg}
-            failed_doc_payload = serialize_document(doc_rec)
-    session.commit()
-    session.expire_all()
+        failed_doc_payload = None
+        if entry.get("document_id"):
+            doc_rec = session.query(Document).filter(Document.id == entry["document_id"]).first()
+            if doc_rec:
+                doc_rec.deletion_status = "DELETE_FAILED"
+                doc_rec.metadata_json = {**(doc_rec.metadata_json or {}), "deletion_error": err_msg}
+                failed_doc_payload = serialize_document(doc_rec)
+        session.commit()
+        session.expire_all()
+    except Exception:
+        session.rollback()
+        raise
 
     if failed_doc_payload and entry.get("user_id"):
         try:
@@ -1127,8 +1168,11 @@ def _run_leased_outbox_deletion_subprocess(
     import json
     import sys
     import time
+    import signal
+    import threading
     import subprocess
 
+    max_capture_chars = 65536
     serializable_entry = {
         "id": str(entry.get("id") or ""),
         "user_id": str(entry.get("user_id") or ""),
@@ -1146,13 +1190,21 @@ def _run_leased_outbox_deletion_subprocess(
     )
 
     backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    popen_kwargs: Dict[str, Any] = {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "cwd": backend_dir,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+
     proc = subprocess.Popen(
         [sys.executable, "-m", "services.storage_delete_runner"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        cwd=backend_dir,
+        **popen_kwargs,
     )
     if proc.stdin is not None:
         try:
@@ -1161,23 +1213,159 @@ def _run_leased_outbox_deletion_subprocess(
         except Exception:
             pass
 
-    def _terminate_and_reap():
-        if proc.poll() is None:
+    # Concurrently drain stdout/stderr into bounded tail/head buffers so large output can NEVER
+    # fill OS pipe buffers and deadlock the child process while waiting.
+    stdout_chunks: List[str] = []
+    stderr_chunks: List[str] = []
+
+    def _drain_pipe(pipe, target_list: List[str], keep_tail: bool) -> None:
+        if pipe is None:
+            return
+        captured_len = 0
+        try:
+            while True:
+                chunk = pipe.read(4096)
+                if not chunk:
+                    break
+                if keep_tail:
+                    target_list.append(chunk)
+                    captured_len += len(chunk)
+                    while captured_len > max_capture_chars and len(target_list) > 1:
+                        removed = target_list.pop(0)
+                        captured_len -= len(removed)
+                    if captured_len > max_capture_chars and target_list:
+                        target_list[0] = target_list[0][-max_capture_chars:]
+                        captured_len = len(target_list[0])
+                elif captured_len < max_capture_chars:
+                    remaining_cap = max_capture_chars - captured_len
+                    target_list.append(chunk[:remaining_cap])
+                    captured_len += min(len(chunk), remaining_cap)
+        except Exception:
+            pass
+
+    stdout_thread = threading.Thread(
+        target=_drain_pipe,
+        args=(proc.stdout, stdout_chunks, True),
+        name=f"outbox-stdout-{str(entry['id'])[:8]}",
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_drain_pipe,
+        args=(proc.stderr, stderr_chunks, False),
+        name=f"outbox-stderr-{str(entry['id'])[:8]}",
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    def _terminate_win32_tree(root_pid: int) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class _PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        snap = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+        if snap in (0, -1, wintypes.HANDLE(-1).value):
+            return
+        children_by_parent: Dict[int, List[int]] = {}
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+            ok_walk = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok_walk:
+                children_by_parent.setdefault(int(entry.th32ParentProcessID), []).append(int(entry.th32ProcessID))
+                ok_walk = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snap)
+
+        # Collect descendants BFS, then terminate leaves-first before root_pid
+        ordered: List[int] = []
+        queue = [int(root_pid)]
+        seen = {int(root_pid)}
+        while queue:
+            cur = queue.pop(0)
+            ordered.append(cur)
+            for child in children_by_parent.get(cur, ()):
+                if child not in seen:
+                    seen.add(child)
+                    queue.append(child)
+
+        for target_pid in reversed(ordered):
+            handle = kernel32.OpenProcess(0x0001, False, target_pid)  # PROCESS_TERMINATE
+            if handle:
+                try:
+                    kernel32.TerminateProcess(handle, 1)
+                finally:
+                    kernel32.CloseHandle(handle)
+
+    def _kill_process_tree(pid: int, force: bool) -> None:
+        if os.name == "nt":
+            # Use Win32 Toolhelp snapshot to walk and terminate descendants + root in <2ms
+            # without spawning taskkill (which can hang or miss children if parent dies first).
             try:
-                proc.terminate()
+                _terminate_win32_tree(pid)
             except Exception:
                 pass
-            try:
-                proc.wait(timeout=effective_grace)
-            except subprocess.TimeoutExpired:
+            if force:
                 try:
                     proc.kill()
                 except Exception:
                     pass
+        else:
+            sig = signal.SIGKILL if force else signal.SIGTERM
+            # Because start_new_session=True sets pgid == proc.pid, killpg(pid, sig) reaches
+            # all descendants even if the leader already exited.
+            try:
+                if pid != os.getpgrp():
+                    os.killpg(pid, sig)
+                else:
+                    os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+            except Exception:
                 try:
-                    proc.wait(timeout=5.0)
+                    proc.kill() if force else proc.terminate()
                 except Exception:
                     pass
+
+    def _terminate_and_reap():
+        if proc.poll() is None:
+            if os.name == "nt":
+                # On Windows, immediately terminate the full tree with /F /T so grandchildren
+                # are never orphaned by parent-only termination.
+                _kill_process_tree(proc.pid, force=True)
+                try:
+                    proc.wait(timeout=max(effective_grace, 2.0))
+                except Exception:
+                    pass
+            else:
+                _kill_process_tree(proc.pid, force=False)
+                try:
+                    proc.wait(timeout=effective_grace)
+                except subprocess.TimeoutExpired:
+                    _kill_process_tree(proc.pid, force=True)
+                    try:
+                        proc.wait(timeout=5.0)
+                    except Exception:
+                        pass
+                # Final sweep of any surviving descendants in the session's process group
+                _kill_process_tree(proc.pid, force=True)
+        else:
+            if os.name != "nt":
+                _kill_process_tree(proc.pid, force=True)
 
     start_mono = time.monotonic()
     last_renew_mono = start_mono
@@ -1229,13 +1417,15 @@ def _run_leased_outbox_deletion_subprocess(
 
         if cancelled:
             _terminate_and_reap()
-            # Subprocess is definitively dead; release claim back to PENDING under fence for immediate retry
+            # Subprocess is definitively dead; release claim back to PENDING strictly under unexpired lease fence
             step_now = utc_now()
-            session.query(StorageDeletionOutbox).filter(
+            released = session.query(StorageDeletionOutbox).filter(
                 StorageDeletionOutbox.id == entry["id"],
                 StorageDeletionOutbox.status == "PROCESSING",
                 StorageDeletionOutbox.worker_id == worker_id,
                 StorageDeletionOutbox.claim_token == entry["claim_token"],
+                StorageDeletionOutbox.lease_expires_at.isnot(None),
+                StorageDeletionOutbox.lease_expires_at > step_now,
             ).update(
                 {
                     StorageDeletionOutbox.status: "PENDING",
@@ -1249,6 +1439,14 @@ def _run_leased_outbox_deletion_subprocess(
                 },
                 synchronize_session=False,
             )
+            if released != 1:
+                session.rollback()
+                return {
+                    "outcome": "stale",
+                    "renewals": renewals,
+                    "error": "Lease expired or reassigned before cancellation release",
+                    "subprocess_terminated": True,
+                }
             session.commit()
             session.expire_all()
             return {
@@ -1269,8 +1467,10 @@ def _run_leased_outbox_deletion_subprocess(
                 "subprocess_terminated": True,
             }
 
-        stdout_data = proc.stdout.read() if proc.stdout else ""
-        stderr_data = proc.stderr.read() if proc.stderr else ""
+        stdout_thread.join(timeout=2.0)
+        stderr_thread.join(timeout=2.0)
+        stdout_data = "".join(stdout_chunks)
+        stderr_data = "".join(stderr_chunks)
         ok_val = False
         err_val = None
         parsed = None
@@ -1278,21 +1478,37 @@ def _run_leased_outbox_deletion_subprocess(
             line = line.strip()
             if line.startswith("{") and line.endswith("}"):
                 try:
-                    parsed = json.loads(line)
-                    break
+                    candidate = json.loads(line)
+                    if isinstance(candidate, dict) and isinstance(candidate.get("ok"), bool):
+                        parsed = candidate
+                        break
                 except Exception:
                     pass
-        if parsed is not None:
-            ok_val = bool(parsed.get("ok"))
+
+        if proc.returncode != 0:
+            ok_val = False
+            parsed_err = parsed.get("error") if isinstance(parsed, dict) else None
+            err_val = (
+                str(parsed_err)
+                if parsed_err
+                else (stderr_data.strip() or f"Deletion subprocess exited with non-zero code {proc.returncode}")
+            )[:500]
+        elif parsed is not None:
+            ok_val = bool(parsed["ok"])
             err_val = parsed.get("error")
         else:
             ok_val = False
-            err_val = (stderr_data.strip() or f"Deletion subprocess exited with code {proc.returncode}")[:500]
+            err_val = (
+                stderr_data.strip()
+                or f"Deletion subprocess produced malformed or missing JSON result (code {proc.returncode})"
+            )[:500]
 
         outcome = finalize_claimed_outbox_entry(session, entry, worker_id, ok_val, err_val)
         return {"outcome": outcome, "renewals": renewals, "error": err_val, "subprocess_terminated": False}
     finally:
         _terminate_and_reap()
+        stdout_thread.join(timeout=1.0)
+        stderr_thread.join(timeout=1.0)
         for pipe in (proc.stdout, proc.stderr):
             if pipe is not None:
                 try:
@@ -1427,11 +1643,13 @@ def _run_leased_outbox_deletion(
         worker_thread.join(timeout=effective_grace)
         if not worker_thread.is_alive():
             step_now = utc_now()
-            session.query(StorageDeletionOutbox).filter(
+            released = session.query(StorageDeletionOutbox).filter(
                 StorageDeletionOutbox.id == entry["id"],
                 StorageDeletionOutbox.status == "PROCESSING",
                 StorageDeletionOutbox.worker_id == worker_id,
                 StorageDeletionOutbox.claim_token == entry["claim_token"],
+                StorageDeletionOutbox.lease_expires_at.isnot(None),
+                StorageDeletionOutbox.lease_expires_at > step_now,
             ).update(
                 {
                     StorageDeletionOutbox.status: "PENDING",
@@ -1445,6 +1663,9 @@ def _run_leased_outbox_deletion(
                 },
                 synchronize_session=False,
             )
+            if released != 1:
+                session.rollback()
+                return {"outcome": "stale", "renewals": renewals, "error": "Lease expired or reassigned before cancellation release"}
             session.commit()
             session.expire_all()
             return {"outcome": "cancelled", "renewals": renewals, "error": "Worker cancelled before deletion completed"}

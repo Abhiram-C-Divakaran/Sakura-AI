@@ -20,7 +20,9 @@ RUN groupadd -g 1001 sakura && \
     useradd -u 1001 -g sakura -s /bin/bash -m sakura
 
 COPY . .
-RUN chown -R sakura:sakura /app
+RUN mkdir -p /data/library /workspaces && \
+    chown -R sakura:sakura /app /data/library /workspaces && \
+    chmod 770 /data/library /workspaces
 
 USER sakura
 

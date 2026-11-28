@@ -1148,13 +1148,36 @@ class TestPostgresPgvectorAndConcurrency(unittest.IsolatedAsyncioTestCase):
             self.assertIn(str(bad_cid), str(err_ctx.exception))
             self.assertIn("1536", str(err_ctx.exception))
 
-            # Remove malformed row -> upgrade to head MUST succeed and preserve exact vector values & NULL
+            # Verify failed migration rolled back cleanly to pre-upgrade revision & column type
+            with temp_engine.connect() as conn:
+                rev_after_fail = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
+                self.assertEqual(rev_after_fail, "i8e6f152a45b")
+
+            # Seed a legacy generated_images row with a dangling parent_image_id (pre-FK state)
+            dangling_img_id = uuid.uuid4()
+            with temp_engine.begin() as conn:
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO generated_images (id, user_id, prompt, storage_path, image_url, parent_image_id) "
+                        "VALUES (:id, :uid, 'orphan child', '/tmp/o.png', '/api/v1/library/files/x/download', :pid)"
+                    ),
+                    {"id": dangling_img_id, "uid": uid, "pid": uuid.uuid4()},
+                )
+
+            # Remove malformed row -> upgrade to head MUST succeed, preserve vectors/NULLs, and nullify dangling parent_image_id
             with temp_engine.begin() as conn:
                 conn.execute(sa.text("DELETE FROM document_chunks WHERE id = :id"), {"id": bad_cid})
 
             with temp_engine.begin() as conn:
                 cfg.attributes["connection"] = conn
                 command.upgrade(cfg, "head")
+
+            with temp_engine.connect() as conn:
+                repaired_parent = conn.execute(
+                    sa.text("SELECT parent_image_id FROM generated_images WHERE id = :id"),
+                    {"id": dangling_img_id},
+                ).scalar()
+                self.assertIsNone(repaired_parent, "Dangling parent_image_id must be nullified before adding FK")
 
             with temp_engine.connect() as conn:
                 emb_type = conn.execute(
@@ -1597,6 +1620,178 @@ class TestPostgresPgvectorAndConcurrency(unittest.IsolatedAsyncioTestCase):
 
         with self.PGSession() as s_chk:
             self.assertIsNone(s_chk.query(Document).filter(Document.id == doc_id).first())
+
+    def test_pg_concurrent_request_document_deletion_creates_single_outbox_row(self):
+        """
+        Real PostgreSQL concurrency test:
+        Two concurrent request_document_deletion() calls for the same document MUST serialize
+        via SELECT ... FOR UPDATE on Document and produce EXACTLY ONE active StorageDeletionOutbox row.
+        """
+        from services.documents import request_document_deletion
+
+        with self.PGSession() as db:
+            user = _make_user(db, "pg_req_dup")
+            uid = user.id
+            doc_id = uuid.uuid4()
+            key = f"users/{uid}/documents/{doc_id}/dedup.txt"
+            db.add(
+                Document(
+                    id=doc_id,
+                    user_id=uid,
+                    filename="dedup.txt",
+                    mime_type="text/plain",
+                    storage_path=key,
+                    storage_key=key,
+                    storage_backend="local",
+                )
+            )
+            db.commit()
+
+        def _req():
+            with self.PGSession() as s:
+                return request_document_deletion(doc_id, uid, s)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = [f.result() for f in [pool.submit(_req) for _ in range(4)]]
+
+        outbox_ids = {r["outbox_id"] for r in results}
+        self.assertEqual(len(outbox_ids), 1, f"Concurrent requests created duplicate outbox rows: {outbox_ids}")
+
+        with self.PGSession() as db:
+            rows = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.document_id == doc_id).all()
+            self.assertEqual(len(rows), 1)
+            # Clean up
+            rows[0].status = "COMPLETED"
+            db.query(Document).filter(Document.id == doc_id).delete(synchronize_session=False)
+            db.commit()
+
+    def test_pg_single_item_claim_contention_recovery_max_attempts_rollback_and_dup_events(self):
+        """
+        Real PostgreSQL integration test covering:
+        1. 4 concurrent workers contesting the EXACT SAME outbox item via claim_specific_outbox_entry -> exactly 1 wins.
+        2. Stale recovery increments attempt_count on each crash/expiry until max_attempts transitions row to FAILED
+           AND updates Document.deletion_status to DELETE_FAILED (never infinite-loops).
+        3. Transaction rollback in finalize_claimed_outbox_entry leaves outbox + Document consistent & session usable.
+        4. Concurrent duplicate CodingTaskEvent appends resolve to strictly monotonic unique sequence numbers.
+        """
+        from services.documents import claim_specific_outbox_entry
+        from coding.job_worker import append_coding_task_event
+        from database.models import CodingTaskEvent
+
+        with self.PGSession() as db:
+            user = _make_user(db, "pg_adv_conc")
+            uid = user.id
+            doc_id = uuid.uuid4()
+            oid = uuid.uuid4()
+            key = f"users/{uid}/documents/{doc_id}/poison.txt"
+            db.add(
+                Document(
+                    id=doc_id,
+                    user_id=uid,
+                    filename="poison.txt",
+                    mime_type="text/plain",
+                    storage_path=key,
+                    storage_key=key,
+                    storage_backend="local",
+                    deletion_status="DELETING",
+                )
+            )
+            db.add(
+                StorageDeletionOutbox(
+                    id=oid,
+                    user_id=uid,
+                    document_id=doc_id,
+                    storage_backend="local",
+                    storage_key=key,
+                    status="PENDING",
+                    attempt_count=0,
+                    max_attempts=2,
+                    next_retry_at=utc_now() - timedelta(seconds=1),
+                    created_at=utc_now(),
+                    updated_at=utc_now(),
+                )
+            )
+            db.commit()
+
+        # 1. 4 concurrent PG workers race to claim the exact same outbox row
+        def _contest(wname: str):
+            with self.PGSession() as s:
+                return claim_specific_outbox_entry(s, oid, worker_id=wname, lease_seconds=30.0)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            claims = [f.result() for f in [pool.submit(_contest, f"pg_contender_{i}") for i in range(4)]]
+
+        winners = [c for c in claims if c is not None]
+        self.assertEqual(len(winners), 1, f"Exactly 1 worker must claim the same item, got {len(winners)}")
+
+        # 2. Simulate repeated worker crashes (lease expiry) -> attempt_count increments & hits FAILED + DELETE_FAILED
+        with self.PGSession() as db:
+            db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == oid).update(
+                {StorageDeletionOutbox.lease_expires_at: utc_now() - timedelta(seconds=5)},
+                synchronize_session=False,
+            )
+            db.commit()
+            rec1 = recover_stale_outbox_claims(db)
+            self.assertGreaterEqual(rec1, 1)
+            row1 = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == oid).first()
+            self.assertEqual(row1.status, "PENDING")
+            self.assertEqual(row1.attempt_count, 1)
+
+            # Second claim + crash -> hits max_attempts=2 -> FAILED + Document.deletion_status == DELETE_FAILED
+            c2 = claim_specific_outbox_entry(db, oid, worker_id="pg_crash_2", lease_seconds=30.0)
+            self.assertIsNotNone(c2)
+            db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == oid).update(
+                {StorageDeletionOutbox.lease_expires_at: utc_now() - timedelta(seconds=5)},
+                synchronize_session=False,
+            )
+            db.commit()
+            recover_stale_outbox_claims(db)
+            db.expire_all()
+            row2 = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == oid).first()
+            self.assertEqual(row2.status, "FAILED")
+            self.assertEqual(row2.attempt_count, 2)
+            doc2 = db.query(Document).filter(Document.id == doc_id).first()
+            self.assertIsNotNone(doc2)
+            self.assertEqual(doc2.deletion_status, "DELETE_FAILED")
+
+            # 3. Transaction rollback in finalize_claimed_outbox_entry preserves state & leaves PG session usable
+            row2.status = "PENDING"
+            row2.attempt_count = 0
+            row2.next_retry_at = utc_now() - timedelta(seconds=1)
+            db.commit()
+            c3 = claim_specific_outbox_entry(db, oid, worker_id="pg_rb_w", lease_seconds=30.0)
+            with patch.object(db, "commit", side_effect=RuntimeError("simulated PG commit failure")):
+                with self.assertRaises(RuntimeError):
+                    finalize_claimed_outbox_entry(db, c3, "pg_rb_w", True, None)
+            # Session must be cleanly rolled back and usable immediately
+            self.assertEqual(db.execute(sa.text("SELECT 1")).scalar(), 1)
+            row_after_rb = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == oid).first()
+            self.assertEqual(row_after_rb.status, "PROCESSING")
+            self.assertIsNotNone(db.query(Document).filter(Document.id == doc_id).first())
+            # Clean up
+            finalize_claimed_outbox_entry(db, c3, "pg_rb_w", True, None)
+
+        # 4. Concurrent duplicate sequence attempts on CodingTaskEvent resolve to unique monotonic sequences
+        task_id = str(uuid.uuid4())
+
+        def _append_dup(idx: int):
+            return append_coding_task_event(
+                task_id=task_id,
+                job_id=None,
+                phase="TESTING",
+                event_type="status",
+                seq=1,  # intentionally colliding sequence number
+                message=f"PG dup event {idx}",
+            )
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            evts = [f.result() for f in [pool.submit(_append_dup, i) for i in range(4)]]
+
+        seqs = sorted(e.sequence_number for e in evts)
+        self.assertEqual(seqs, [1, 2, 3, 4], f"Expected strictly monotonic unique sequences, got {seqs}")
+        with self.PGSession() as db:
+            db.query(CodingTaskEvent).filter(CodingTaskEvent.task_id == task_id).delete(synchronize_session=False)
+            db.commit()
 
 
 if __name__ == "__main__":
