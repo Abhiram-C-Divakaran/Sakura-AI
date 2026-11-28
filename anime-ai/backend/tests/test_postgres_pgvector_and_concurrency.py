@@ -1094,14 +1094,28 @@ class TestDatabaseContractAndHardening(unittest.IsolatedAsyncioTestCase):
 
         # 2. CodingJobWorker rejects finalization, progress update, and event append after lease expiry
         c_worker = CodingJobWorker(worker_id="exp_code_w", lease_duration=30)
-        claimed_code = c_worker.claim_next_job()
-        self.assertIsNotNone(claimed_code)
+        target_code_job_id = next(iter(job_ids))
+        code_attempt_id = uuid.uuid4()
+        code_now = utc_now()
         with get_db_context() as db:
-            db.query(CodingJob).filter(CodingJob.id == claimed_code.id).update(
-                {CodingJob.lease_expires_at: utc_now() - timedelta(seconds=5)},
+            rows = db.query(CodingJob).filter(
+                CodingJob.id == target_code_job_id,
+                CodingJob.status == "QUEUED",
+            ).update(
+                {
+                    CodingJob.status: "RUNNING",
+                    CodingJob.worker_id: c_worker.worker_id,
+                    CodingJob.execution_attempt_id: code_attempt_id,
+                    CodingJob.started_at: code_now,
+                    CodingJob.heartbeat_at: code_now,
+                    CodingJob.lease_expires_at: code_now - timedelta(seconds=5),
+                },
                 synchronize_session=False,
             )
+            self.assertEqual(rows, 1)
             db.commit()
+            claimed_code = db.query(CodingJob).filter(CodingJob.id == target_code_job_id).first()
+            db.expunge(claimed_code)
 
         self.assertFalse(
             c_worker._fenced_finalize(
@@ -1150,8 +1164,17 @@ class TestDatabaseContractAndHardening(unittest.IsolatedAsyncioTestCase):
             img_job_id = img_job.id
 
         img_worker = ImageJobWorker(worker_id="exp_img_w", lease_duration=30, heartbeat_interval=60)
-        claimed_img = img_worker.claim_next_job()
+        with get_db_context() as db:
+            img_now = utc_now()
+            claimed_img = img_worker._atomic_claim_job_id(
+                db,
+                img_job_id,
+                img_now,
+                img_now + timedelta(seconds=30),
+                uuid.uuid4(),
+            )
         self.assertIsNotNone(claimed_img)
+        self.assertEqual(claimed_img.id, img_job_id)
 
         async def _expire_mid_gen(user_id, prompt, params):
             with get_db_context() as s:
@@ -1170,6 +1193,174 @@ class TestDatabaseContractAndHardening(unittest.IsolatedAsyncioTestCase):
             reloaded.status = "CANCELLED"
             reloaded.lease_expires_at = None
             db.commit()
+
+    async def test_durable_task_worker_heartbeat_refuses_expired_lease_resurrection_and_cas_recovery(self):
+        """
+        Regression test for DurableTaskWorker:
+        1. Heartbeat loop MUST NOT resurrect an already-expired BackgroundTask lease; it must
+           detect lease loss, cancel the handler, and perform zero terminal writes.
+        2. Concurrent recover_stale_tasks() calls must atomically CAS-recover an expired task
+           at most once (retry_count incremented once, never overwriting a fresh claim).
+        """
+        import asyncio
+        from tasks.worker import DurableTaskWorker
+        from database.models import BackgroundTask
+
+        with get_db_context() as db:
+            user = _make_user(db, "bg_lease_fence")
+            task_id = uuid.uuid4()
+            attempt_id = uuid.uuid4()
+            now = utc_now()
+            db.add(
+                BackgroundTask(
+                    id=task_id,
+                    user_id=user.id,
+                    type="doc_summary",
+                    title="Lease resurrection regression",
+                    payload={},
+                    status="Running",
+                    progress=5,
+                    retry_count=0,
+                    worker_id="bg_worker_exp",
+                    execution_attempt_id=attempt_id,
+                    started_at=now,
+                    heartbeat_at=now,
+                    lease_expires_at=now + timedelta(seconds=30),
+                    created_at=now,
+                )
+            )
+            db.commit()
+
+        worker = DurableTaskWorker(
+            worker_id="bg_worker_exp",
+            lease_duration=30.0,
+            heartbeat_interval=0.06,
+        )
+
+        handler_cancelled = False
+
+        async def _slow_handler(tid, uid, payload, router, ctx=None):
+            nonlocal handler_cancelled
+            # Expire lease in DB BEFORE the next heartbeat fires (without running recovery)
+            with get_db_context() as s:
+                s.query(BackgroundTask).filter(BackgroundTask.id == task_id).update(
+                    {BackgroundTask.lease_expires_at: utc_now() - timedelta(seconds=5)},
+                    synchronize_session=False,
+                )
+                s.commit()
+            try:
+                await asyncio.sleep(5.0)
+            except asyncio.CancelledError:
+                handler_cancelled = True
+                raise
+
+        with get_db_context() as db:
+            task_obj = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
+            db.expunge(task_obj)
+
+        with patch("tasks.worker.execute_doc_summary", side_effect=_slow_handler):
+            await worker.execute_task(task_obj)
+
+        self.assertTrue(handler_cancelled, "Expired-lease heartbeat must cancel running handler instead of resurrecting lease!")
+        with get_db_context() as db:
+            after = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
+            self.assertEqual(after.status, "Running")
+            self.assertLess(
+                after.lease_expires_at.replace(tzinfo=None),
+                utc_now().replace(tzinfo=None),
+                "Expired lease_expires_at MUST NOT be extended by stale heartbeat!",
+            )
+
+        # Concurrent CAS recovery: two workers running recover_stale_tasks() recover task at most once
+        w1 = DurableTaskWorker(worker_id="bg_rec_1")
+        w2 = DurableTaskWorker(worker_id="bg_rec_2")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f1 = pool.submit(w1.recover_stale_tasks)
+            f2 = pool.submit(w2.recover_stale_tasks)
+            r1, r2 = f1.result(), f2.result()
+
+        self.assertEqual(r1 + r2, 1, f"Expected exactly 1 CAS recovery across concurrent workers, got {r1}+{r2}")
+        with get_db_context() as db:
+            rec = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
+            self.assertEqual(rec.status, "Queued")
+            self.assertEqual(rec.retry_count, 1)
+            # Clean up
+            rec.status = "Cancelled"
+            db.commit()
+
+    def test_account_deletion_cleans_variation_batches_and_reconciles_failed_outbox_rows(self):
+        """
+        Regression test for delete_user_account():
+        - Explicitly deletes user's ImageVariationBatch rows.
+        - Reconciles prior FAILED StorageDeletionOutbox rows whose physical object is deleted
+          to COMPLETED (zero orphaned FAILED alert rows), while leaving active PROCESSING rows untouched.
+        """
+        from services.account import delete_user_account
+
+        local_store = LocalFilesystemStorage(root_dir=self.tmp_dir)
+        with get_db_context() as db:
+            user = _make_user(db, "acct_del_hygiene")
+            uid = user.id
+            doc_id = uuid.uuid4()
+            key_failed = f"users/{uid}/documents/{doc_id}/previously_failed.txt"
+            local_store.put(key_failed, b"cleanup_me", content_type="text/plain", user_id=uid)
+
+            db.add(
+                Document(
+                    id=doc_id,
+                    user_id=uid,
+                    filename="previously_failed.txt",
+                    mime_type="text/plain",
+                    storage_path=key_failed,
+                    storage_key=key_failed,
+                    storage_backend="local",
+                    deletion_status="DELETE_FAILED",
+                )
+            )
+            failed_ob_id = uuid.uuid4()
+            db.add(
+                StorageDeletionOutbox(
+                    id=failed_ob_id,
+                    user_id=uid,
+                    document_id=doc_id,
+                    storage_backend="local",
+                    storage_key=key_failed,
+                    status="FAILED",
+                    attempt_count=5,
+                    max_attempts=5,
+                    last_error="Prior transient error",
+                    created_at=utc_now(),
+                    updated_at=utc_now(),
+                )
+            )
+            batch_id = uuid.uuid4()
+            db.add(
+                ImageVariationBatch(
+                    id=batch_id,
+                    user_id=uid,
+                    idempotency_key=f"acct-del-var-{uid.hex[:8]}",
+                    request_fingerprint="fp_acct_del",
+                    parent_image_id=None,
+                    job_ids=[],
+                    created_at=utc_now(),
+                )
+            )
+            db.commit()
+
+            res = delete_user_account(db, user, storage_override=local_store)
+            self.assertEqual(res["cleanup_status"], "COMPLETE")
+            self.assertFalse(local_store.exists(key_failed))
+
+            # ImageVariationBatch row must be explicitly removed
+            self.assertIsNone(
+                db.query(ImageVariationBatch).filter(ImageVariationBatch.id == batch_id).first(),
+                "delete_user_account() must explicitly delete ImageVariationBatch rows!",
+            )
+            # Prior FAILED outbox row must be reconciled to COMPLETED (not left FAILED forever)
+            ob_after = db.query(StorageDeletionOutbox).filter(StorageDeletionOutbox.id == failed_ob_id).first()
+            self.assertIsNotNone(ob_after)
+            self.assertEqual(ob_after.status, "COMPLETED")
+            self.assertIsNone(ob_after.user_id)
 
 
 @unittest.skipUnless(

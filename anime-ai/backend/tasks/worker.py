@@ -96,15 +96,16 @@ class DurableTaskWorker:
 
     def recover_stale_tasks(self) -> int:
         """
-        Recovers tasks orphaned in 'Running' or 'Starting' status whose lease has expired.
-        Never requeues an active worker's task whose heartbeat is healthy.
-        Re-queues them if retries remain, or marks them Failed.
+        Atomically recovers tasks orphaned in 'Running' or 'Starting' status whose lease has expired.
+        Uses per-row conditional CAS fenced by (id, status, worker_id, execution_attempt_id, expired lease)
+        so concurrent workers never double-increment retries or disrupt an active worker's fresh claim.
         """
         logger.info(f"Worker {self.worker_id} performing stale task recovery check...")
         recovered_count = 0
         now = utc_now()
+        from sqlalchemy import or_
+
         with get_db_context() as db:
-            from sqlalchemy import or_
             stale_tasks = db.query(BackgroundTask).filter(
                 BackgroundTask.status.in_(["Running", "Starting"]),
                 or_(
@@ -112,25 +113,63 @@ class DurableTaskWorker:
                     BackgroundTask.lease_expires_at < now
                 )
             ).all()
+            snaps = [
+                (
+                    task.id,
+                    task.status,
+                    task.worker_id,
+                    task.execution_attempt_id,
+                    int(task.retry_count or 0),
+                )
+                for task in stale_tasks
+            ]
 
-            for task in stale_tasks:
-                current_retries = task.retry_count or 0
+        for task_id, old_status, old_worker_id, old_attempt_id, current_retries in snaps:
+            with get_db_context() as db:
+                base_filter = [
+                    BackgroundTask.id == task_id,
+                    BackgroundTask.status == old_status,
+                    BackgroundTask.worker_id == old_worker_id,
+                    BackgroundTask.execution_attempt_id == old_attempt_id,
+                    or_(
+                        BackgroundTask.lease_expires_at.is_(None),
+                        BackgroundTask.lease_expires_at < now
+                    ),
+                ]
                 if current_retries >= MAX_RETRIES:
-                    task.status = "Failed"
-                    task.error = f"Task exceeded maximum retries ({MAX_RETRIES}). Lease expired without heartbeat."
-                    task.completed_at = now
-                    logger.warning(f"Task {task.id} failed after lease expiration and exceeding max retries.")
+                    rows = db.query(BackgroundTask).filter(*base_filter).update(
+                        {
+                            BackgroundTask.status: "Failed",
+                            BackgroundTask.error: f"Task exceeded maximum retries ({MAX_RETRIES}). Lease expired without heartbeat.",
+                            BackgroundTask.completed_at: now,
+                            BackgroundTask.lease_expires_at: None,
+                        },
+                        synchronize_session=False,
+                    )
+                    if rows == 1:
+                        db.commit()
+                        logger.warning(f"Task {task_id} failed after lease expiration and exceeding max retries.")
+                    else:
+                        db.rollback()
                 else:
-                    task.status = "Queued"
-                    task.retry_count = current_retries + 1
-                    task.worker_id = None
-                    task.execution_attempt_id = None
-                    task.started_at = None
-                    task.heartbeat_at = None
-                    task.lease_expires_at = None
-                    logger.info(f"Task {task.id} lease expired and recovered to Queued (retry {task.retry_count}).")
-                    recovered_count += 1
-            db.commit()
+                    rows = db.query(BackgroundTask).filter(*base_filter).update(
+                        {
+                            BackgroundTask.status: "Queued",
+                            BackgroundTask.retry_count: current_retries + 1,
+                            BackgroundTask.worker_id: None,
+                            BackgroundTask.execution_attempt_id: None,
+                            BackgroundTask.started_at: None,
+                            BackgroundTask.heartbeat_at: None,
+                            BackgroundTask.lease_expires_at: None,
+                        },
+                        synchronize_session=False,
+                    )
+                    if rows == 1:
+                        db.commit()
+                        logger.info(f"Task {task_id} lease expired and recovered to Queued (retry {current_retries + 1}).")
+                        recovered_count += 1
+                    else:
+                        db.rollback()
 
         return recovered_count
 
@@ -290,11 +329,16 @@ class DurableTaskWorker:
                             BackgroundTask.id == task_id,
                             BackgroundTask.worker_id == self.worker_id,
                             BackgroundTask.execution_attempt_id == attempt_id,
-                            BackgroundTask.status == "Running"
-                        ).update({
-                            BackgroundTask.heartbeat_at: hb_now,
-                            BackgroundTask.lease_expires_at: hb_lease
-                        })
+                            BackgroundTask.status == "Running",
+                            BackgroundTask.lease_expires_at.isnot(None),
+                            BackgroundTask.lease_expires_at > hb_now,
+                        ).update(
+                            {
+                                BackgroundTask.heartbeat_at: hb_now,
+                                BackgroundTask.lease_expires_at: hb_lease,
+                            },
+                            synchronize_session=False,
+                        )
                         db.commit()
                         if rows == 0:
                             logger.warning(

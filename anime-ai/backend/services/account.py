@@ -48,6 +48,7 @@ from database.models import (
     BackgroundTask,
     ImageGenerationJob,
     ImageGenerationJobStatus,
+    ImageVariationBatch,
     StorageDeletionOutbox,
     PasswordResetToken,
     WebSocketTicket,
@@ -102,9 +103,17 @@ def _enqueue_outbox_entry(
     ts = now or utc_now()
     existing = db.query(StorageDeletionOutbox).filter(
         StorageDeletionOutbox.storage_key == storage_key,
-        StorageDeletionOutbox.status == "PENDING",
+        StorageDeletionOutbox.status.in_(["PENDING", "FAILED"]),
     ).first()
     if existing:
+        existing.status = "PENDING"
+        existing.user_id = None
+        existing.attempt_count = 1
+        existing.worker_id = None
+        existing.claim_token = None
+        existing.claimed_at = None
+        existing.lease_expires_at = None
+        existing.next_retry_at = ts + timedelta(seconds=60)
         existing.last_error = last_error or existing.last_error
         existing.updated_at = ts
         return existing
@@ -253,7 +262,7 @@ def delete_user_account(
 
     pending_outbox = db.query(StorageDeletionOutbox).filter(
         StorageDeletionOutbox.user_id == user_id,
-        StorageDeletionOutbox.status == "PENDING",
+        StorageDeletionOutbox.status.in_(["PENDING", "FAILED"]),
     ).all()
     for ob in pending_outbox:
         if ob.storage_key:
@@ -376,6 +385,7 @@ def delete_user_account(
     if coding_task_ids:
         db.query(ToolExecution).filter(ToolExecution.coding_task_id.in_(coding_task_ids)).delete(synchronize_session=False)
 
+    db.query(ImageVariationBatch).filter(ImageVariationBatch.user_id == user_id).delete(synchronize_session=False)
     db.query(ImageGenerationJob).filter(ImageGenerationJob.user_id == user_id).delete(synchronize_session=False)
     db.query(GeneratedImage).filter(GeneratedImage.user_id == user_id).delete(synchronize_session=False)
     db.query(Document).filter(Document.user_id == user_id).delete(synchronize_session=False)
