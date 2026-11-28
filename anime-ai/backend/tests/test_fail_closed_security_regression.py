@@ -649,6 +649,46 @@ class TestFailClosedSecurityRegression(unittest.IsolatedAsyncioTestCase):
         errs_det, _ = mod.validate_environment(det_prod)
         self.assertTrue(any("deterministic_test_providers" in e.lower() for e in errs_det))
 
+    # 14. Sandbox cancel_execution terminates CLI process BEFORE removing container (prevents Created orphan race)
+    def test_sandbox_cancel_execution_kills_process_before_docker_rm(self):
+        import coding.sandbox_service as ss
+
+        events = []
+
+        class _FakeProc:
+            returncode = None
+
+            def kill(self):
+                events.append("proc_kill")
+                self.returncode = -9
+
+            async def wait(self):
+                events.append("proc_wait")
+                return -9
+
+        def _fake_subproc_run(cmd, **_kwargs):
+            events.append(("docker_rm", list(cmd)))
+
+        exec_id = f"exec-cancel-{uuid.uuid4().hex[:8]}"
+        cname = f"sakura-exec-{uuid.uuid4().hex}"
+        tok = "prod_cancel_svc_token_1234567890"
+        ss._ACTIVE_EXECUTIONS[exec_id] = (cname, _FakeProc())
+        try:
+            with patch.dict(os.environ, {"ENVIRONMENT": "production", "SAKURA_SANDBOX_SERVICE_TOKEN": tok}):
+                with patch("coding.sandbox_service.subprocess.run", side_effect=_fake_subproc_run):
+                    resp = self.sandbox_client.post(
+                        f"/executions/{exec_id}/cancel",
+                        headers={"X-Sandbox-Token": tok},
+                    )
+                    self.assertEqual(resp.status_code, 200)
+                    self.assertTrue(resp.json()["cancelled"])
+        finally:
+            ss._ACTIVE_EXECUTIONS.pop(exec_id, None)
+
+        self.assertEqual(events[0], "proc_kill")
+        self.assertEqual(events[1], "proc_wait")
+        self.assertEqual(events[2], ("docker_rm", ["docker", "rm", "-f", cname]))
+
 
 if __name__ == "__main__":
     unittest.main()

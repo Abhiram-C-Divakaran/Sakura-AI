@@ -1122,7 +1122,14 @@ async def execute_command(
         }
     finally:
         _ACTIVE_EXECUTIONS.pop(exec_id, None)
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
+                pass
         # Idempotent cleanup: unconditionally ensure execution container is removed from Docker
+        # after the CLI process has terminated (prevents Created-state orphan race).
         try:
             subprocess.run(
                 ["docker", "rm", "-f", container_name],
@@ -1146,6 +1153,12 @@ async def cancel_execution(
         return {"cancelled": False, "execution_id": execution_id, "reason": "not_running"}
 
     container_name, proc = entry
+    if proc is not None and proc.returncode is None:
+        try:
+            proc.kill()
+            await asyncio.wait_for(proc.wait(), timeout=1.5)
+        except Exception:
+            pass
     try:
         subprocess.run(
             ["docker", "rm", "-f", container_name],
@@ -1156,11 +1169,6 @@ async def cancel_execution(
         )
     except Exception:
         pass
-    if proc is not None:
-        try:
-            proc.kill()
-        except Exception:
-            pass
     return {"cancelled": True, "execution_id": execution_id, "container_name": container_name}
 
 

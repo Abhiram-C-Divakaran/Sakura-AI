@@ -373,6 +373,44 @@ test.describe('Sakura AI Real Full-Stack Integration Suite (Zero API Mocks)', ()
     await page.reload({ waitUntil: 'domcontentloaded' });
     await expect(page.getByText('/code create deterministic check module')).toBeVisible({ timeout: 15_000 });
 
+    // Wait for the /code chat-triggered durable coding task to reach a terminal state
+    // so no sandbox child container is still mid-execution when account deletion runs.
+    const chatCodingTaskId = await page.evaluate(async () => {
+      const tok = localStorage.getItem('access_token') || '';
+      const h = { Authorization: `Bearer ${tok}` };
+      const convs = await (await fetch('/api/v1/conversations', { headers: h })).json();
+      for (const c of Array.isArray(convs) ? convs : []) {
+        const msgs = await (await fetch(`/api/v1/conversations/${c.id}/messages`, { headers: h })).json();
+        for (const m of (Array.isArray(msgs) ? msgs : []).slice().reverse()) {
+          const tid = m?.metadata?.coding_task_id;
+          if (tid) return String(tid);
+        }
+      }
+      return null;
+    });
+    expect(chatCodingTaskId).toBeTruthy();
+    if (chatCodingTaskId) {
+      const chatCodingFinal = await pollUntil(
+        async () =>
+          page.evaluate(async (tid) => {
+            const tok = localStorage.getItem('access_token') || '';
+            const r = await fetch(`/api/v1/coding/tasks/${tid}`, {
+              headers: { Authorization: `Bearer ${tok}` },
+            });
+            return r.json();
+          }, chatCodingTaskId),
+        (t) =>
+          ['COMPLETED_VERIFIED', 'COMPLETED_UNVERIFIED', 'FAILED', 'CANCELLED'].includes(
+            String(t.status || '').toUpperCase()
+          ),
+        35_000,
+        500
+      );
+      expect(['COMPLETED_VERIFIED', 'COMPLETED_UNVERIFIED']).toContain(
+        String(chatCodingFinal.status || '').toUpperCase()
+      );
+    }
+
     // 11. Real async Account Export -> real DurableTaskWorker builds ZIP -> valid ZIP download
     const exportStart = await page.evaluate(async () => {
       const tok = localStorage.getItem('access_token') || '';
