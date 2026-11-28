@@ -769,10 +769,24 @@ async def execute_scheduled_task_job(
         return
 
     with get_db_context() as db:
-        st = db.query(ScheduledTask).filter(ScheduledTask.id == st_uuid).first()
-        run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+        st = (
+            db.query(ScheduledTask)
+            .filter(ScheduledTask.id == st_uuid, ScheduledTask.user_id == user_id)
+            .first()
+        )
+        run = (
+            db.query(ScheduledTaskRun)
+            .filter(ScheduledTaskRun.id == run_uuid, ScheduledTaskRun.task_id == st_uuid)
+            .first()
+        )
         if not st or not run:
-            await update_task_state(task_id, "Failed", 100, error="Scheduled task or run record not found.", ctx=ctx)
+            await update_task_state(
+                task_id,
+                "Failed",
+                100,
+                error="Scheduled task or run record not found or access denied.",
+                ctx=ctx,
+            )
             return
 
         run.status = "RUNNING"
@@ -790,7 +804,11 @@ async def execute_scheduled_task_job(
         curr = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
         if curr and (curr.cancel_requested or curr.status == "Cancelled"):
             with get_db_context() as db2:
-                r = db2.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+                r = (
+                    db2.query(ScheduledTaskRun)
+                    .filter(ScheduledTaskRun.id == run_uuid, ScheduledTaskRun.task_id == st_uuid)
+                    .first()
+                )
                 if r:
                     r.status = "CANCELLED"
                     r.error = "Execution cancelled by user."
@@ -820,7 +838,11 @@ async def execute_scheduled_task_job(
 
             curr = db.query(BackgroundTask).filter(BackgroundTask.id == task_id).first()
             if curr and (curr.cancel_requested or curr.status == "Cancelled"):
-                r = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+                r = (
+                    db.query(ScheduledTaskRun)
+                    .filter(ScheduledTaskRun.id == run_uuid, ScheduledTaskRun.task_id == st_uuid)
+                    .first()
+                )
                 if r:
                     r.status = "CANCELLED"
                     r.error = "Execution cancelled by user."
@@ -829,7 +851,11 @@ async def execute_scheduled_task_job(
                 await update_task_state(task_id, "Cancelled", 100, ctx=ctx)
                 return
 
-            run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+            run = (
+                db.query(ScheduledTaskRun)
+                .filter(ScheduledTaskRun.id == run_uuid, ScheduledTaskRun.task_id == st_uuid)
+                .first()
+            )
             if run:
                 run.status = "COMPLETED"
                 run.output = response_text
@@ -849,7 +875,11 @@ async def execute_scheduled_task_job(
                     ctx.assert_owned_in_session(db, lock=False)
                 except TaskLeaseLostError:
                     return
-            run = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_uuid).first()
+            run = (
+                db.query(ScheduledTaskRun)
+                .filter(ScheduledTaskRun.id == run_uuid, ScheduledTaskRun.task_id == st_uuid)
+                .first()
+            )
             if run:
                 run.status = "FAILED"
                 run.error = str(e)

@@ -107,8 +107,10 @@ services:
       - SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY=${SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY:?Production requires SAKURA_SANDBOX_CAPABILITY_SIGNING_KEY}
       - SAKURA_WORKSPACE_ROOT=/workspaces
       - ENVIRONMENT=production
+      - SAKURA_EMBEDDED_WORKER=false
       - SAKURA_EMBEDDED_SCHEDULER=false
       - SAKURA_EMBEDDED_CODING_WORKER=false
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GROQ_API_KEY=${GROQ_API_KEY:-}
@@ -295,6 +297,8 @@ services:
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
         NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-}
+        NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-}
+        NEXT_PUBLIC_SUPPORT_EMAIL: ${NEXT_PUBLIC_SUPPORT_EMAIL:-}
     container_name: sakura_frontend
     restart: always
     # Bind strictly to loopback so public traffic must pass through the TLS reverse proxy

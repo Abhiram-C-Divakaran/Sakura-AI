@@ -1176,21 +1176,6 @@ async def chat_stream(
                 is_terminal_coding_status,
             )
             from database.models import CodingJob, CodingTaskEvent
-            from services.quotas import enforce_user_quota
-
-            is_replay = False
-            if req.idempotency_key and req.idempotency_key.strip():
-                is_replay = (
-                    db.query(CodingJob)
-                    .filter(
-                        CodingJob.user_id == current_user.id,
-                        CodingJob.idempotency_key == req.idempotency_key.strip()[:128],
-                    )
-                    .first()
-                    is not None
-                )
-            if not is_replay:
-                enforce_user_quota(db, current_user.id, "coding_task")
 
             coding_task, coding_job, _created = create_and_enqueue_coding_job(
                 db=db,
@@ -1201,6 +1186,7 @@ async def chat_stream(
                 intensity=req.intensity or "high",
                 idempotency_key=req.idempotency_key,
                 metadata={"source": "chat_stream", "conversation_id": str(conv.id)},
+                enforce_quota=True,
             )
             queued_task_id = str(coding_task.id)
             queued_job_id = str(coding_job.id)
@@ -1511,9 +1497,23 @@ class TaskCreateRequest(BaseModel):
     title: str
     payload: Dict[str, Any]
 
+ALLOWED_USER_TASK_TYPES = frozenset({
+    "doc_summary",
+    "code_analysis",
+    "dataset_analysis",
+    "web_research",
+})
+
+
 @router.post("/tasks")
 async def create_task(req: TaskCreateRequest, current_user: User = Depends(AuthManager.get_current_user)):
     user_id = str(current_user.id)
+
+    if req.type not in ALLOWED_USER_TASK_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported or internal-only task type: {req.type}",
+        )
 
     if req.type == "doc_summary" and "document_id" not in req.payload:
         raise HTTPException(status_code=400, detail="document_id is required for document summary")

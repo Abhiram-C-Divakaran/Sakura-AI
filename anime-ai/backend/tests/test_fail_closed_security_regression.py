@@ -54,9 +54,20 @@ from coding.sandbox import (
 from coding.sandbox_service import app as sandbox_app
 from config.settings import KNOWN_DEV_SECRETS, Settings
 from database.db import Base, engine, get_db_context
-from database.models import Document, GeneratedImage, User, utc_now
+from database.models import (
+    BackgroundTask,
+    Conversation,
+    Document,
+    GeneratedImage,
+    RepositoryWorkspace,
+    ScheduledTask,
+    ScheduledTaskRun,
+    User,
+    utc_now,
+)
 from main import app as main_app
 from services.rate_limit import enforce_rate_limit
+from tasks.task_manager import execute_scheduled_task_job
 
 
 def _make_user(db, prefix="fc_sec"):
@@ -346,6 +357,139 @@ class TestFailClosedSecurityRegression(unittest.IsolatedAsyncioTestCase):
                 await rt.run_command("echo hi", timeout_seconds=1)
             with self.assertRaises(SandboxUnavailableError):
                 await rt.clone_repository("https://github.com/octocat/Hello-World.git", "main", "cap", timeout_seconds=1)
+
+    # 8. Cross-user scheduled task execution & internal task type forging denied
+    async def test_cross_user_scheduled_task_execution_and_internal_task_submission_denied(self):
+        with get_db_context() as db:
+            user_a = _make_user(db, "sched_owner_a")
+            user_b = _make_user(db, "sched_intruder_b")
+            st = ScheduledTask(
+                id=uuid.uuid4(),
+                user_id=user_a.id,
+                title="Private Owner Report",
+                prompt="Summarize confidential Q4 revenue numbers",
+                schedule="every day at 9am",
+                enabled=True,
+                created_at=utc_now(),
+            )
+            db.add(st)
+            db.flush()
+            run = ScheduledTaskRun(
+                id=uuid.uuid4(),
+                task_id=st.id,
+                status="QUEUED",
+                scheduled_for=utc_now(),
+            )
+            db.add(run)
+            bg_b = BackgroundTask(
+                id=uuid.uuid4(),
+                user_id=user_b.id,
+                type="scheduled_run",
+                title="Forged cross-user run",
+                status="Queued",
+                payload={"scheduled_task_id": str(st.id), "run_id": str(run.id)},
+                created_at=utc_now(),
+            )
+            db.add(bg_b)
+            db.commit()
+            user_b_id = user_b.id
+            st_id = st.id
+            run_id = run.id
+            bg_b_id = bg_b.id
+            tok_b = AuthManager.create_access_token({"sub": user_b.username})
+
+        hdr_b = {"Authorization": f"Bearer {tok_b}"}
+        # HTTP API MUST reject internal-only task types
+        for forbidden_type in ("scheduled_run", "document_index", "user_data_export", "arbitrary_unknown"):
+            resp = self.api_client.post(
+                "/api/v1/tasks",
+                headers=hdr_b,
+                json={
+                    "type": forbidden_type,
+                    "title": "Forged task",
+                    "payload": {"scheduled_task_id": str(st_id), "run_id": str(run_id)},
+                },
+            )
+            self.assertEqual(resp.status_code, 400, f"POST /api/v1/tasks MUST reject {forbidden_type!r}")
+
+        # Even if a cross-user BackgroundTask exists in DB, execute_scheduled_task_job MUST fail closed
+        class _FailIfCalledRouter:
+            called = False
+
+            def get_provider(self, *_args, **_kwargs):
+                self.called = True
+                raise AssertionError("LLM provider must never be called for unauthorized scheduled task")
+
+        fake_router = _FailIfCalledRouter()
+        await execute_scheduled_task_job(
+            bg_b_id,
+            user_b_id,
+            {"scheduled_task_id": str(st_id), "run_id": str(run_id)},
+            fake_router,
+        )
+        self.assertFalse(fake_router.called)
+
+        with get_db_context() as db:
+            run_after = db.query(ScheduledTaskRun).filter(ScheduledTaskRun.id == run_id).first()
+            bg_after = db.query(BackgroundTask).filter(BackgroundTask.id == bg_b_id).first()
+            self.assertEqual(run_after.status, "QUEUED")
+            self.assertIsNone(run_after.output)
+            self.assertEqual(bg_after.status, "Failed")
+            self.assertIn("access denied", (bg_after.error or "").lower())
+
+    # 9. /chat/stream coding route uses atomic quota enforcement inside create_and_enqueue_coding_job
+    def test_chat_stream_coding_route_enforces_quota_atomically(self):
+        with get_db_context() as db:
+            user = _make_user(db, "chat_code_quota")
+            conv = Conversation(
+                id=uuid.uuid4(),
+                user_id=user.id,
+                title="Coding Quota Test",
+                created_at=utc_now(),
+            )
+            ws = RepositoryWorkspace(
+                id=uuid.uuid4(),
+                user_id=user.id,
+                name="demo-repo",
+                repository_url="https://github.com/octocat/Hello-World.git",
+                active_branch="main",
+                workspace_path=os.path.join(self.tmp_dir, "demo-repo"),
+                status="READY",
+                created_at=utc_now(),
+            )
+            os.makedirs(ws.workspace_path, exist_ok=True)
+            db.add(conv)
+            db.add(ws)
+            db.commit()
+            conv_id = str(conv.id)
+            tok = AuthManager.create_access_token({"sub": user.username})
+
+        captured = {}
+        quota_resources = []
+
+        def _fake_create_and_enqueue(**kwargs):
+            captured.update(kwargs)
+            raise HTTPException(status_code=429, detail="Daily quota exceeded for coding_task")
+
+        def _spy_enforce_quota(_db, _uid, resource, *args, **kwargs):
+            quota_resources.append(resource)
+            if resource == "coding_task":
+                raise AssertionError("Must not pre-charge coding_task quota outside create_and_enqueue_coding_job")
+
+        with patch("coding.job_worker.create_and_enqueue_coding_job", side_effect=_fake_create_and_enqueue):
+            with patch("services.quotas.enforce_user_quota", side_effect=_spy_enforce_quota):
+                res = self.api_client.post(
+                    "/api/v1/chat/stream",
+                    headers={"Authorization": f"Bearer {tok}"},
+                    json={
+                        "conversation_id": conv_id,
+                        "message": "/code fix the unit test",
+                        "idempotency_key": f"idem-{uuid.uuid4().hex[:8]}",
+                    },
+                )
+                self.assertEqual(res.status_code, 429)
+                self.assertTrue(captured.get("enforce_quota"), "chat/stream must pass enforce_quota=True")
+                self.assertNotIn("coding_task", quota_resources)
 
 
 if __name__ == "__main__":
