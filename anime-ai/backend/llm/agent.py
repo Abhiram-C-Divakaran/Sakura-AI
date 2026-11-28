@@ -747,12 +747,31 @@ class Agent:
                         Document.id == att_uuid,
                         Document.user_id == self.user_id
                     ).first()
-                    if doc and os.path.exists(doc.storage_path):
+                    if doc:
+                        preview = None
                         try:
-                            with open(doc.storage_path, "r", encoding="utf-8", errors="ignore") as f:
-                                preview = f.read(4000)
-                                attachment_snippets.append(f"=== ATTACHED FILE: {doc.filename} ===\n{preview}")
+                            from services.storage import (
+                                get_storage_backend,
+                                assert_user_storage_key,
+                                resolve_legacy_local_path,
+                            )
+                            if doc.storage_key:
+                                assert_user_storage_key(self.user_id, doc.storage_key)
+                                storage = get_storage_backend(getattr(doc, "storage_backend", "local"))
+                                if storage.exists(doc.storage_key):
+                                    raw_bytes = storage.get_bytes(doc.storage_key)
+                                    if raw_bytes:
+                                        preview = raw_bytes[:16000].decode("utf-8", errors="ignore")[:4000]
+                            if preview is None and doc.storage_path:
+                                safe_path = resolve_legacy_local_path(doc.storage_path)
+                                if os.path.exists(safe_path):
+                                    with open(safe_path, "r", encoding="utf-8", errors="ignore") as f:
+                                        preview = f.read(4000)
                         except Exception:
+                            preview = None
+                        if preview:
+                            attachment_snippets.append(f"=== ATTACHED FILE: {doc.filename} ===\n{preview}")
+                        else:
                             attachment_snippets.append(f"=== ATTACHED FILE: {doc.filename} (Available in Knowledge Base) ===")
             if attachment_snippets:
                 attachment_context = "\n\nUser Attached Documents for this query:\n" + "\n\n".join(attachment_snippets)

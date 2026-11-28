@@ -491,6 +491,114 @@ class TestFailClosedSecurityRegression(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(captured.get("enforce_quota"), "chat/stream must pass enforce_quota=True")
                 self.assertNotIn("coding_task", quota_resources)
 
+    # 10. Audio transcribe rejects oversized uploads (HTTP 413) & unsafe extensions (HTTP 400)
+    def test_audio_transcribe_enforces_size_limit_and_extension_allowlist(self):
+        from io import BytesIO
+        with get_db_context() as db:
+            user = _make_user(db, "audio_sec")
+            tok = AuthManager.create_access_token({"sub": user.username})
+        hdr = {"Authorization": f"Bearer {tok}"}
+
+        # Path-traversal / non-audio extension MUST be rejected with HTTP 400
+        for bad_name in ("evil.py", "payload.sh", "clip.wav/../../escape.txt"):
+            r_bad = self.api_client.post(
+                "/api/v1/audio/transcribe",
+                headers=hdr,
+                files={"file": (bad_name, BytesIO(b"RIFF....WAVE"), "audio/wav")},
+            )
+            self.assertEqual(r_bad.status_code, 400, f"Unsafe filename {bad_name!r} must be rejected")
+
+        # Oversized audio upload MUST be rejected with HTTP 413 via streaming cap
+        with patch("api.audio.MAX_AUDIO_UPLOAD_BYTES", 64):
+            r_big = self.api_client.post(
+                "/api/v1/audio/transcribe",
+                headers=hdr,
+                files={"file": ("voice.webm", BytesIO(b"A" * 128), "audio/webm")},
+            )
+            self.assertEqual(r_big.status_code, 413)
+
+    # 11. Manual scheduled task trigger enforces daily scheduled_job quota
+    def test_manual_scheduled_task_run_enforces_daily_quota(self):
+        with get_db_context() as db:
+            user = _make_user(db, "sched_quota")
+            st = ScheduledTask(
+                id=uuid.uuid4(),
+                user_id=user.id,
+                title="Quota Checked Task",
+                prompt="Generate daily summary",
+                schedule="every day at 9am",
+                enabled=True,
+                created_at=utc_now(),
+            )
+            db.add(st)
+            db.commit()
+            st_id = str(st.id)
+            tok = AuthManager.create_access_token({"sub": user.username})
+        hdr = {"Authorization": f"Bearer {tok}"}
+
+        with patch.dict(os.environ, {"SAKURA_QUOTA_SCHEDULED_DAILY": "1"}, clear=False):
+            r1 = self.api_client.post(f"/api/v1/scheduled/{st_id}/run", headers=hdr)
+            self.assertEqual(r1.status_code, 202)
+            r2 = self.api_client.post(f"/api/v1/scheduled/{st_id}/run", headers=hdr)
+            self.assertEqual(r2.status_code, 429)
+
+    # 12. Chat agent reads attached document previews via StorageBackend (S3-safe, no local-path assumption)
+    async def test_chat_agent_loads_attachment_from_storage_backend(self):
+        from llm.agent import Agent
+        from llm.router import LLMRouter
+
+        with get_db_context() as db:
+            user = _make_user(db, "s3_attach")
+            doc_id = uuid.uuid4()
+            storage_key = f"users/{user.id}/documents/{doc_id}/brief.txt"
+            doc = Document(
+                id=doc_id,
+                user_id=user.id,
+                filename="brief.txt",
+                mime_type="text/plain",
+                storage_backend="s3",
+                storage_key=storage_key,
+                storage_path=storage_key,  # Intentionally non-existent on local disk
+            )
+            db.add(doc)
+            db.commit()
+
+            class _FakeS3Backend:
+                def exists(self, key):
+                    return key == storage_key
+
+                def get_bytes(self, key):
+                    assert key == storage_key
+                    return b"S3_CONFIDENTIAL_PROJECT_NOTES_12345"
+
+            captured_messages = []
+
+            class _FakeProvider:
+                async def tool_turn(self, messages, **_kwargs):
+                    captured_messages.extend(messages)
+                    return {"content": "ok", "tool_calls": []}
+
+                async def stream_generate(self, **_kwargs):
+                    yield "ok"
+
+            fake_router = LLMRouter()
+            with patch("services.storage.get_storage_backend", return_value=_FakeS3Backend()):
+                with patch.object(fake_router, "get_provider", return_value=("fake", _FakeProvider())):
+                    loop = Agent(
+                        db=db,
+                        user_id=user.id,
+                        llm_router=fake_router,
+                        system_prompt="You are Sakura.",
+                        history=[],
+                        attachments=[{"id": str(doc_id), "filename": "brief.txt"}],
+                    )
+                    tokens = []
+                    async for chunk in loop.run_stream("Summarize my attachment"):
+                        tokens.append(chunk)
+
+            self.assertTrue(captured_messages, "Expected system prompt sent to provider")
+            self.assertIn("S3_CONFIDENTIAL_PROJECT_NOTES_12345", captured_messages[0]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()
