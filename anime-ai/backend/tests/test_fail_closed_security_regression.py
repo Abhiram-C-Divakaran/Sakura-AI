@@ -689,6 +689,85 @@ class TestFailClosedSecurityRegression(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[1], "proc_wait")
         self.assertEqual(events[2], ("docker_rm", ["docker", "rm", "-f", cname]))
 
+    # 15. Library file download & thumbnail reject query-string JWTs (?token=...) and require Bearer header
+    def test_library_download_and_thumbnail_reject_query_string_jwt(self):
+        with get_db_context() as db:
+            user = _make_user(db, "dl_hdr_only")
+            doc_id = uuid.uuid4()
+            storage_key = f"users/{user.id}/documents/{doc_id}/secret.txt"
+            local_file = os.path.join(self.tmp_dir, "secret.txt")
+            with open(local_file, "wb") as f:
+                f.write(b"TOP_SECRET_LIBRARY_CONTENT")
+            db.add(
+                Document(
+                    id=doc_id,
+                    user_id=user.id,
+                    filename="secret.txt",
+                    mime_type="text/plain",
+                    storage_backend="local",
+                    storage_key=storage_key,
+                    storage_path=local_file,
+                )
+            )
+            db.commit()
+            tok = AuthManager.create_access_token({"sub": user.username})
+
+        # Query-string ?token= MUST be rejected with HTTP 401
+        r_dl_q = self.api_client.get(f"/api/v1/library/files/{doc_id}/download?token={tok}")
+        self.assertEqual(r_dl_q.status_code, 401)
+        r_th_q = self.api_client.get(f"/api/v1/library/files/{doc_id}/thumbnail?token={tok}")
+        self.assertEqual(r_th_q.status_code, 401)
+
+        # Malformed UUID routes MUST return HTTP 400 (never unhandled HTTP 500)
+        hdr = {"Authorization": f"Bearer {tok}"}
+        self.assertEqual(self.api_client.get("/api/v1/conversations/not-a-uuid/messages", headers=hdr).status_code, 400)
+        self.assertEqual(self.api_client.delete("/api/v1/memory/not-a-uuid", headers=hdr).status_code, 400)
+        self.assertEqual(
+            self.api_client.post("/api/v1/documents/not-a-uuid/rename", headers=hdr, json={"filename": "x.txt"}).status_code,
+            400,
+        )
+
+    # 16. AI providers & embedding manager enforce bounded timeouts and safe empty-choices streaming
+    async def test_ai_providers_configure_bounded_timeouts_and_safe_streaming(self):
+        from llm.providers.openai import OpenAIProvider
+        from llm.providers.anthropic import AnthropicProvider
+        from rag.embeddings.manager import EmbeddingManager
+
+        oa = OpenAIProvider(api_key="sk-test-timeout-check-000000")
+        an = AnthropicProvider(api_key="sk-ant-timeout-check-000000")
+        em = EmbeddingManager(api_key="sk-emb-timeout-check-000000")
+
+        self.assertIsNotNone(oa.client.timeout)
+        self.assertIsNotNone(an.client.timeout)
+        self.assertIsNotNone(em.client.timeout)
+        self.assertEqual(oa.client.max_retries, 2)
+        self.assertEqual(an.client.max_retries, 2)
+        self.assertEqual(em.client.max_retries, 2)
+
+        # Verify OpenAIProvider.stream_messages skips empty usage chunks (choices=[]) without IndexError
+        class _Chunk:
+            def __init__(self, choices):
+                self.choices = choices
+
+        class _Choice:
+            def __init__(self, content):
+                self.delta = type("Delta", (), {"content": content})()
+
+        async def _fake_stream():
+            yield _Chunk([])
+            yield _Chunk([_Choice("Hello")])
+            yield _Chunk([_Choice(" world")])
+            yield _Chunk([])
+
+        async def _fake_create(**_kwargs):
+            return _fake_stream()
+
+        with patch.object(oa.client.chat.completions, "create", side_effect=_fake_create):
+            collected = []
+            async for token in oa.stream_messages([{"role": "user", "content": "hi"}]):
+                collected.append(token)
+        self.assertEqual("".join(collected), "Hello world")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,7 +13,8 @@ class AnthropicProvider(LLMProvider):
         api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY environment variable is not set.")
-        self.client = AsyncAnthropic(api_key=api_key)
+        timeout_secs = float(os.getenv("ANTHROPIC_TIMEOUT_SECONDS", "60.0"))
+        self.client = AsyncAnthropic(api_key=api_key, timeout=timeout_secs, max_retries=2)
         self.model = model
 
     def _prepare_messages_and_system(

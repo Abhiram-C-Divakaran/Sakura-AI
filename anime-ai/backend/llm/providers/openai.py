@@ -10,7 +10,8 @@ class OpenAIProvider(LLMProvider):
         api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable is not set.")
-        self.client = AsyncOpenAI(api_key=api_key)
+        timeout_secs = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "60.0"))
+        self.client = AsyncOpenAI(api_key=api_key, timeout=timeout_secs, max_retries=2)
         self.model = model
 
     def _prepare_messages(
@@ -66,6 +67,8 @@ class OpenAIProvider(LLMProvider):
             **kwargs
         )
         async for chunk in response_stream:
+            if not getattr(chunk, "choices", None):
+                continue
             content = chunk.choices[0].delta.content
             if content:
                 yield content
@@ -98,6 +101,8 @@ class OpenAIProvider(LLMProvider):
 
         response_stream = await self.client.chat.completions.create(**params)
         async for chunk in response_stream:
+            if not getattr(chunk, "choices", None):
+                continue
             content = chunk.choices[0].delta.content
             if content:
                 yield content
